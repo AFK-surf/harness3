@@ -1,0 +1,276 @@
+import gleam/bit_array
+import gleam/dynamic/decode
+import gleam/json
+import gleam/list
+import gleam/result
+import gleam/string
+import harness3/llm.{type Provider}
+import harness3/llm/anthropic_messages
+import harness3/llm/openai_chat_completions
+import harness3/llm/openai_responses
+import harness3/storage.{type Storage, type VersionToken}
+
+pub type ModelType {
+  OpenAIChatCompletions
+  OpenAIResponses
+  AnthropicMessages
+}
+
+pub opaque type Credentials {
+  Credentials(value: String)
+}
+
+pub fn api_key(value: String) -> Credentials {
+  Credentials(value)
+}
+
+pub type Model {
+  Model(
+    id: String,
+    name: String,
+    endpoint: String,
+    model_type: ModelType,
+    credentials: Credentials,
+  )
+}
+
+pub type Catalog {
+  Catalog(revision: Int, models: List(Model))
+}
+
+pub fn new() -> Catalog {
+  Catalog(0, [])
+}
+
+pub type Error {
+  InvalidCatalog(reason: String)
+  DuplicateModel(id: String)
+  UnknownModel(id: String)
+  DecodeFailed(reason: String)
+  StorageFailed(error: storage.Error)
+  ConcurrentUpdate
+}
+
+pub opaque type Session {
+  Session(
+    storage: Storage,
+    key: String,
+    catalog: Catalog,
+    version: VersionToken,
+  )
+}
+
+pub fn create(
+  storage: Storage,
+  key: String,
+  catalog: Catalog,
+) -> Result(Session, Error) {
+  use _ <- result.try(validate(catalog))
+  let body = encode(catalog) |> json.to_string |> bit_array.from_string
+  use metadata <- result.try(
+    storage.put(storage, key, body, storage.IfAbsent)
+    |> result.map_error(storage_error),
+  )
+  Ok(Session(storage, key, catalog, metadata.version))
+}
+
+pub fn resume(storage: Storage, key: String) -> Result(Session, Error) {
+  use object <- result.try(
+    storage.get(storage, key) |> result.map_error(StorageFailed),
+  )
+  use body <- result.try(
+    bit_array.to_string(object.body)
+    |> result.map_error(fn(_) { DecodeFailed("catalog is not UTF-8 JSON") }),
+  )
+  use catalog <- result.try(
+    json.parse(body, catalog_decoder())
+    |> result.map_error(fn(error) { DecodeFailed(string.inspect(error)) }),
+  )
+  use _ <- result.try(validate(catalog))
+  Ok(Session(storage, key, catalog, object.metadata.version))
+}
+
+pub fn catalog(session: Session) -> Catalog {
+  session.catalog
+}
+
+pub fn revision(catalog: Catalog) -> Int {
+  catalog.revision
+}
+
+pub fn lookup(catalog: Catalog, id: String) -> Result(Model, Error) {
+  list.find(catalog.models, fn(model) { model.id == id })
+  |> result.map_error(fn(_) { UnknownModel(id) })
+}
+
+pub fn put_model(catalog: Catalog, model: Model) -> Result(Catalog, Error) {
+  use _ <- result.try(validate_model(model))
+  let models = case list.any(catalog.models, fn(item) { item.id == model.id }) {
+    True ->
+      list.map(catalog.models, fn(item) {
+        case item.id == model.id {
+          True -> model
+          False -> item
+        }
+      })
+    False -> list.append(catalog.models, [model])
+  }
+  Ok(Catalog(..catalog, models: models))
+}
+
+pub fn remove_model(catalog: Catalog, id: String) -> Result(Catalog, Error) {
+  case list.any(catalog.models, fn(model) { model.id == id }) {
+    False -> Error(UnknownModel(id))
+    True ->
+      Ok(
+        Catalog(
+          ..catalog,
+          models: list.filter(catalog.models, fn(model) { model.id != id }),
+        ),
+      )
+  }
+}
+
+pub fn commit(session: Session, catalog: Catalog) -> Result(Session, Error) {
+  let next = Catalog(..catalog, revision: session.catalog.revision + 1)
+  use _ <- result.try(validate(next))
+  let body = encode(next) |> json.to_string |> bit_array.from_string
+  use metadata <- result.try(
+    storage.put(
+      session.storage,
+      session.key,
+      body,
+      storage.IfUnchanged(session.version),
+    )
+    |> result.map_error(storage_error),
+  )
+  Ok(Session(session.storage, session.key, next, metadata.version))
+}
+
+fn storage_error(error: storage.Error) -> Error {
+  case error {
+    storage.PreconditionFailed(_) -> ConcurrentUpdate
+    error -> StorageFailed(error)
+  }
+}
+
+pub fn provider(model: Model) -> Provider {
+  let Credentials(api_key) = model.credentials
+  case model.model_type {
+    OpenAIChatCompletions ->
+      openai_chat_completions.new(openai_chat_completions.Config(
+        api_key,
+        model.endpoint,
+        openai_chat_completions.MaxCompletionTokens,
+      ))
+    OpenAIResponses ->
+      openai_responses.new(openai_responses.Config(api_key, model.endpoint))
+    AnthropicMessages ->
+      anthropic_messages.new(anthropic_messages.Config(
+        api_key,
+        model.endpoint,
+        "2023-06-01",
+      ))
+  }
+}
+
+pub fn validate(catalog: Catalog) -> Result(Nil, Error) {
+  use _ <- result.try(list.try_each(catalog.models, validate_model))
+  catalog.models
+  |> list.try_fold([], fn(ids, model) {
+    case list.contains(ids, model.id) {
+      True -> Error(DuplicateModel(model.id))
+      False -> Ok([model.id, ..ids])
+    }
+  })
+  |> result.map(fn(_) { Nil })
+}
+
+fn validate_model(model: Model) -> Result(Nil, Error) {
+  let Credentials(secret) = model.credentials
+  case
+    string.trim(model.id),
+    string.trim(model.name),
+    string.trim(model.endpoint),
+    string.trim(secret)
+  {
+    "", _, _, _ -> Error(InvalidCatalog("model id cannot be empty"))
+    _, "", _, _ -> Error(InvalidCatalog("model name cannot be empty"))
+    _, _, "", _ -> Error(InvalidCatalog("model endpoint cannot be empty"))
+    _, _, _, "" -> Error(InvalidCatalog("model credentials cannot be empty"))
+    _, _, _, _ -> Ok(Nil)
+  }
+}
+
+fn encode(catalog: Catalog) -> json.Json {
+  json.object([
+    #("schema_version", json.int(1)),
+    #("revision", json.int(catalog.revision)),
+    #("models", json.array(catalog.models, encode_model)),
+  ])
+}
+
+fn encode_model(model: Model) -> json.Json {
+  let Credentials(secret) = model.credentials
+  json.object([
+    #("id", json.string(model.id)),
+    #("name", json.string(model.name)),
+    #("endpoint", json.string(model.endpoint)),
+    #("type", json.string(model_type_name(model.model_type))),
+    #(
+      "credentials",
+      json.object([
+        #("type", json.string("api_key")),
+        #("value", json.string(secret)),
+      ]),
+    ),
+  ])
+}
+
+fn model_type_name(model_type: ModelType) -> String {
+  case model_type {
+    OpenAIChatCompletions -> "openai_chat_completions"
+    OpenAIResponses -> "openai_responses"
+    AnthropicMessages -> "anthropic_messages"
+  }
+}
+
+fn model_type_decoder() -> decode.Decoder(ModelType) {
+  decode.string
+  |> decode.then(fn(value) {
+    case value {
+      "openai_chat_completions" -> decode.success(OpenAIChatCompletions)
+      "openai_responses" -> decode.success(OpenAIResponses)
+      "anthropic_messages" -> decode.success(AnthropicMessages)
+      _ -> decode.failure(OpenAIResponses, "unsupported model type")
+    }
+  })
+}
+
+fn credentials_decoder() -> decode.Decoder(Credentials) {
+  use kind <- decode.field("type", decode.string)
+  use value <- decode.field("value", decode.string)
+  case kind {
+    "api_key" -> decode.success(Credentials(value))
+    _ -> decode.failure(Credentials(""), "unsupported credential type")
+  }
+}
+
+fn model_decoder() -> decode.Decoder(Model) {
+  use id <- decode.field("id", decode.string)
+  use name <- decode.field("name", decode.string)
+  use endpoint <- decode.field("endpoint", decode.string)
+  use model_type <- decode.field("type", model_type_decoder())
+  use credentials <- decode.field("credentials", credentials_decoder())
+  decode.success(Model(id, name, endpoint, model_type, credentials))
+}
+
+fn catalog_decoder() -> decode.Decoder(Catalog) {
+  use schema <- decode.field("schema_version", decode.int)
+  use revision <- decode.field("revision", decode.int)
+  use models <- decode.field("models", decode.list(of: model_decoder()))
+  case schema {
+    1 -> decode.success(Catalog(revision, models))
+    _ -> decode.failure(Catalog(0, []), "unsupported catalog schema")
+  }
+}
