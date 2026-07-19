@@ -6,14 +6,15 @@ import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{type Option}
 import gleam/otp/actor
 import gleam/result
 import gleam/string
+import gleam/uri
 import harness3/agent
+import harness3/agent_group_registry
+import harness3/agent_profile
 import harness3/model_catalog
-import harness3/plugin
-import harness3/storage.{type Storage, type VersionToken}
+import harness3/storage.{type Metadata, type Storage, type VersionToken}
 
 pub type ExecutionState {
   Idle
@@ -24,33 +25,37 @@ pub type ExecutionState {
 pub type AgentGroup {
   AgentGroup(
     id: String,
+    model_catalog_key: String,
     revision: Int,
     agents: List(agent.State),
     execution: ExecutionState,
   )
 }
 
-pub fn new(id: String, agents: List(agent.State)) -> AgentGroup {
-  AgentGroup(id, 0, agents, Idle)
+pub type RunningIndexEntry {
+  RunningIndexEntry(
+    index_key: String,
+    group_id: String,
+    group_key: String,
+    owner: String,
+    epoch: Int,
+    lease_expires_at: Int,
+  )
 }
 
-pub type AgentDefinition {
-  AgentDefinition(
-    id: String,
-    registry: plugin.Registry,
-    transport: agent.ModelTransport,
-    max_output_tokens: Option(Int),
-    reasoning_effort: Option(String),
-    observe: fn(agent.Event) -> Result(Nil, agent.Error),
-  )
+pub fn new(
+  id: String,
+  model_catalog_key: String,
+  agents: List(agent.State),
+) -> AgentGroup {
+  AgentGroup(id, model_catalog_key, 0, agents, Idle)
 }
 
 pub type Config {
   Config(
     storage: Storage,
     object_key: String,
-    catalog: model_catalog.Catalog,
-    definitions: List(AgentDefinition),
+    profiles: List(agent_profile.AgentProfile),
     lease_duration_seconds: Int,
   )
 }
@@ -58,7 +63,7 @@ pub type Config {
 pub type Error {
   InvalidGroup(reason: String)
   MissingAgent(id: String)
-  MissingDefinition(id: String)
+  MissingProfile(id: String)
   DuplicateAgent(id: String)
   UnknownModel(agent_id: String, model_id: String)
   AlreadyClaimed(owner: String, lease_expires_at: Int)
@@ -71,6 +76,8 @@ pub type Error {
   AgentCallbackUnavailable(id: String)
   AgentCallbackFailed(id: String, error: agent.Error)
   ProcessStartFailed(reason: String)
+  ProfileUnavailable(reason: String)
+  ModelCatalogFailed(error: model_catalog.Error)
 }
 
 pub type CommitReceipt {
@@ -81,16 +88,22 @@ pub opaque type Group {
   Group(subject: Subject(Message))
 }
 
+pub opaque type LoadedGroup {
+  LoadedGroup(config: Config, group: AgentGroup, version: VersionToken)
+}
+
 type CoordinatorState {
   CoordinatorState(
     storage: Storage,
     key: String,
+    index_key: String,
     group: AgentGroup,
-    version: VersionToken,
+    metadata: Metadata,
     owner: String,
     lease_duration_seconds: Int,
     owned: Bool,
     children: List(#(String, agent.Handle)),
+    helpers: List(Pid),
   )
 }
 
@@ -105,6 +118,7 @@ type Message {
   AgentPids(reply: Subject(List(#(String, Pid))))
   RegisterChild(id: String, handle: agent.Handle, reply: Subject(Nil))
   AgentExited(id: String)
+  CallbackHelperExited(pid: Pid)
   StopIfEmpty
   CallAgentCallback(
     source_id: String,
@@ -126,28 +140,73 @@ type Message {
 }
 
 type PreparedAgent {
-  PreparedAgent(id: String, active: agent.Active, definition: AgentDefinition)
+  PreparedAgent(
+    id: String,
+    active: agent.Active,
+    profile: agent_profile.AgentProfile,
+  )
 }
 
-pub fn create(config: Config, group: AgentGroup) -> Result(Group, Error) {
+pub fn create(config: Config, group: AgentGroup) -> Result(LoadedGroup, Error) {
   use _ <- result.try(validate(config, group))
-  let owner = owner_token()
-  let claimed = claim(group, owner, config.lease_duration_seconds)
-  let body = encode_group(claimed) |> json.to_string |> bit_array.from_string
+  agent_profile.install(config.profiles)
+  let body = encode_group(group) |> json.to_string |> bit_array.from_string
   use metadata <- result.try(
     storage.put(config.storage, config.object_key, body, storage.IfAbsent)
     |> result.map_error(storage_error),
   )
-  start_coordinator(config, claimed, metadata.version, owner)
+  Ok(LoadedGroup(config, group, metadata.version))
 }
 
-pub fn resume(config: Config) -> Result(Group, Error) {
+pub fn resume(config: Config) -> Result(LoadedGroup, Error) {
   use object <- result.try(
     storage.get(config.storage, config.object_key)
     |> result.map_error(StorageFailed),
   )
   use group <- result.try(decode_group_body(object.body))
   use _ <- result.try(validate(config, group))
+  agent_profile.install(config.profiles)
+  Ok(LoadedGroup(config, group, object.metadata.version))
+}
+
+/// Loads a group using agent profiles installed on the current node.
+pub fn resume_registered(
+  storage: Storage,
+  object_key: String,
+  lease_duration_seconds: Int,
+) -> Result(LoadedGroup, Error) {
+  use object <- result.try(
+    storage.get(storage, object_key)
+    |> result.map_error(StorageFailed),
+  )
+  use group <- result.try(decode_group_body(object.body))
+  let profile_ids =
+    group.agents
+    |> list.filter(fn(state) { state.status == agent.Ready })
+    |> list.map(fn(state) { state.profile_id })
+  use profiles <- result.try(
+    agent_profile.profiles(profile_ids)
+    |> result.map_error(fn(error) { ProfileUnavailable(string.inspect(error)) }),
+  )
+  let config = Config(storage, object_key, profiles, lease_duration_seconds)
+  use _ <- result.try(validate(config, group))
+  Ok(LoadedGroup(config, group, object.metadata.version))
+}
+
+pub fn loaded_state(loaded: LoadedGroup) -> AgentGroup {
+  let LoadedGroup(group:, ..) = loaded
+  group
+}
+
+/// Claims a loaded group and starts its coordinator and agent processes.
+pub fn wake(loaded: LoadedGroup) -> Result(Group, Error) {
+  let LoadedGroup(config:, group:, version:) = loaded
+  use catalog_session <- result.try(
+    model_catalog.resume(config.storage, group.model_catalog_key)
+    |> result.map_error(ModelCatalogFailed),
+  )
+  let catalog = model_catalog.catalog(catalog_session)
+  use _ <- result.try(validate_models(group, catalog))
   use _ <- result.try(ensure_claimable(group.execution))
   let owner = owner_token()
   let claimed = claim(group, owner, config.lease_duration_seconds)
@@ -158,11 +217,12 @@ pub fn resume(config: Config) -> Result(Group, Error) {
       config.storage,
       config.object_key,
       claimed_body,
-      storage.IfUnchanged(object.metadata.version),
+      storage.IfUnchanged(version),
     )
     |> result.map_error(storage_error),
   )
-  start_coordinator(config, claimed, metadata.version, owner)
+  let index_key = running_index_key(claimed, owner)
+  start_coordinator(config, claimed, metadata, owner, index_key, catalog)
 }
 
 /// Loads the durable group state without claiming it or starting processes.
@@ -188,19 +248,23 @@ fn decode_group_body(body: BitArray) -> Result(AgentGroup, Error) {
 fn start_coordinator(
   config: Config,
   group: AgentGroup,
-  version: VersionToken,
+  metadata: Metadata,
   owner: String,
+  index_key: String,
+  catalog: model_catalog.Catalog,
 ) -> Result(Group, Error) {
-  use prepared <- result.try(prepare_agents(config, group))
+  use prepared <- result.try(prepare_agents(config, group, catalog))
   let state =
     CoordinatorState(
       config.storage,
       config.object_key,
+      index_key,
       group,
-      version,
+      metadata,
       owner,
       config.lease_duration_seconds,
       True,
+      [],
       [],
     )
   use started <- result.try(
@@ -210,45 +274,74 @@ fn start_coordinator(
     |> result.map_error(fn(error) { ProcessStartFailed(string.inspect(error)) }),
   )
   let handle = Group(started.data)
-  schedule_renewal(started.data, config.lease_duration_seconds)
+  agent_group_registry.register(group.id, started.pid, fn() {
+    stop(handle) |> result.map_error(string.inspect)
+  })
+  case
+    write_running_index(
+      config.storage,
+      index_key,
+      config.object_key,
+      group,
+      owner,
+    )
+  {
+    Error(error) -> {
+      agent_group_registry.unregister(group.id, started.pid)
+      process.unlink(started.pid)
+      process.kill(started.pid)
+      Error(StorageFailed(error))
+    }
+    Ok(_) -> start_agents(config, prepared, handle, started.data)
+  }
+}
+
+fn start_agents(
+  config: Config,
+  prepared: List(PreparedAgent),
+  handle: Group,
+  subject: Subject(Message),
+) -> Result(Group, Error) {
+  schedule_renewal(subject, config.lease_duration_seconds)
   let children = list.map(prepared, fn(item) { launch_agent(handle, item) })
   list.each(children, agent.release)
-  process.send(started.data, StopIfEmpty)
+  process.send(subject, StopIfEmpty)
   Ok(handle)
 }
 
 fn prepare_agents(
   config: Config,
   group: AgentGroup,
+  catalog: model_catalog.Catalog,
 ) -> Result(List(PreparedAgent), Error) {
   group.agents
   |> list.filter(fn(state) { state.status == agent.Ready })
   |> list.try_map(fn(state) {
-    use definition <- result.try(find_definition(config.definitions, state.id))
+    use profile <- result.try(find_profile(config.profiles, state.profile_id))
     use model <- result.try(
-      model_catalog.lookup(config.catalog, state.model_id)
+      model_catalog.lookup(catalog, state.model_id)
       |> result.map_error(fn(_) { UnknownModel(state.id, state.model_id) }),
     )
     let agent_config =
       agent.Config(
         provider: model_catalog.provider(model),
         model_name: model.name,
-        catalog_revision: model_catalog.revision(config.catalog),
-        registry: definition.registry,
-        transport: definition.transport,
-        max_output_tokens: definition.max_output_tokens,
-        reasoning_effort: definition.reasoning_effort,
+        catalog_revision: model_catalog.revision(catalog),
+        registry: profile.registry,
+        transport: profile.transport,
+        max_output_tokens: profile.max_output_tokens,
+        reasoning_effort: profile.reasoning_effort,
       )
     use active <- result.try(
       agent.activate(state, agent_config)
       |> result.map_error(fn(error) { AgentActivationFailed(state.id, error) }),
     )
-    Ok(PreparedAgent(state.id, active, definition))
+    Ok(PreparedAgent(state.id, active, profile))
   })
 }
 
 fn launch_agent(group: Group, prepared: PreparedAgent) -> agent.Handle {
-  let PreparedAgent(id:, active:, definition:) = prepared
+  let PreparedAgent(id:, active:, profile:) = prepared
   let checkpoint =
     agent.checkpointer(fn(expected, state) {
       commit_agent(group, id, expected, state)
@@ -268,7 +361,7 @@ fn launch_agent(group: Group, prepared: PreparedAgent) -> agent.Handle {
       })
     })
   let child =
-    agent.start(active, checkpoint, router, definition.observe, fn() {
+    agent.start(active, checkpoint, router, profile.observe, fn() {
       let Group(subject) = group
       process.send(subject, AgentExited(id))
     })
@@ -347,15 +440,12 @@ fn handle_message(
         Error(error) -> {
           process.send(reply, Error(error))
           case error {
-            ConcurrentGroupUpdate | LostGroupOwnership ->
-              list.each(state.children, fn(child) { agent.stop(child.1) })
-            _ -> Nil
+            ConcurrentGroupUpdate | LostGroupOwnership -> {
+              abandon(state)
+              actor.stop()
+            }
+            _ -> actor.continue(state)
           }
-          actor.continue(case error {
-            ConcurrentGroupUpdate | LostGroupOwnership ->
-              CoordinatorState(..state, owned: False)
-            _ -> state
-          })
         }
       }
     }
@@ -367,9 +457,10 @@ fn handle_message(
       actor.continue(state)
     }
     AgentPids(reply) -> {
-      process.send(reply, list.map(state.children, fn(child) {
-        #(child.0, agent.pid(child.1))
-      }))
+      process.send(
+        reply,
+        list.map(state.children, fn(child) { #(child.0, agent.pid(child.1)) }),
+      )
       actor.continue(state)
     }
     RegisterChild(id, handle, reply) -> {
@@ -380,23 +471,35 @@ fn handle_message(
       )
     }
     AgentExited(id) -> {
-      let children =
-        list.filter(state.children, fn(child) { child.0 != id })
-      case children {
-        [] -> {
-          let _ = release(CoordinatorState(..state, children:))
+      let children = list.filter(state.children, fn(child) { child.0 != id })
+      case children, state.helpers {
+        [], [] -> {
+          let _ = finish(CoordinatorState(..state, children:))
+          agent_group_registry.unregister(state.group.id, process.self())
           actor.stop()
         }
-        _ -> actor.continue(CoordinatorState(..state, children:))
+        _, _ -> actor.continue(CoordinatorState(..state, children:))
+      }
+    }
+    CallbackHelperExited(pid) -> {
+      let helpers = list.filter(state.helpers, fn(helper) { helper != pid })
+      case state.children, helpers {
+        [], [] -> {
+          let _ = finish(CoordinatorState(..state, helpers:))
+          agent_group_registry.unregister(state.group.id, process.self())
+          actor.stop()
+        }
+        _, _ -> actor.continue(CoordinatorState(..state, helpers:))
       }
     }
     StopIfEmpty ->
-      case state.children {
-        [] -> {
-          let _ = release(state)
+      case state.children, state.helpers {
+        [], [] -> {
+          let _ = finish(state)
+          agent_group_registry.unregister(state.group.id, process.self())
           actor.stop()
         }
-        _ -> actor.continue(state)
+        _, _ -> actor.continue(state)
       }
     CallAgentCallback(
       source,
@@ -410,15 +513,21 @@ fn handle_message(
       let target = find_child(state.children, target_id)
       let source_exists =
         list.any(state.children, fn(child) { child.0 == source })
-      case source == target_id, source_exists, target {
-        True, _, _ ->
+      let next = case source == target_id, source_exists, target {
+        True, _, _ -> {
           process.send(reply, Error(AgentCallbackUnavailable(target_id)))
-        _, False, _ ->
+          state
+        }
+        _, False, _ -> {
           process.send(reply, Error(AgentCallbackUnavailable(source)))
-        _, _, Error(_) ->
+          state
+        }
+        _, _, Error(_) -> {
           process.send(reply, Error(AgentCallbackUnavailable(target_id)))
+          state
+        }
         False, True, Ok(handle) -> {
-          let _ =
+          let helper =
             process.spawn(fn() {
               let response = case
                 agent.call_callback(handle, plugin_name, callback, input)
@@ -442,11 +551,12 @@ fn handle_message(
                 }
               }
               process.send(reply, response)
+              process.send(coordinator, CallbackHelperExited(process.self()))
             })
-          Nil
+          CoordinatorState(..state, helpers: [helper, ..state.helpers])
         }
       }
-      actor.continue(state)
+      actor.continue(next)
     }
     PersistCallbackStates(target_id, plugin_states, plugin_generation, reply) -> {
       case
@@ -464,40 +574,51 @@ fn handle_message(
         Error(error) -> {
           process.send(reply, Error(error))
           case error {
-            ConcurrentGroupUpdate | LostGroupOwnership ->
-              list.each(state.children, fn(child) { agent.stop(child.1) })
-            _ -> Nil
+            ConcurrentGroupUpdate | LostGroupOwnership -> {
+              abandon(state)
+              actor.stop()
+            }
+            _ -> actor.continue(state)
           }
-          actor.continue(case error {
-            ConcurrentGroupUpdate | LostGroupOwnership ->
-              CoordinatorState(..state, owned: False)
-            _ -> state
-          })
         }
       }
     }
     Renew(subject) -> {
-      let next = case renew(state) {
-        Ok(state) -> state
+      case renew(state) {
+        Ok(next) -> {
+          case next.group.execution {
+            Claimed(..) ->
+              schedule_renewal(subject, next.lease_duration_seconds)
+            _ -> Nil
+          }
+          actor.continue(next)
+        }
         Error(_) -> {
-          list.each(state.children, fn(child) { agent.stop(child.1) })
-          CoordinatorState(..state, owned: False)
+          abandon(state)
+          actor.stop()
         }
       }
-      case next.owned, next.group.execution {
-        True, Claimed(..) ->
-          schedule_renewal(subject, next.lease_duration_seconds)
-        _, _ -> Nil
-      }
-      actor.continue(next)
     }
     Stop(reply) -> {
       list.each(state.children, fn(child) { agent.stop(child.1) })
-      let released = release(state)
-      process.send(reply, released |> result.map(fn(_) { Nil }))
+      list.each(state.helpers, stop_helper)
+      let finished = finish(state)
+      process.send(reply, finished |> result.map(fn(_) { Nil }))
+      agent_group_registry.unregister(state.group.id, process.self())
       actor.stop()
     }
   }
+}
+
+fn abandon(state: CoordinatorState) -> Nil {
+  list.each(state.children, fn(child) { agent.stop(child.1) })
+  list.each(state.helpers, stop_helper)
+  agent_group_registry.unregister(state.group.id, process.self())
+}
+
+fn stop_helper(pid: Pid) -> Nil {
+  process.unlink(pid)
+  process.kill(pid)
 }
 
 fn find_child(
@@ -558,9 +679,9 @@ fn do_commit_agent(
   }
   let group =
     AgentGroup(..state.group, revision: group_revision, agents:, execution:)
-  use version <- result.try(write_group(state, group))
+  use metadata <- result.try(write_group(state, group))
   Ok(#(
-    CoordinatorState(..state, group:, version:),
+    CoordinatorState(..state, group:, metadata:),
     CommitReceipt(agent_revision, group_revision),
   ))
 }
@@ -617,8 +738,8 @@ fn write_callback_states(
       agents:,
       execution:,
     )
-  use version <- result.try(write_group(state, group))
-  Ok(CoordinatorState(..state, group:, version:))
+  use metadata <- result.try(write_group(state, group))
+  Ok(CoordinatorState(..state, group:, metadata:))
 }
 
 fn renew(state: CoordinatorState) -> Result(CoordinatorState, Error) {
@@ -628,20 +749,25 @@ fn renew(state: CoordinatorState) -> Result(CoordinatorState, Error) {
   })
   case state.group.execution {
     Completed -> Ok(state)
-    _ -> {
-      let group =
-        AgentGroup(
-          ..state.group,
-          revision: state.group.revision + 1,
-          execution: Claimed(
-            state.owner,
-            execution_epoch(state.group.execution),
-            system_time(Second) + state.lease_duration_seconds,
-          ),
-        )
-      use version <- result.try(write_group(state, group))
-      Ok(CoordinatorState(..state, group:, version:))
-    }
+    Claimed(owner, epoch, expires_at) ->
+      case owner == state.owner && expires_at > system_time(Second) {
+        False -> Error(LostGroupOwnership)
+        True -> {
+          let group =
+            AgentGroup(
+              ..state.group,
+              revision: state.group.revision + 1,
+              execution: Claimed(
+                state.owner,
+                epoch,
+                system_time(Second) + state.lease_duration_seconds,
+              ),
+            )
+          use metadata <- result.try(write_group(state, group))
+          Ok(CoordinatorState(..state, group:, metadata:))
+        }
+      }
+    _ -> Error(LostGroupOwnership)
   }
 }
 
@@ -655,10 +781,89 @@ fn release(state: CoordinatorState) -> Result(CoordinatorState, Error) {
           revision: state.group.revision + 1,
           execution: Idle,
         )
-      use version <- result.try(write_group(state, group))
-      Ok(CoordinatorState(..state, group:, version:, owned: False))
+      use metadata <- result.try(write_group(state, group))
+      Ok(CoordinatorState(..state, group:, metadata:, owned: False))
     }
   }
+}
+
+fn finish(state: CoordinatorState) -> Result(CoordinatorState, Error) {
+  use _ <- result.try(
+    storage.delete(state.storage, state.index_key)
+    |> result.try_recover(fn(error) {
+      case error {
+        storage.NotFound(_) -> Ok(Nil)
+        error -> Error(error)
+      }
+    })
+    |> result.map_error(StorageFailed),
+  )
+  release(state)
+}
+
+/// Prefix containing durable records of running or crashed group claims.
+pub fn running_index_prefix() -> String {
+  "cluster/agent-groups/"
+}
+
+pub fn decode_running_index(
+  index_key: String,
+  body: BitArray,
+) -> Result(RunningIndexEntry, Error) {
+  use body <- result.try(
+    bit_array.to_string(body)
+    |> result.map_error(fn(_) { DecodeFailed("running index is not UTF-8") }),
+  )
+  json.parse(body, {
+    use group_id <- decode.field("group_id", decode.string)
+    use group_key <- decode.field("group_key", decode.string)
+    use owner <- decode.field("owner", decode.string)
+    use epoch <- decode.field("epoch", decode.int)
+    use lease_expires_at <- decode.field("lease_expires_at", decode.int)
+    decode.success(RunningIndexEntry(
+      index_key,
+      group_id,
+      group_key,
+      owner,
+      epoch,
+      lease_expires_at,
+    ))
+  })
+  |> result.map_error(fn(error) { DecodeFailed(string.inspect(error)) })
+}
+
+fn running_index_key(group: AgentGroup, owner: String) -> String {
+  running_index_prefix()
+  <> uri.percent_encode(group.id)
+  <> "/"
+  <> int.to_string(execution_epoch(group.execution))
+  <> "_"
+  <> owner
+}
+
+fn write_running_index(
+  backend: Storage,
+  index_key: String,
+  group_key: String,
+  group: AgentGroup,
+  owner: String,
+) -> Result(storage.Metadata, storage.Error) {
+  let #(epoch, lease_expires_at) = case group.execution {
+    Claimed(_, epoch, lease_expires_at) -> #(epoch, lease_expires_at)
+    _ -> #(0, 0)
+  }
+  let body =
+    json.object([
+      #("schema_version", json.int(1)),
+      #("group_id", json.string(group.id)),
+      #("group_key", json.string(group_key)),
+      #("owner", json.string(owner)),
+      #("epoch", json.int(epoch)),
+      #("lease_expires_at", json.int(lease_expires_at)),
+    ])
+    |> json.to_string
+    |> bit_array.from_string
+  storage.put(backend, index_key, body, storage.IfAbsent)
 }
 
 fn agent_is_terminal(state: agent.State) -> Bool {
@@ -671,16 +876,33 @@ fn agent_is_terminal(state: agent.State) -> Bool {
 fn write_group(
   state: CoordinatorState,
   group: AgentGroup,
-) -> Result(VersionToken, Error) {
+) -> Result(Metadata, Error) {
   let body = encode_group(group) |> json.to_string |> bit_array.from_string
-  storage.put(
-    state.storage,
-    state.key,
-    body,
-    storage.IfUnchanged(state.version),
-  )
-  |> result.map(fn(metadata) { metadata.version })
-  |> result.map_error(storage_error)
+  case
+    storage.put(
+      state.storage,
+      state.key,
+      body,
+      storage.IfUnchanged(state.metadata.version),
+    )
+  {
+    Ok(metadata) -> Ok(metadata)
+    Error(storage.PreconditionFailed(_)) ->
+      confirm_group_write(state.storage, state.key, body)
+    Error(error) -> Error(storage_error(error))
+  }
+}
+
+fn confirm_group_write(
+  backend: Storage,
+  key: String,
+  intended_body: BitArray,
+) -> Result(Metadata, Error) {
+  case storage.get(backend, key) {
+    Ok(object) if object.body == intended_body -> Ok(object.metadata)
+    Ok(_) | Error(storage.PreconditionFailed(_)) -> Error(ConcurrentGroupUpdate)
+    Error(error) -> Error(StorageFailed(error))
+  }
 }
 
 fn storage_error(error: storage.Error) -> Error {
@@ -695,18 +917,25 @@ fn validate(config: Config, group: AgentGroup) -> Result(Nil, Error) {
     True -> Ok(Nil)
     False -> Error(InvalidGroup("lease duration must be positive"))
   })
-  use _ <- result.try(case string.trim(group.id), group.agents {
-    "", _ -> Error(InvalidGroup("group id cannot be empty"))
-    _, [] -> Error(InvalidGroup("agent group must contain at least one agent"))
-    _, _ -> Ok(Nil)
-  })
   use _ <- result.try(
-    config.definitions
-    |> list.try_fold([], fn(ids, definition) {
-      case list.contains(ids, definition.id) {
-        True ->
-          Error(InvalidGroup("duplicate agent definition: " <> definition.id))
-        False -> Ok([definition.id, ..ids])
+    case
+      string.trim(group.id),
+      string.trim(group.model_catalog_key),
+      group.agents
+    {
+      "", _, _ -> Error(InvalidGroup("group id cannot be empty"))
+      _, "", _ -> Error(InvalidGroup("model catalog key cannot be empty"))
+      _, _, [] ->
+        Error(InvalidGroup("agent group must contain at least one agent"))
+      _, _, _ -> Ok(Nil)
+    },
+  )
+  use _ <- result.try(
+    config.profiles
+    |> list.try_fold([], fn(ids, profile) {
+      case list.contains(ids, profile.id) {
+        True -> Error(InvalidGroup("duplicate agent profile: " <> profile.id))
+        False -> Ok([profile.id, ..ids])
       }
     })
     |> result.map(fn(_) { Nil }),
@@ -724,19 +953,30 @@ fn validate(config: Config, group: AgentGroup) -> Result(Nil, Error) {
   group.agents
   |> list.filter(fn(state) { state.status == agent.Ready })
   |> list.try_each(fn(state) {
-    use _ <- result.try(find_definition(config.definitions, state.id))
-    model_catalog.lookup(config.catalog, state.model_id)
+    find_profile(config.profiles, state.profile_id)
+    |> result.map(fn(_) { Nil })
+  })
+}
+
+fn validate_models(
+  group: AgentGroup,
+  catalog: model_catalog.Catalog,
+) -> Result(Nil, Error) {
+  group.agents
+  |> list.filter(fn(state) { state.status == agent.Ready })
+  |> list.try_each(fn(state) {
+    model_catalog.lookup(catalog, state.model_id)
     |> result.map(fn(_) { Nil })
     |> result.map_error(fn(_) { UnknownModel(state.id, state.model_id) })
   })
 }
 
-fn find_definition(
-  definitions: List(AgentDefinition),
+fn find_profile(
+  profiles: List(agent_profile.AgentProfile),
   id: String,
-) -> Result(AgentDefinition, Error) {
-  list.find(definitions, fn(definition) { definition.id == id })
-  |> result.map_error(fn(_) { MissingDefinition(id) })
+) -> Result(agent_profile.AgentProfile, Error) {
+  list.find(profiles, fn(profile) { profile.id == id })
+  |> result.map_error(fn(_) { MissingProfile(id) })
 }
 
 fn find_agent(
@@ -806,6 +1046,7 @@ fn encode_group(group: AgentGroup) -> json.Json {
   json.object([
     #("schema_version", json.int(1)),
     #("id", json.string(group.id)),
+    #("model_catalog_key", json.string(group.model_catalog_key)),
     #("revision", json.int(group.revision)),
     #("agents", json.array(group.agents, agent.encode_state)),
     #("execution", encode_execution(group.execution)),
@@ -829,14 +1070,22 @@ fn encode_execution(execution: ExecutionState) -> json.Json {
 fn group_decoder() -> decode.Decoder(AgentGroup) {
   use schema <- decode.field("schema_version", decode.int)
   use id <- decode.field("id", decode.string)
+  use model_catalog_key <- decode.field("model_catalog_key", decode.string)
   use revision <- decode.field("revision", decode.int)
   use agents <- decode.field("agents", decode.list(of: agent.state_decoder()))
   use execution <- decode.field("execution", execution_decoder())
   case schema {
-    1 -> decode.success(AgentGroup(id, revision, agents, execution))
+    1 ->
+      decode.success(AgentGroup(
+        id,
+        model_catalog_key,
+        revision,
+        agents,
+        execution,
+      ))
     _ ->
       decode.failure(
-        AgentGroup("", 0, [], Idle),
+        AgentGroup("", "", 0, [], Idle),
         "unsupported agent-group schema",
       )
   }

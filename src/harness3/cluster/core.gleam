@@ -13,10 +13,14 @@ import gleam/httpc
 import gleam/int
 import gleam/json
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
 import gleam/string
 import gleam/uri
+import harness3/agent_group
+import harness3/agent_group_registry
+import harness3/cluster/recovery
 import harness3/storage.{type Storage}
 import mist.{type ResponseData}
 
@@ -29,7 +33,7 @@ pub type Config {
     storage: Storage,
     node_ip: String,
     node_port: Int,
-    plugins: List(Plugin),
+    rpc_plugins: List(RpcPlugin),
     max_request_bytes: Int,
   )
 }
@@ -39,13 +43,13 @@ pub fn config(storage: Storage, node_ip: String, node_port: Int) -> Config {
     storage:,
     node_ip:,
     node_port:,
-    plugins: [],
+    rpc_plugins: [],
     max_request_bytes: default_max_request_bytes,
   )
 }
 
-pub fn with_plugin(config: Config, plugin: Plugin) -> Config {
-  Config(..config, plugins: [plugin, ..config.plugins])
+pub fn with_rpc_plugin(config: Config, plugin: RpcPlugin) -> Config {
+  Config(..config, rpc_plugins: [plugin, ..config.rpc_plugins])
 }
 
 pub fn with_max_request_bytes(config: Config, bytes: Int) -> Config {
@@ -91,12 +95,12 @@ pub fn raw_method(
   Method(name, fn(term) { handler(term) |> result.map(term_to_binary) })
 }
 
-pub opaque type Plugin {
-  Plugin(methods: List(Method))
+pub opaque type RpcPlugin {
+  RpcPlugin(methods: List(Method))
 }
 
-pub fn plugin(methods: List(Method)) -> Plugin {
-  Plugin(methods)
+pub fn rpc_plugin(methods: List(Method)) -> RpcPlugin {
+  RpcPlugin(methods)
 }
 
 pub type StartError {
@@ -106,6 +110,7 @@ pub type StartError {
   ListenerAddressUnavailable
   MembershipWriteFailed(error: storage.Error)
   RefresherFailed(reason: String)
+  RecoveryLeaderFailed(reason: String)
 }
 
 pub type CallError {
@@ -122,6 +127,7 @@ pub opaque type Cluster {
     membership_key: String,
     listener: Pid,
     refresher: Subject(Control),
+    recovery: recovery.Handle,
   )
 }
 
@@ -211,7 +217,7 @@ type ListenerInfo {
 }
 
 type Control {
-  Refresh(subject: Subject(Control))
+  Refresh(subject: Subject(Control), reply: Option(Subject(Nil)))
   Shutdown
 }
 
@@ -227,7 +233,7 @@ type RefreshState {
 
 pub fn start(config: Config) -> Result(Cluster, StartError) {
   use _ <- result.try(validate_config(config))
-  use registry <- result.try(build_registry(config.plugins))
+  use registry <- result.try(build_registry(config.rpc_plugins))
 
   let token =
     crypto.strong_random_bytes(32)
@@ -297,16 +303,52 @@ pub fn start(config: Config) -> Result(Cluster, StartError) {
     process.send_after(
       refresh_subject,
       refresh_interval_ms,
-      Refresh(refresh_subject),
+      Refresh(refresh_subject, None),
     )
 
-  Ok(Cluster(token, ip, port, key, listener_pid, refresh_subject))
+  use recovery_handle <- result.try(
+    recovery.start(config.storage, token, fn(ip, port, token, group_key) {
+      call(ip, port, token, "resume_agent_group", group_key, decode.string)
+      |> result.map(fn(_) { Nil })
+      |> result.map_error(string.inspect)
+    })
+    |> result.map_error(fn(error) {
+      process.send(refresh_subject, Shutdown)
+      process.send_exit(listener_pid)
+      RecoveryLeaderFailed(string.inspect(error))
+    }),
+  )
+
+  Ok(Cluster(
+    token,
+    ip,
+    port,
+    key,
+    listener_pid,
+    refresh_subject,
+    recovery_handle,
+  ))
 }
 
 pub fn stop(cluster: Cluster) -> Nil {
-  let Cluster(listener:, refresher:, ..) = cluster
+  let Cluster(listener:, refresher:, recovery: recovery_handle, ..) = cluster
+  recovery.stop(recovery_handle)
   process.send(refresher, Shutdown)
   process.send_exit(listener)
+}
+
+/// Publishes the current membership immediately and returns after storage has
+/// acknowledged the write.
+pub fn refresh(cluster: Cluster) -> Nil {
+  let Cluster(refresher:, ..) = cluster
+  process.call_forever(refresher, fn(reply) { Refresh(refresher, Some(reply)) })
+}
+
+pub fn recovery_candidates(
+  cluster: Cluster,
+) -> List(agent_group.RunningIndexEntry) {
+  let Cluster(recovery: recovery_handle, ..) = cluster
+  recovery.candidates(recovery_handle)
 }
 
 fn validate_config(config: Config) -> Result(Nil, StartError) {
@@ -320,11 +362,11 @@ fn validate_config(config: Config) -> Result(Nil, StartError) {
   }
 }
 
-fn build_registry(plugins: List(Plugin)) -> Result(Registry, StartError) {
+fn build_registry(plugins: List(RpcPlugin)) -> Result(Registry, StartError) {
   plugins
   |> list.reverse
   |> list.flat_map(fn(plugin) {
-    let Plugin(methods) = plugin
+    let RpcPlugin(methods) = plugin
     methods
   })
   |> insert_methods(dict.new())
@@ -431,10 +473,12 @@ fn membership_object_key(ip: String, port: Int) -> String {
 }
 
 fn membership_body(token: String, ip: String, port: Int) -> BitArray {
+  let agent_groups = agent_group_registry.alive_ids()
   json.object([
     #("token", json.string(token)),
     #("ip", json.string(ip)),
     #("port", json.int(port)),
+    #("agent_groups", json.array(agent_groups, json.string)),
     #("refreshed_at", json.int(system_time(Second))),
   ])
   |> json.to_string
@@ -462,9 +506,14 @@ fn handle_control(
 ) -> actor.Next(RefreshState, Control) {
   let RefreshState(storage: backend, key:, token:, ip:, port:) = state
   case message {
-    Refresh(subject) -> {
-      let _ = write_membership(backend, key, token, ip, port)
-      let _ = process.send_after(subject, refresh_interval_ms, Refresh(subject))
+    Refresh(subject, reply) -> {
+      let written = write_membership(backend, key, token, ip, port)
+      case written, reply {
+        Ok(_), Some(reply) -> process.send(reply, Nil)
+        _, _ -> Nil
+      }
+      let _ =
+        process.send_after(subject, refresh_interval_ms, Refresh(subject, None))
       actor.continue(state)
     }
     Shutdown -> {

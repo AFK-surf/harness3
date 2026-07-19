@@ -6,11 +6,17 @@ import gleam/erlang/process.{type Monitor, type Subject}
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/otp/actor
+import gleam/result
+import gleam/string
 import harness3/agent
 import harness3/agent_group
+import harness3/agent_group_registry
+import harness3/agent_profile
 import harness3/llm
 import harness3/model_catalog
 import harness3/plugin
+import harness3/storage
 import harness3/storage/local
 
 @external(erlang, "file", "del_dir_r")
@@ -18,6 +24,56 @@ fn remove_directory(path: String) -> Dynamic
 
 type GateMessage {
   Started(release: Subject(Nil))
+}
+
+type AmbiguityMessage {
+  Ambiguate(
+    body: BitArray,
+    condition: storage.PutCondition,
+    reply: Subject(Bool),
+  )
+}
+
+fn handle_ambiguity(
+  triggered: Bool,
+  message: AmbiguityMessage,
+) -> actor.Next(Bool, AmbiguityMessage) {
+  let Ambiguate(body, condition, reply) = message
+  let body = bit_array.to_string(body) |> result.unwrap("")
+  let should_ambiguate = case condition {
+    storage.IfUnchanged(_) -> !triggered && string.contains(body, "\"round\":1")
+    _ -> False
+  }
+  process.send(reply, should_ambiguate)
+  actor.continue(triggered || should_ambiguate)
+}
+
+fn ambiguous_commit_storage(backend: storage.Storage) -> storage.Storage {
+  let assert Ok(started) =
+    actor.new(False)
+    |> actor.on_message(handle_ambiguity)
+    |> actor.start
+  let control = started.data
+  storage.from_functions(
+    get: fn(key) { storage.get(backend, key) },
+    head: fn(key) { storage.head(backend, key) },
+    put: fn(key, body, condition) {
+      let ambiguous =
+        process.call_forever(control, fn(reply) {
+          Ambiguate(body, condition, reply)
+        })
+      case storage.put(backend, key, body, condition), ambiguous {
+        Ok(_), True -> Error(storage.PreconditionFailed(key))
+        result, _ -> result
+      }
+    },
+    list: fn(prefix) { storage.list(backend, prefix) },
+    delete: fn(key) { storage.delete(backend, key) },
+    stream_get: fn(key, consume) { storage.get_stream(backend, key, consume) },
+    stream_put: fn(key, source, condition) {
+      storage.put_stream(backend, key, source, condition)
+    },
+  )
 }
 
 fn temporary_root(label: String) -> String {
@@ -42,7 +98,9 @@ fn gated_transport(
   })
 }
 
-fn crashing_gated_transport(gate: Subject(GateMessage)) -> agent.ModelTransport {
+fn crashing_gated_transport(
+  gate: Subject(GateMessage),
+) -> agent.ModelTransport {
   agent.model_transport(fn(_, _, _) {
     let release = process.new_subject()
     process.send(gate, Started(release))
@@ -75,10 +133,11 @@ pub fn parallel_agents_commit_through_group_test() {
       credentials: model_catalog.api_key("secret"),
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(storage, "catalog", catalog)
   let assert Ok(registry) = plugin.registry([])
   let gate = process.new_subject()
-  let definitions = [
-    agent_group.AgentDefinition(
+  let profiles = [
+    agent_profile.AgentProfile(
       id: "a",
       registry:,
       transport: gated_transport(gate, "A finished"),
@@ -86,7 +145,7 @@ pub fn parallel_agents_commit_through_group_test() {
       reasoning_effort: None,
       observe:,
     ),
-    agent_group.AgentDefinition(
+    agent_profile.AgentProfile(
       id: "b",
       registry:,
       transport: gated_transport(gate, "B finished"),
@@ -99,16 +158,16 @@ pub fn parallel_agents_commit_through_group_test() {
     agent_group.Config(
       storage:,
       object_key: "groups/group",
-      catalog:,
-      definitions:,
+      profiles:,
       lease_duration_seconds: 10,
     )
   let initial =
-    agent_group.new("group", [
+    agent_group.new("group", "catalog", [
       agent.state("a", "model"),
       agent.state("b", "model"),
     ])
-  let assert Ok(group) = agent_group.create(config, initial)
+  let assert Ok(loaded) = agent_group.create(config, initial)
+  let assert Ok(group) = agent_group.wake(loaded)
   let group_monitor = process.monitor(agent_group.pid(group))
   let agent_monitors =
     agent_group.agent_pids(group)
@@ -144,6 +203,7 @@ pub fn linked_agent_crash_terminates_process_tree_test() {
       credentials: model_catalog.api_key("secret"),
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(storage, "catalog", catalog)
   let assert Ok(registry) = plugin.registry([])
   let crashing_gate = process.new_subject()
   let sibling_gate = process.new_subject()
@@ -151,9 +211,8 @@ pub fn linked_agent_crash_terminates_process_tree_test() {
     agent_group.Config(
       storage:,
       object_key: "groups/crash",
-      catalog:,
-      definitions: [
-        agent_group.AgentDefinition(
+      profiles: [
+        agent_profile.AgentProfile(
           id: "crashing",
           registry:,
           transport: crashing_gated_transport(crashing_gate),
@@ -161,7 +220,7 @@ pub fn linked_agent_crash_terminates_process_tree_test() {
           reasoning_effort: None,
           observe:,
         ),
-        agent_group.AgentDefinition(
+        agent_profile.AgentProfile(
           id: "sibling",
           registry:,
           transport: gated_transport(sibling_gate, "never completed"),
@@ -173,14 +232,18 @@ pub fn linked_agent_crash_terminates_process_tree_test() {
       lease_duration_seconds: 10,
     )
   let initial =
-    agent_group.new("crash", [
+    agent_group.new("crash", "catalog", [
       agent.state("crashing", "model"),
       agent.state("sibling", "model"),
     ])
   let started = process.new_subject()
   let owner =
     process.spawn_unlinked(fn() {
-      process.send(started, agent_group.create(config, initial))
+      let started_group = case agent_group.create(config, initial) {
+        Ok(loaded) -> agent_group.wake(loaded)
+        Error(error) -> Error(error)
+      }
+      process.send(started, started_group)
       process.sleep_forever()
     })
   let assert Ok(Ok(group)) = process.receive(started, within: 5000)
@@ -206,6 +269,7 @@ pub fn encrypted_reasoning_state_round_trip_test() {
   let original =
     agent.State(
       id: "agent",
+      profile_id: "agent",
       revision: 2,
       model_id: "model",
       round: 3,
@@ -256,6 +320,7 @@ pub fn full_agent_loop_with_mocked_llm_test() {
       credentials: model_catalog.api_key("secret"),
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(storage, "catalog", catalog)
 
   let tool =
     plugin.tool(
@@ -316,9 +381,8 @@ pub fn full_agent_loop_with_mocked_llm_test() {
     agent_group.Config(
       storage:,
       object_key: "groups/full-loop",
-      catalog:,
-      definitions: [
-        agent_group.AgentDefinition(
+      profiles: [
+        agent_profile.AgentProfile(
           id: "agent",
           registry:,
           transport:,
@@ -329,11 +393,12 @@ pub fn full_agent_loop_with_mocked_llm_test() {
       ],
       lease_duration_seconds: 10,
     )
-  let assert Ok(group) =
+  let assert Ok(loaded) =
     agent_group.create(
       config,
-      agent_group.new("full-loop", [agent.state("agent", "model")]),
+      agent_group.new("full-loop", "catalog", [agent.state("agent", "model")]),
     )
+  let assert Ok(group) = agent_group.wake(loaded)
   let group_monitor = process.monitor(agent_group.pid(group))
   await_down(group_monitor)
   let assert Ok(snapshot) = agent_group.load(config)
@@ -381,6 +446,7 @@ pub fn plugin_callback_between_agents_test() {
       credentials: model_catalog.api_key("secret"),
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(storage, "catalog", catalog)
 
   let receiver_plugin =
     plugin.new("receiver_plugin", "{\"calls\":0}")
@@ -457,9 +523,8 @@ pub fn plugin_callback_between_agents_test() {
     agent_group.Config(
       storage:,
       object_key: "groups/cross-agent",
-      catalog:,
-      definitions: [
-        agent_group.AgentDefinition(
+      profiles: [
+        agent_profile.AgentProfile(
           id: "caller",
           registry: caller_registry,
           transport: caller_transport,
@@ -467,7 +532,7 @@ pub fn plugin_callback_between_agents_test() {
           reasoning_effort: None,
           observe:,
         ),
-        agent_group.AgentDefinition(
+        agent_profile.AgentProfile(
           id: "receiver",
           registry: receiver_registry,
           transport: receiver_transport,
@@ -478,14 +543,15 @@ pub fn plugin_callback_between_agents_test() {
       ],
       lease_duration_seconds: 10,
     )
-  let assert Ok(group) =
+  let assert Ok(loaded) =
     agent_group.create(
       config,
-      agent_group.new("cross-agent", [
+      agent_group.new("cross-agent", "catalog", [
         agent.state("caller", "model"),
         agent.state("receiver", "model"),
       ]),
     )
+  let assert Ok(group) = agent_group.wake(loaded)
   let group_monitor = process.monitor(agent_group.pid(group))
   await_down(group_monitor)
   let assert Ok(snapshot) = agent_group.load(config)
@@ -505,5 +571,303 @@ pub fn plugin_callback_between_agents_test() {
   assert receiver.plugin_generation == 1
   assert snapshot.revision >= 5
 
+  remove_directory(root)
+}
+
+pub fn create_is_dormant_and_wake_registers_and_indexes_until_stop_test() {
+  let root = temporary_root("agent-group-lifecycle-test")
+  let backend = local.new(local.config(root))
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let gate = process.new_subject()
+  let profile =
+    agent_profile.AgentProfile(
+      "shared-profile",
+      registry,
+      gated_transport(gate, "done"),
+      None,
+      None,
+      observe,
+    )
+  let config = agent_group.Config(backend, "groups/lifecycle", [profile], 10)
+  let state =
+    agent.State(
+      ..agent.state("agent-instance", "model"),
+      profile_id: "shared-profile",
+    )
+  let assert Ok(loaded) =
+    agent_group.create(config, agent_group.new("lifecycle", "catalog", [state]))
+  assert agent_group.loaded_state(loaded).execution == agent_group.Idle
+  assert !list.contains(agent_group_registry.alive_ids(), "lifecycle")
+  let assert Ok(index) =
+    storage.list(backend, agent_group.running_index_prefix())
+  assert list.is_empty(index)
+
+  let assert Ok(group) = agent_group.wake(loaded)
+  let group_monitor = process.monitor(agent_group.pid(group))
+  let assert Ok(Started(_)) = process.receive(gate, within: 2000)
+  assert list.contains(agent_group_registry.alive_ids(), "lifecycle")
+  let assert Ok(index) =
+    storage.list(backend, agent_group.running_index_prefix())
+  assert list.length(index) == 1
+  assert agent_group.stop(group) == Ok(Nil)
+  await_down(group_monitor)
+
+  assert !list.contains(agent_group_registry.alive_ids(), "lifecycle")
+  let assert Ok(index) =
+    storage.list(backend, agent_group.running_index_prefix())
+  assert list.is_empty(index)
+  let assert Ok(snapshot) = agent_group.load(config)
+  assert snapshot.execution == agent_group.Idle
+  let assert [preserved] = snapshot.agents
+  assert preserved.profile_id == "shared-profile"
+  assert preserved.round == 0
+  remove_directory(root)
+}
+
+pub fn wake_loads_the_model_catalog_on_demand_test() {
+  let root = temporary_root("agent-group-catalog-test")
+  let backend = local.new(local.config(root))
+  let old_model =
+    model_catalog.Model(
+      "model",
+      "old-name",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+    )
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), old_model)
+  let assert Ok(catalog_session) =
+    model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      assert request.model == "new-name"
+      let assert Ok(Nil) = consume(llm.MessageStart("message", "new-name"))
+      let assert Ok(Nil) = consume(llm.TextDelta(0, "done"))
+      let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+      let assert Ok(Nil) = consume(llm.MessageStop)
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config = agent_group.Config(backend, "groups/catalog", [profile], 10)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("catalog-group", "catalog", [
+        agent.state("agent", "model"),
+      ]),
+    )
+  let new_model = model_catalog.Model(..old_model, name: "new-name")
+  let assert Ok(updated_catalog) = model_catalog.put_model(catalog, new_model)
+  let assert Ok(_) = model_catalog.commit(catalog_session, updated_catalog)
+
+  let assert Ok(group) = agent_group.wake(loaded)
+  await_down(process.monitor(agent_group.pid(group)))
+  let assert Ok(snapshot) = agent_group.load(config)
+  let assert [completed] = snapshot.agents
+  assert completed.status == agent.Completed
+  assert completed.last_catalog_revision == Some(1)
+  remove_directory(root)
+}
+
+pub fn concurrent_storage_update_terminates_and_unregisters_coordinator_test() {
+  let root = temporary_root("agent-group-fencing-test")
+  let backend = local.new(local.config(root))
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let gate = process.new_subject()
+  let config =
+    agent_group.Config(
+      backend,
+      "groups/fenced",
+      [
+        agent_profile.AgentProfile(
+          "agent",
+          registry,
+          gated_transport(gate, "will conflict"),
+          None,
+          None,
+          observe,
+        ),
+      ],
+      10,
+    )
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("fenced", "catalog", [agent.state("agent", "model")]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let group_monitor = process.monitor(agent_group.pid(group))
+  let assert Ok(Started(release)) = process.receive(gate, within: 2000)
+  let assert Ok(claimed) = storage.get(backend, "groups/fenced")
+  let assert Ok(claimed_body) = bit_array.to_string(claimed.body)
+  let assert Ok(_) =
+    storage.put(
+      backend,
+      "groups/fenced",
+      bit_array.from_string(claimed_body <> " "),
+      storage.IfUnchanged(claimed.metadata.version),
+    )
+  process.send(release, Nil)
+  await_down(group_monitor)
+
+  assert !list.contains(agent_group_registry.alive_ids(), "fenced")
+  let assert Ok(index) =
+    storage.list(backend, agent_group.running_index_prefix())
+  assert list.length(index) == 1
+  remove_directory(root)
+}
+
+pub fn expired_lease_terminates_and_unregisters_coordinator_test() {
+  let root = temporary_root("agent-group-expired-lease-test")
+  let backend = local.new(local.config(root))
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let gate = process.new_subject()
+  let config =
+    agent_group.Config(
+      backend,
+      "groups/expired",
+      [
+        agent_profile.AgentProfile(
+          "agent",
+          registry,
+          gated_transport(gate, "never committed"),
+          None,
+          None,
+          observe,
+        ),
+      ],
+      1,
+    )
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("expired", "catalog", [agent.state("agent", "model")]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let monitor = process.monitor(agent_group.pid(group))
+  let assert Ok(Started(_)) = process.receive(gate, within: 2000)
+  await_down(monitor)
+  assert !list.contains(agent_group_registry.alive_ids(), "expired")
+  let assert Ok(index) =
+    storage.list(backend, agent_group.running_index_prefix())
+  assert list.length(index) == 1
+  remove_directory(root)
+}
+
+pub fn ambiguous_successful_cas_is_idempotent_and_fences_next_commit_test() {
+  let root = temporary_root("agent-group-ambiguous-cas-test")
+  let local_backend = local.new(local.config(root))
+  let backend = ambiguous_commit_storage(local_backend)
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+
+  let tool =
+    plugin.tool(
+      llm.Tool(
+        "continue_once",
+        None,
+        json.object([#("type", json.string("object"))]),
+      ),
+      fn(state, context, _) {
+        Ok(plugin.hook_result(
+          state,
+          context,
+          plugin.ToolOutput([llm.Text("continue")], False),
+        ))
+      },
+    )
+  let assert Ok(registry) =
+    plugin.registry([plugin.new("tool", "{}") |> plugin.with_tool(tool)])
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      let _ = case contains_tool_result(request.messages) {
+        False -> {
+          let assert Ok(Nil) = consume(llm.MessageStart("first", "test-model"))
+          let assert Ok(Nil) =
+            consume(llm.ToolCallStart(0, "call", "continue_once"))
+          let assert Ok(Nil) = consume(llm.ToolCallArgumentsDelta(0, "{}"))
+          let assert Ok(Nil) = consume(llm.ContentStop(0))
+          let assert Ok(Nil) = consume(llm.Finished(llm.ToolUse))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+        }
+        True -> {
+          let assert Ok(Nil) = consume(llm.MessageStart("second", "test-model"))
+          let assert Ok(Nil) = consume(llm.TextDelta(0, "done"))
+          let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+        }
+      }
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config = agent_group.Config(backend, "groups/ambiguous", [profile], 10)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("ambiguous", "catalog", [agent.state("agent", "model")]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  await_down(process.monitor(agent_group.pid(group)))
+  let assert Ok(snapshot) = agent_group.load(config)
+  let assert [completed] = snapshot.agents
+  assert completed.status == agent.Completed
+  assert completed.round == 2
+  assert completed.revision == 2
   remove_directory(root)
 }

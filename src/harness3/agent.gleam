@@ -21,6 +21,7 @@ pub type Status {
 pub type State {
   State(
     id: String,
+    profile_id: String,
     revision: Int,
     model_id: String,
     round: Int,
@@ -36,6 +37,7 @@ pub type State {
 pub fn state(id: String, model_id: String) -> State {
   State(
     id:,
+    profile_id: id,
     revision: 0,
     model_id:,
     round: 0,
@@ -693,6 +695,7 @@ pub fn stop(handle: Handle) -> Nil {
 pub fn encode_state(state: State) -> Json {
   json.object([
     #("id", json.string(state.id)),
+    #("profile_id", json.string(state.profile_id)),
     #("revision", json.int(state.revision)),
     #("model_id", json.string(state.model_id)),
     #("round", json.int(state.round)),
@@ -718,6 +721,7 @@ pub fn encode_state(state: State) -> Json {
 
 pub fn state_decoder() -> decode.Decoder(State) {
   use id <- decode.field("id", decode.string)
+  use profile_id <- decode.field("profile_id", decode.string)
   use revision <- decode.field("revision", decode.int)
   use model_id <- decode.field("model_id", decode.string)
   use round <- decode.field("round", decode.int)
@@ -744,6 +748,7 @@ pub fn state_decoder() -> decode.Decoder(State) {
   use status <- decode.field("status", status_decoder())
   decode.success(State(
     id,
+    profile_id,
     revision,
     model_id,
     round,
