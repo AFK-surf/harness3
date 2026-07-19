@@ -532,10 +532,18 @@ fn decode_message_delta(data: String) -> Result(List(Event), Error) {
       )
       decode.success(reason)
     })
-    use usage <- decode.field("usage", usage_decoder())
-    decode.success(
-      list.append(finish_events(stop_reason), [usage_event(usage)]),
+    // Not every message_delta carries usage: adaptive-thinking streams emit
+    // frames with only a stop_reason.
+    use usage <- decode.optional_field(
+      "usage",
+      None,
+      decode.optional(usage_decoder()),
     )
+    let usage = case usage {
+      Some(usage) -> [usage_event(usage)]
+      None -> []
+    }
+    decode.success(list.append(finish_events(stop_reason), usage))
   })
 }
 

@@ -24,12 +24,28 @@ pub type TokenLimitField {
   MaxTokens
 }
 
+/// Which assistant-message field carries reasoning text back to the provider
+/// when a conversation is replayed. OpenAI has no Chat Completions reasoning
+/// replay and rejects unknown message fields, so reasoning is omitted;
+/// Fireworks requires prior `reasoning_content` on interleaved-thinking
+/// tool-call turns; OpenRouter reads `reasoning`.
+pub type ReasoningReplayField {
+  OmitReasoning
+  ReasoningContentField
+  ReasoningField
+}
+
 pub type Config {
-  Config(api_key: String, base_url: String, max_tokens_field: TokenLimitField)
+  Config(
+    api_key: String,
+    base_url: String,
+    max_tokens_field: TokenLimitField,
+    reasoning_replay_field: ReasoningReplayField,
+  )
 }
 
 pub fn config(api_key: String) -> Config {
-  Config(api_key, "https://api.openai.com", MaxCompletionTokens)
+  Config(api_key, "https://api.openai.com", MaxCompletionTokens, OmitReasoning)
 }
 
 pub fn new(config: Config) -> Provider {
@@ -57,7 +73,9 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     reasoning_effort:,
     stream:,
   ) = request
-  use messages <- result.try(list.try_map(messages, encode_message))
+  use messages <- result.try(
+    list.try_map(messages, encode_message(config.reasoning_replay_field, _)),
+  )
   use tools <- result.try(list.try_map(tools, encode_tool))
   let fields = [
     #("model", json.string(model)),
@@ -107,7 +125,10 @@ fn role_name(role: Role) -> String {
   }
 }
 
-fn encode_message(message: Message) -> Result(Json, Error) {
+fn encode_message(
+  replay: ReasoningReplayField,
+  message: Message,
+) -> Result(Json, Error) {
   let llm.Message(role:, content:) = message
   case role {
     llm.ToolRole -> encode_tool_result_message(content)
@@ -117,6 +138,15 @@ fn encode_message(message: Message) -> Result(Json, Error) {
           !is_tool_call(part) && !is_reasoning(part)
         })
       let calls = list.filter(content, is_tool_call)
+      let reasoning =
+        content
+        |> list.filter_map(fn(part) {
+          case part {
+            Reasoning(summary, _) -> Ok(string.concat(summary))
+            _ -> Error(Nil)
+          }
+        })
+        |> string.concat
       use regular <- result.try(list.try_map(regular, encode_content))
       use calls <- result.try(list.try_map(calls, encode_tool_call))
       let fields = [#("role", json.string(role_name(role)))]
@@ -129,6 +159,14 @@ fn encode_message(message: Message) -> Result(Json, Error) {
       let fields = case calls {
         [] -> fields
         _ -> [#("tool_calls", json.preprocessed_array(calls)), ..fields]
+      }
+      let fields = case replay, reasoning {
+        OmitReasoning, _ | _, "" -> fields
+        ReasoningContentField, text -> [
+          #("reasoning_content", json.string(text)),
+          ..fields
+        ]
+        ReasoningField, text -> [#("reasoning", json.string(text)), ..fields]
       }
       Ok(json.object(fields))
     }

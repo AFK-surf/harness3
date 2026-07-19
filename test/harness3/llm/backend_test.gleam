@@ -267,6 +267,7 @@ pub fn chat_completions_max_tokens_field_test() {
       api_key: "key",
       base_url: "https://api.fireworks.ai/inference",
       max_tokens_field: openai_chat_completions.MaxTokens,
+      reasoning_replay_field: openai_chat_completions.OmitReasoning,
     ))
   let assert Ok(llm.HttpRequest(url:, body:, ..)) =
     llm.build_request(
@@ -341,6 +342,63 @@ pub fn anthropic_finish_reasons_test() {
       "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"model_context_window_exceeded\"},\"usage\":{\"output_tokens\":5}}",
     )
   assert list.contains(overflow, llm.Finished(llm.Length))
+}
+
+pub fn anthropic_message_delta_without_usage_test() {
+  let provider = anthropic_messages.new(anthropic_messages.config("key"))
+  // Adaptive-thinking streams emit message_delta frames without usage.
+  let assert Ok(events) =
+    llm.decode_stream_event(
+      provider,
+      "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}}",
+    )
+  assert events == [llm.Finished(llm.Stop)]
+}
+
+pub fn chat_completions_reasoning_replay_test() {
+  let request =
+    llm.request("test-model", [
+      llm.Message(llm.Assistant, [
+        llm.Reasoning(["Prior ", "thinking"], None),
+        llm.ToolCall("call_1", "lookup", json.object([])),
+      ]),
+      llm.Message(llm.ToolRole, [
+        llm.ToolResult("call_1", [llm.Text("ok")], False),
+      ]),
+    ])
+
+  let assert Ok(llm.HttpRequest(body: openai_body, ..)) =
+    llm.build_request(
+      openai_chat_completions.new(openai_chat_completions.config("key")),
+      request,
+    )
+  assert !string.contains(openai_body, "Prior thinking")
+
+  let fireworks =
+    openai_chat_completions.new(openai_chat_completions.Config(
+      api_key: "key",
+      base_url: "https://api.fireworks.ai/inference",
+      max_tokens_field: openai_chat_completions.MaxTokens,
+      reasoning_replay_field: openai_chat_completions.ReasoningContentField,
+    ))
+  let assert Ok(llm.HttpRequest(body: fireworks_body, ..)) =
+    llm.build_request(fireworks, request)
+  assert string.contains(
+    fireworks_body,
+    "\"reasoning_content\":\"Prior thinking\"",
+  )
+
+  let openrouter =
+    openai_chat_completions.new(openai_chat_completions.Config(
+      api_key: "key",
+      base_url: "https://openrouter.ai/api",
+      max_tokens_field: openai_chat_completions.MaxCompletionTokens,
+      reasoning_replay_field: openai_chat_completions.ReasoningField,
+    ))
+  let assert Ok(llm.HttpRequest(body: openrouter_body, ..)) =
+    llm.build_request(openrouter, request)
+  assert string.contains(openrouter_body, "\"reasoning\":\"Prior thinking\"")
+  assert !string.contains(openrouter_body, "reasoning_content")
 }
 
 pub fn chat_completions_reasoning_delta_test() {

@@ -162,6 +162,7 @@ pub fn provider(model: Model) -> Provider {
         api_key,
         model.endpoint,
         openai_chat_completions.MaxCompletionTokens,
+        openai_chat_completions.OmitReasoning,
       ))
     OpenAIResponses ->
       openai_responses.new(openai_responses.Config(api_key, model.endpoint))
