@@ -46,7 +46,6 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     messages:,
     tools:,
     max_output_tokens:,
-    temperature:,
     reasoning_effort:,
     stream:,
   ) = request
@@ -65,18 +64,11 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     _ -> [#("tools", json.preprocessed_array(tools)), ..fields]
   }
   let fields = add_optional_int(fields, "max_output_tokens", max_output_tokens)
-  let fields = add_optional_float(fields, "temperature", temperature)
-  // summary: "auto" opts into the reasoning summaries the decoder surfaces
-  // as ReasoningDelta events.
+  // Reasoning summaries are not requested: `summary` requires a verified
+  // organization and 400s otherwise.
   let fields = case reasoning_effort {
     Some(effort) -> [
-      #(
-        "reasoning",
-        json.object([
-          #("effort", json.string(effort)),
-          #("summary", json.string("auto")),
-        ]),
-      ),
+      #("reasoning", json.object([#("effort", json.string(effort))])),
       ..fields
     ]
     None -> fields
@@ -300,15 +292,8 @@ fn add_optional_int(fields, name, value: Option(Int)) {
   }
 }
 
-fn add_optional_float(fields, name, value: Option(Float)) {
-  case value {
-    Some(value) -> [#(name, json.float(value)), ..fields]
-    None -> fields
-  }
-}
-
 type UsageData {
-  UsageData(input: Int, output: Int, cached: Int)
+  UsageData(input: Int, output: Int, cached: Int, cache_write: Option(Int))
 }
 
 type PartData {
@@ -343,11 +328,16 @@ type ResponseData {
 fn usage_decoder() -> decode.Decoder(UsageData) {
   use input <- decode.field("input_tokens", decode.int)
   use output <- decode.field("output_tokens", decode.int)
-  use cached <- decode.optional_field("input_tokens_details", 0, {
+  use details <- decode.optional_field("input_tokens_details", #(0, None), {
     use cached <- decode.optional_field("cached_tokens", 0, decode.int)
-    decode.success(cached)
+    use cache_write <- decode.optional_field(
+      "cache_write_tokens",
+      None,
+      decode.optional(decode.int),
+    )
+    decode.success(#(cached, cache_write))
   })
-  decode.success(UsageData(input, output, cached))
+  decode.success(UsageData(input, output, details.0, details.1))
 }
 
 fn part_decoder() -> decode.Decoder(PartData) {
@@ -681,12 +671,12 @@ fn decode_terminal(data: String) -> Result(List(Event), Error) {
 
 fn usage_events(usage: Option(UsageData)) -> List(Event) {
   case usage {
-    Some(UsageData(input, output, cached)) -> [
+    Some(UsageData(input, output, cached, cache_write)) -> [
       UsageReported(Usage(
         input_tokens: Some(input),
         output_tokens: Some(output),
         cache_read_tokens: Some(cached),
-        cache_write_tokens: None,
+        cache_write_tokens: cache_write,
       )),
     ]
     None -> []

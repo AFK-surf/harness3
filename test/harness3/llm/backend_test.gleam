@@ -26,7 +26,6 @@ fn multimodal_request() -> llm.Request {
       ),
     ],
     max_output_tokens: Some(128),
-    temperature: Some(0.2),
     reasoning_effort: None,
     stream: True,
   )
@@ -68,6 +67,10 @@ pub fn multimodal_requests_test() {
   assert string.contains(anthropic_body, "\"type\":\"base64\"")
   assert string.contains(anthropic_body, "\"type\":\"file\"")
   assert string.contains(anthropic_body, "input_schema")
+  assert string.contains(
+    anthropic_body,
+    "\"cache_control\":{\"type\":\"ephemeral\"}",
+  )
   assert list.contains(anthropic_headers, #(
     "anthropic-beta",
     "files-api-2025-04-14",
@@ -91,7 +94,6 @@ pub fn tool_call_replay_request_test() {
       ],
       tools: [],
       max_output_tokens: None,
-      temperature: None,
       reasoning_effort: None,
       stream: False,
     )
@@ -205,7 +207,7 @@ pub fn chat_completions_stream_test() {
   let start =
     "{\"id\":\"chatcmpl_1\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}],\"usage\":null}"
   let usage =
-    "{\"id\":\"chatcmpl_1\",\"model\":\"gpt-test\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":6,\"total_tokens\":18,\"prompt_tokens_details\":{\"cached_tokens\":4}}}"
+    "{\"id\":\"chatcmpl_1\",\"model\":\"gpt-test\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":6,\"total_tokens\":18,\"prompt_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":5}}}"
 
   let decoder = llm.stream_decoder(provider)
   let #(decoder, first) = llm.push(decoder, "data: " <> start)
@@ -218,7 +220,28 @@ pub fn chat_completions_stream_test() {
   assert list.contains(events, llm.MessageStart("chatcmpl_1", "gpt-test"))
   assert list.contains(events, llm.TextDelta(0, "Hello"))
   assert list.contains(events, llm.MessageStop)
-  assert stats(events) == llm.Stats(12, 6, 4, 0)
+  assert stats(events) == llm.Stats(12, 6, 4, 5)
+}
+
+pub fn chat_completions_embedded_error_test() {
+  let provider =
+    openai_chat_completions.new(openai_chat_completions.config("key"))
+  // OpenAI-style mid-stream error frame: bare `error` object with a string
+  // type and no choices.
+  let assert Error(llm.ApiError(0, "server_error", "The server had an error")) =
+    llm.decode_stream_event(
+      provider,
+      "{\"error\":{\"message\":\"The server had an error\",\"type\":\"server_error\",\"param\":null,\"code\":null}}",
+    )
+  // OpenRouter-style: a chunk with a top-level `error` (integer code)
+  // alongside a finish_reason "error" choice, delivered mid-stream or on a
+  // 200-status body.
+  let openrouter =
+    "{\"id\":\"chatcmpl_1\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}],\"error\":{\"code\":502,\"message\":\"Provider disconnected\"}}"
+  let assert Error(llm.ApiError(502, "api_error", "Provider disconnected")) =
+    llm.decode_stream_event(provider, openrouter)
+  let assert Error(llm.ApiError(502, "api_error", "Provider disconnected")) =
+    llm.decode_response(provider, 200, openrouter)
 }
 
 pub fn chat_completions_tool_call_indices_test() {
@@ -253,7 +276,6 @@ pub fn chat_completions_max_tokens_field_test() {
         messages: [llm.Message(llm.User, [llm.Text("hi")])],
         tools: [],
         max_output_tokens: Some(128),
-        temperature: None,
         reasoning_effort: None,
         stream: True,
       ),
@@ -294,7 +316,9 @@ pub fn reasoning_effort_request_test() {
       request,
     )
   assert string.contains(responses_body, "\"effort\":\"high\"")
-  assert string.contains(responses_body, "\"summary\":\"auto\"")
+  // Reasoning summaries require a verified organization, so they are never
+  // requested.
+  assert !string.contains(responses_body, "\"summary\":\"auto\"")
 }
 
 pub fn anthropic_finish_reasons_test() {
@@ -413,7 +437,7 @@ pub fn responses_stream_test() {
   let assert Ok(done) =
     llm.decode_stream_event(
       provider,
-      "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4},\"output_tokens\":6,\"total_tokens\":18}}}",
+      "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":5},\"output_tokens\":6,\"total_tokens\":18}}}",
     )
   let events =
     list.flatten([
@@ -436,7 +460,7 @@ pub fn responses_stream_test() {
     ),
   )
   assert list.contains(events, llm.Finished(llm.Stop))
-  assert stats(events) == llm.Stats(12, 6, 4, 0)
+  assert stats(events) == llm.Stats(12, 6, 4, 5)
 }
 
 pub fn anthropic_stream_test() {

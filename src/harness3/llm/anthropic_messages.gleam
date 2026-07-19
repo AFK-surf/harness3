@@ -47,7 +47,6 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     messages:,
     tools:,
     max_output_tokens:,
-    temperature:,
     reasoning_effort:,
     stream:,
   ) = request
@@ -67,6 +66,10 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     #("max_tokens", json.int(max_output_tokens |> option_int(1024))),
     #("messages", json.preprocessed_array(messages)),
     #("stream", json.bool(stream)),
+    // Anthropic caches nothing without an explicit breakpoint; the top-level
+    // marker auto-places it on the last cacheable block, so each turn extends
+    // the cached prefix.
+    #("cache_control", json.object([#("type", json.string("ephemeral"))])),
   ]
   let fields = case tools {
     [] -> fields
@@ -75,10 +78,6 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
   let fields = case system {
     "" -> fields
     _ -> [#("system", json.string(system)), ..fields]
-  }
-  let fields = case temperature {
-    Some(value) -> [#("temperature", json.float(value)), ..fields]
-    None -> fields
   }
   // Adaptive thinking with an effort hint; requires a Claude 4.6+ model.
   let fields = case reasoning_effort {

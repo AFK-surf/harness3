@@ -40,7 +40,6 @@ pub type AgentDefinition {
     registry: plugin.Registry,
     transport: agent.ModelTransport,
     max_output_tokens: Option(Int),
-    temperature: Option(Float),
     reasoning_effort: Option(String),
     observe: fn(agent.Event) -> Result(Nil, agent.Error),
   )
@@ -221,7 +220,6 @@ fn prepare_agents(
         registry: definition.registry,
         transport: definition.transport,
         max_output_tokens: definition.max_output_tokens,
-        temperature: definition.temperature,
         reasoning_effort: definition.reasoning_effort,
       )
     use active <- result.try(

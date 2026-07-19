@@ -54,7 +54,6 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     messages:,
     tools:,
     max_output_tokens:,
-    temperature:,
     reasoning_effort:,
     stream:,
   ) = request
@@ -75,7 +74,6 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     MaxTokens -> "max_tokens"
   }
   let fields = add_optional_int(fields, token_field, max_output_tokens)
-  let fields = add_optional_float(fields, "temperature", temperature)
   let fields = case reasoning_effort {
     Some(effort) -> [#("reasoning_effort", json.string(effort)), ..fields]
     None -> fields
@@ -283,15 +281,8 @@ fn add_optional_int(fields, name, value: Option(Int)) {
   }
 }
 
-fn add_optional_float(fields, name, value: Option(Float)) {
-  case value {
-    Some(value) -> [#(name, json.float(value)), ..fields]
-    None -> fields
-  }
-}
-
 type UsageData {
-  UsageData(input: Int, output: Int, cached: Int)
+  UsageData(input: Int, output: Int, cached: Int, cache_write: Option(Int))
 }
 
 type ToolDelta {
@@ -329,11 +320,17 @@ type Chunk {
 fn usage_decoder() -> decode.Decoder(UsageData) {
   use input <- decode.field("prompt_tokens", decode.int)
   use output <- decode.field("completion_tokens", decode.int)
-  use cached <- decode.optional_field("prompt_tokens_details", 0, {
+  use details <- decode.optional_field("prompt_tokens_details", #(0, None), {
     use cached <- decode.optional_field("cached_tokens", 0, decode.int)
-    decode.success(cached)
+    // OpenRouter reports cache writes here; OpenAI omits the field.
+    use cache_write <- decode.optional_field(
+      "cache_write_tokens",
+      None,
+      decode.optional(decode.int),
+    )
+    decode.success(#(cached, cache_write))
   })
-  decode.success(UsageData(input, output, cached))
+  decode.success(UsageData(input, output, details.0, details.1))
 }
 
 fn tool_delta_decoder() -> decode.Decoder(ToolDelta) {
@@ -441,6 +438,54 @@ fn decode_response(status: Int, body: String) -> Result(List(Event), Error) {
 }
 
 fn decode_chunk(data: String, streaming: Bool) -> Result(List(Event), Error) {
+  // OpenAI and OpenRouter report mid-generation failures as a top-level
+  // `error` object on an in-stream frame or a 200-status body; decoded as a
+  // chunk, such a payload yields no events and the failure disappears.
+  case embedded_error(data) {
+    Some(error) -> Error(error)
+    None -> decode_chunk_events(data, streaming)
+  }
+}
+
+// OpenAI errors carry a string `type`; OpenRouter errors carry an HTTP-like
+// integer `code` instead.
+fn embedded_error(data: String) -> Option(Error) {
+  let error_decoder = {
+    use status <- decode.optional_field(
+      "code",
+      0,
+      decode.one_of(decode.int, or: [decode.success(0)]),
+    )
+    use kind <- decode.optional_field(
+      "type",
+      "api_error",
+      decode.one_of(decode.string, or: [decode.success("api_error")]),
+    )
+    use message <- decode.optional_field(
+      "message",
+      data,
+      decode.one_of(decode.string, or: [decode.success(data)]),
+    )
+    decode.success(ApiError(status, kind, message))
+  }
+  let decoder = {
+    use error <- decode.optional_field(
+      "error",
+      None,
+      decode.optional(error_decoder),
+    )
+    decode.success(error)
+  }
+  case json.parse(data, decoder) {
+    Ok(Some(error)) -> Some(error)
+    _ -> None
+  }
+}
+
+fn decode_chunk_events(
+  data: String,
+  streaming: Bool,
+) -> Result(List(Event), Error) {
   use chunk <- result.try(
     json.parse(data, chunk_decoder())
     |> result.map_error(fn(error) { InvalidResponse(string.inspect(error)) }),
@@ -455,12 +500,12 @@ fn decode_chunk(data: String, streaming: Bool) -> Result(List(Event), Error) {
   }
   let events = choices |> list.flat_map(choice_events)
   let usage = case usage {
-    Some(UsageData(input, output, cached)) -> [
+    Some(UsageData(input, output, cached, cache_write)) -> [
       UsageReported(Usage(
         input_tokens: Some(input),
         output_tokens: Some(output),
         cache_read_tokens: Some(cached),
-        cache_write_tokens: None,
+        cache_write_tokens: cache_write,
       )),
     ]
     None -> []

@@ -75,7 +75,6 @@ pub type Config {
     registry: plugin.Registry,
     transport: ModelTransport,
     max_output_tokens: Option(Int),
-    temperature: Option(Float),
     reasoning_effort: Option(String),
   )
 }
@@ -322,7 +321,6 @@ pub fn run_round(
       messages:,
       tools: plugin_tools(plugins),
       max_output_tokens: config.max_output_tokens,
-      temperature: config.temperature,
       reasoning_effort: config.reasoning_effort,
       stream: True,
     )

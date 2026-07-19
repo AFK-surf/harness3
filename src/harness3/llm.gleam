@@ -55,7 +55,6 @@ pub type Request {
     messages: List(Message),
     tools: List(Tool),
     max_output_tokens: Option(Int),
-    temperature: Option(Float),
     /// Provider-defined reasoning effort (e.g. "low", "medium", "high").
     /// Requests reasoning where the provider supports it: adaptive thinking
     /// plus `output_config.effort` on Anthropic, `reasoning_effort` on Chat
@@ -72,7 +71,6 @@ pub fn request(model: String, messages: List(Message)) -> Request {
     messages:,
     tools: [],
     max_output_tokens: None,
-    temperature: None,
     reasoning_effort: None,
     stream: True,
   )
