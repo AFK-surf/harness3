@@ -56,6 +56,12 @@ pub type Request {
     tools: List(Tool),
     max_output_tokens: Option(Int),
     temperature: Option(Float),
+    /// Provider-defined reasoning effort (e.g. "low", "medium", "high").
+    /// Requests reasoning where the provider supports it: adaptive thinking
+    /// plus `output_config.effort` on Anthropic, `reasoning_effort` on Chat
+    /// Completions, and `reasoning.effort` with summaries on Responses.
+    /// Valid values are model-dependent and not validated here.
+    reasoning_effort: Option(String),
     stream: Bool,
   )
 }
@@ -67,6 +73,7 @@ pub fn request(model: String, messages: List(Message)) -> Request {
     tools: [],
     max_output_tokens: None,
     temperature: None,
+    reasoning_effort: None,
     stream: True,
   )
 }
@@ -144,12 +151,22 @@ pub type FinishReason {
   ToolUse
   ContentFilter
   Cancelled
+  /// The provider paused a long-running turn (Anthropic `pause_turn`).
+  /// Re-send the conversation with the partial assistant turn appended to
+  /// resume it.
+  Paused
   Failed(reason: String)
   Other(reason: String)
 }
 
 /// Provider-neutral streaming events. The same event sequence is produced for
 /// buffered JSON responses and individual SSE data records.
+///
+/// Lifecycle events are best-effort: providers that do not delimit content
+/// (Chat Completions) emit `TextDelta` without `ContentStart`/`ContentStop`,
+/// and some OpenAI-compatible providers repeat the fields that produce
+/// `MessageStart` and `MessageStop`, so consumers must treat repeated
+/// occurrences of either as idempotent.
 pub type Event {
   MessageStart(id: String, model: String)
   ContentStart(index: Int, kind: ContentKind)
@@ -206,13 +223,14 @@ pub fn decode_response(
   decode_response(status, body)
 }
 
-/// Decodes one SSE `data:` payload. `[DONE]` produces no events.
+/// Decodes one SSE `data:` payload. `[DONE]` marks the end of the stream and
+/// produces `MessageStop`.
 pub fn decode_stream_event(
   provider: Provider,
   data: String,
 ) -> Result(List(Event), Error) {
   case string.trim(data) {
-    "[DONE]" -> Ok([])
+    "[DONE]" -> Ok([MessageStop])
     data -> {
       let Provider(decode_stream_event:, ..) = provider
       decode_stream_event(data)

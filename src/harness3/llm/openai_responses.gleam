@@ -8,12 +8,12 @@ import harness3/llm.{
   type Content, type Error, type Event, type FinishReason, type HttpRequest,
   type ImageDetail, type MediaSource, type Message, type Provider, type Request,
   type Role, type Tool, ApiError, Assistant, Auto, Base64, Cancelled,
-  ContentStart, Developer, Document, Failed, FileId, Finished, High, HttpRequest,
-  Image, InvalidRequest, InvalidResponse, Length, Low, MessageStart, MessageStop,
-  OpenAIEncryptedReasoning, Other, Reasoning, ReasoningContent, ReasoningDelta,
-  ReasoningEncrypted, RefusalDelta, Stop, System, Text, TextContent, TextDelta,
-  ToolCall, ToolCallArgumentsDelta, ToolCallStart, ToolResult, Unsupported, Url,
-  Usage, UsageReported, User,
+  ContentFilter, ContentStart, Developer, Document, Failed, FileId, Finished,
+  High, HttpRequest, Image, InvalidRequest, InvalidResponse, Length, Low,
+  MessageStart, MessageStop, OpenAIEncryptedReasoning, Other, Reasoning,
+  ReasoningContent, ReasoningDelta, ReasoningEncrypted, RefusalDelta, Stop,
+  System, Text, TextContent, TextDelta, ToolCall, ToolCallArgumentsDelta,
+  ToolCallStart, ToolResult, Unsupported, Url, Usage, UsageReported, User,
 }
 
 pub type Config {
@@ -47,6 +47,7 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     tools:,
     max_output_tokens:,
     temperature:,
+    reasoning_effort:,
     stream:,
   ) = request
   use message_items <- result.try(list.try_map(messages, encode_message_items))
@@ -54,12 +55,32 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
   let fields = [
     #("model", json.string(model)),
     #("input", message_items |> list.flatten |> json.preprocessed_array),
+    // reasoning.encrypted_content is only available for stateless requests.
     #("include", json.array(["reasoning.encrypted_content"], json.string)),
-    #("tools", json.preprocessed_array(tools)),
+    #("store", json.bool(False)),
     #("stream", json.bool(stream)),
   ]
+  let fields = case tools {
+    [] -> fields
+    _ -> [#("tools", json.preprocessed_array(tools)), ..fields]
+  }
   let fields = add_optional_int(fields, "max_output_tokens", max_output_tokens)
   let fields = add_optional_float(fields, "temperature", temperature)
+  // summary: "auto" opts into the reasoning summaries the decoder surfaces
+  // as ReasoningDelta events.
+  let fields = case reasoning_effort {
+    Some(effort) -> [
+      #(
+        "reasoning",
+        json.object([
+          #("effort", json.string(effort)),
+          #("summary", json.string("auto")),
+        ]),
+      ),
+      ..fields
+    ]
+    None -> fields
+  }
   let Config(api_key:, ..) = config
   Ok(HttpRequest(
     method: "POST",
@@ -80,7 +101,7 @@ fn encode_message_items(message: Message) -> Result(List(Json), Error) {
     list.filter(content, fn(content) {
       !is_regular_content(content) && !is_reasoning_content(content)
     })
-  use regular <- result.try(list.try_map(regular, encode_content))
+  use regular <- result.try(list.try_map(regular, encode_content(role, _)))
   use reasoning <- result.try(list.try_map(reasoning, encode_special_item))
   use special <- result.try(list.try_map(special, encode_special_item))
   let message = case regular {
@@ -120,15 +141,21 @@ fn role_name(role: Role) -> String {
   }
 }
 
-fn encode_content(content: Content) -> Result(Json, Error) {
+fn encode_content(role: Role, content: Content) -> Result(Json, Error) {
   case content {
-    Text(text) ->
+    Text(text) -> {
+      // Replayed assistant text must use output_text; input_text is rejected.
+      let kind = case role {
+        Assistant -> "output_text"
+        _ -> "input_text"
+      }
       Ok(
         json.object([
-          #("type", json.string("input_text")),
+          #("type", json.string(kind)),
           #("text", json.string(text)),
         ]),
       )
+    }
     Image(source, detail) -> encode_image(source, detail)
     Document(source) -> encode_document(source)
     _ -> Error(InvalidRequest("expected regular message content"))
@@ -159,8 +186,25 @@ fn encode_document(source: MediaSource) -> Result(Json, Error) {
   case source {
     Url(url) -> Ok(json.object([#("file_url", json.string(url)), ..fields]))
     FileId(id) -> Ok(json.object([#("file_id", json.string(id)), ..fields]))
-    Base64(_, _) ->
-      Error(Unsupported("Responses base64 documents without a filename"))
+    Base64(media_type, data) ->
+      Ok(
+        json.object([
+          #("filename", json.string(base64_filename(media_type))),
+          #(
+            "file_data",
+            json.string("data:" <> media_type <> ";base64," <> data),
+          ),
+          ..fields
+        ]),
+      )
+  }
+}
+
+// The Responses API infers the file type from the filename extension.
+fn base64_filename(media_type: String) -> String {
+  case string.split(media_type, "/") {
+    [_, subtype] -> "document." <> subtype
+    _ -> "document"
   }
 }
 
@@ -289,6 +333,8 @@ type ResponseData {
     id: String,
     model: String,
     status: String,
+    incomplete_reason: Option(String),
+    error_message: Option(String),
     output: List(ItemData),
     usage: Option(UsageData),
   )
@@ -347,6 +393,30 @@ fn response_decoder() -> decode.Decoder(ResponseData) {
   use id <- decode.field("id", decode.string)
   use model <- decode.field("model", decode.string)
   use status <- decode.field("status", decode.string)
+  use incomplete <- decode.optional_field(
+    "incomplete_details",
+    None,
+    decode.optional({
+      use reason <- decode.optional_field(
+        "reason",
+        None,
+        decode.optional(decode.string),
+      )
+      decode.success(reason)
+    }),
+  )
+  use error <- decode.optional_field(
+    "error",
+    None,
+    decode.optional({
+      use message <- decode.optional_field(
+        "message",
+        None,
+        decode.optional(decode.string),
+      )
+      decode.success(message)
+    }),
+  )
   use output <- decode.optional_field(
     "output",
     [],
@@ -357,7 +427,15 @@ fn response_decoder() -> decode.Decoder(ResponseData) {
     None,
     decode.optional(usage_decoder()),
   )
-  decode.success(ResponseData(id, model, status, output, usage))
+  decode.success(ResponseData(
+    id:,
+    model:,
+    status:,
+    incomplete_reason: option.flatten(incomplete),
+    error_message: option.flatten(error),
+    output:,
+    usage:,
+  ))
 }
 
 fn decode_response(status: Int, body: String) -> Result(List(Event), Error) {
@@ -371,13 +449,14 @@ fn decode_response(status: Int, body: String) -> Result(List(Event), Error) {
 }
 
 fn response_events(response: ResponseData) -> List(Event) {
-  let ResponseData(id:, model:, status:, output:, usage:) = response
+  let finish = response_finish(response)
+  let ResponseData(id:, model:, output:, usage:, ..) = response
   let output = output |> list.index_map(output_item_events) |> list.flatten
   let usage = usage_events(usage)
   list.flatten([
     [MessageStart(id, model)],
     output,
-    [Finished(response_finish(status))],
+    [Finished(finish)],
     usage,
     [MessageStop],
   ])
@@ -394,24 +473,26 @@ fn output_item_events(item: ItemData, index: Int) -> List(Event) {
     summary:,
     encrypted_content:,
   ) = item
+  // All indices are output-item indices so text, tool, and reasoning blocks
+  // share one collision-free space.
   case kind {
-    "message" ->
-      content
-      |> list.index_map(fn(part, content_index) {
-        let PartData(kind:, text:) = part
-        case kind {
-          "output_text" -> [
-            ContentStart(content_index, TextContent),
-            TextDelta(content_index, text),
-          ]
-          "refusal" -> [
-            ContentStart(content_index, TextContent),
-            RefusalDelta(content_index, text),
-          ]
-          _ -> [llm.UnknownEvent(kind)]
-        }
-      })
-      |> list.flatten
+    "message" -> {
+      let parts =
+        content
+        |> list.flat_map(fn(part) {
+          let PartData(kind:, text:) = part
+          case kind {
+            "output_text" -> [TextDelta(index, text)]
+            "refusal" -> [RefusalDelta(index, text)]
+            kind -> [llm.UnknownEvent(kind)]
+          }
+        })
+      list.flatten([
+        [ContentStart(index, TextContent)],
+        parts,
+        [llm.ContentStop(index)],
+      ])
+    }
     "function_call" -> [
       ToolCallStart(index, call_id, name),
       ToolCallArgumentsDelta(index, arguments),
@@ -470,13 +551,38 @@ fn decode_stream_event(data: String) -> Result(List(Event), Error) {
     | "response.incomplete"
     | "response.failed"
     | "response.cancelled" -> decode_terminal(data)
+    "error" -> Error(decode_stream_error(data))
     kind -> Ok([llm.UnknownEvent(kind)])
   }
 }
 
+// Stream error events carry code/message at the top level, unlike the
+// error-object envelope of non-2xx response bodies.
+fn decode_stream_error(data: String) -> Error {
+  let decoder = {
+    use code <- decode.optional_field(
+      "code",
+      None,
+      decode.optional(decode.string),
+    )
+    use message <- decode.optional_field(
+      "message",
+      None,
+      decode.optional(decode.string),
+    )
+    decode.success(ApiError(
+      0,
+      option.unwrap(code, "api_error"),
+      option.unwrap(message, data),
+    ))
+  }
+  json.parse(data, decoder)
+  |> result.unwrap(ApiError(0, "api_error", data))
+}
+
 fn decode_content_start(data: String) -> Result(List(Event), Error) {
   parse(data, {
-    use index <- decode.field("content_index", decode.int)
+    use index <- decode.optional_field("output_index", 0, decode.int)
     use kind <- decode.field("part", {
       use kind <- decode.field("type", decode.string)
       decode.success(kind)
@@ -494,19 +600,18 @@ fn decode_text_delta(
   reasoning: Bool,
 ) -> Result(List(Event), Error) {
   parse(data, {
-    use content_index <- decode.optional_field("content_index", 0, decode.int)
-    use output_index <- decode.optional_field("output_index", 0, decode.int)
+    use index <- decode.optional_field("output_index", 0, decode.int)
     use delta <- decode.field("delta", decode.string)
     decode.success(case reasoning {
-      True -> [ReasoningDelta(output_index, delta)]
-      False -> [TextDelta(content_index, delta)]
+      True -> [ReasoningDelta(index, delta)]
+      False -> [TextDelta(index, delta)]
     })
   })
 }
 
 fn decode_refusal_delta(data: String) -> Result(List(Event), Error) {
   parse(data, {
-    use index <- decode.optional_field("content_index", 0, decode.int)
+    use index <- decode.optional_field("output_index", 0, decode.int)
     use delta <- decode.field("delta", decode.string)
     decode.success([RefusalDelta(index, delta)])
   })
@@ -552,7 +657,7 @@ fn decode_item_done(data: String) -> Result(List(Event), Error) {
 
 fn decode_content_stop(data: String) -> Result(List(Event), Error) {
   parse(data, {
-    use index <- decode.optional_field("content_index", 0, decode.int)
+    use index <- decode.optional_field("output_index", 0, decode.int)
     decode.success([llm.ContentStop(index)])
   })
 }
@@ -564,10 +669,10 @@ fn decode_terminal(data: String) -> Result(List(Event), Error) {
       decode.success(response)
     }),
   )
-  let ResponseData(status:, usage:, ..) = response
+  let ResponseData(usage:, ..) = response
   Ok(
     list.flatten([
-      [Finished(response_finish(status))],
+      [Finished(response_finish(response))],
       usage_events(usage),
       [MessageStop],
     ]),
@@ -588,12 +693,17 @@ fn usage_events(usage: Option(UsageData)) -> List(Event) {
   }
 }
 
-fn response_finish(status: String) -> FinishReason {
+fn response_finish(response: ResponseData) -> FinishReason {
+  let ResponseData(status:, incomplete_reason:, error_message:, ..) = response
   case status {
     "completed" -> Stop
-    "incomplete" -> Length
+    "incomplete" ->
+      case incomplete_reason {
+        Some("content_filter") -> ContentFilter
+        _ -> Length
+      }
     "cancelled" -> Cancelled
-    "failed" -> Failed("response failed")
+    "failed" -> Failed(option.unwrap(error_message, "response failed"))
     status -> Other(status)
   }
 }

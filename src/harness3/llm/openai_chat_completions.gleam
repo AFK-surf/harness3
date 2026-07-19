@@ -10,17 +10,26 @@ import harness3/llm.{
   type Role, type Tool, ApiError, Assistant, Auto, Base64, ContentFilter,
   Developer, Document, FileId, Finished, High, HttpRequest, Image,
   InvalidRequest, InvalidResponse, Length, Low, MessageStart, MessageStop, Other,
-  Reasoning, RefusalDelta, Stop, System, Text, TextDelta, ToolCall,
-  ToolCallArgumentsDelta, ToolCallStart, ToolResult, ToolUse, Unsupported, Url,
-  Usage, UsageReported, User,
+  Reasoning, ReasoningDelta, RefusalDelta, Stop, System, Text, TextDelta,
+  ToolCall, ToolCallArgumentsDelta, ToolCallStart, ToolResult, ToolUse,
+  Unsupported, Url, Usage, UsageReported, User,
+}
+
+/// Which request field carries the output-token limit. OpenAI expects
+/// `max_completion_tokens` (and rejects `max_tokens` on reasoning models);
+/// some OpenAI-compatible providers such as Fireworks only honor the legacy
+/// `max_tokens`.
+pub type TokenLimitField {
+  MaxCompletionTokens
+  MaxTokens
 }
 
 pub type Config {
-  Config(api_key: String, base_url: String)
+  Config(api_key: String, base_url: String, max_tokens_field: TokenLimitField)
 }
 
 pub fn config(api_key: String) -> Config {
-  Config(api_key, "https://api.openai.com")
+  Config(api_key, "https://api.openai.com", MaxCompletionTokens)
 }
 
 pub fn new(config: Config) -> Provider {
@@ -46,6 +55,7 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     tools:,
     max_output_tokens:,
     temperature:,
+    reasoning_effort:,
     stream:,
   ) = request
   use messages <- result.try(list.try_map(messages, encode_message))
@@ -53,12 +63,23 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
   let fields = [
     #("model", json.string(model)),
     #("messages", json.preprocessed_array(messages)),
-    #("tools", json.preprocessed_array(tools)),
     #("stream", json.bool(stream)),
   ]
-  let fields =
-    add_optional_int(fields, "max_completion_tokens", max_output_tokens)
+  // OpenAI rejects empty tools arrays; omit the field when there are none.
+  let fields = case tools {
+    [] -> fields
+    _ -> [#("tools", json.preprocessed_array(tools)), ..fields]
+  }
+  let token_field = case config.max_tokens_field {
+    MaxCompletionTokens -> "max_completion_tokens"
+    MaxTokens -> "max_tokens"
+  }
+  let fields = add_optional_int(fields, token_field, max_output_tokens)
   let fields = add_optional_float(fields, "temperature", temperature)
+  let fields = case reasoning_effort {
+    Some(effort) -> [#("reasoning_effort", json.string(effort)), ..fields]
+    None -> fields
+  }
   let fields = case stream {
     True -> [
       #("stream_options", json.object([#("include_usage", json.bool(True))])),
@@ -100,10 +121,13 @@ fn encode_message(message: Message) -> Result(Json, Error) {
       let calls = list.filter(content, is_tool_call)
       use regular <- result.try(list.try_map(regular, encode_content))
       use calls <- result.try(list.try_map(calls, encode_tool_call))
-      let fields = [
-        #("role", json.string(role_name(role))),
-        #("content", json.preprocessed_array(regular)),
-      ]
+      let fields = [#("role", json.string(role_name(role)))]
+      // OpenAI rejects empty content arrays; omit content on tool-call-only
+      // assistant turns.
+      let fields = case regular, calls {
+        [], [_, ..] -> fields
+        _, _ -> [#("content", json.preprocessed_array(regular)), ..fields]
+      }
       let fields = case calls {
         [] -> fields
         _ -> [#("tool_calls", json.preprocessed_array(calls)), ..fields]
@@ -272,7 +296,7 @@ type UsageData {
 
 type ToolDelta {
   ToolDelta(
-    index: Int,
+    index: Option(Int),
     id: Option(String),
     name: Option(String),
     arguments: Option(String),
@@ -284,6 +308,7 @@ type Delta {
     role: Option(String),
     content: Option(String),
     refusal: Option(String),
+    reasoning: Option(String),
     tool_calls: List(ToolDelta),
   )
 }
@@ -312,7 +337,7 @@ fn usage_decoder() -> decode.Decoder(UsageData) {
 }
 
 fn tool_delta_decoder() -> decode.Decoder(ToolDelta) {
-  use index <- decode.optional_field("index", 0, decode.int)
+  use index <- decode.optional_field("index", None, decode.optional(decode.int))
   use id <- decode.optional_field("id", None, decode.optional(decode.string))
   use function <- decode.optional_field("function", #(None, None), {
     use name <- decode.optional_field(
@@ -346,19 +371,37 @@ fn delta_decoder() -> decode.Decoder(Delta) {
     None,
     decode.optional(decode.string),
   )
+  // DeepSeek-style providers (Fireworks) use reasoning_content; OpenRouter
+  // normalizes to reasoning.
+  use reasoning_content <- decode.optional_field(
+    "reasoning_content",
+    None,
+    decode.optional(decode.string),
+  )
+  use reasoning <- decode.optional_field(
+    "reasoning",
+    None,
+    decode.optional(decode.string),
+  )
   use tool_calls <- decode.optional_field(
     "tool_calls",
     [],
     decode.list(of: tool_delta_decoder()),
   )
-  decode.success(Delta(role, content, refusal, tool_calls))
+  decode.success(Delta(
+    role,
+    content,
+    refusal,
+    option.or(reasoning_content, reasoning),
+    tool_calls,
+  ))
 }
 
 fn choice_decoder() -> decode.Decoder(Choice) {
   use index <- decode.field("index", decode.int)
   use delta <- decode.optional_field(
     "delta",
-    Delta(None, None, None, []),
+    Delta(None, None, None, None, []),
     delta_decoder(),
   )
   use delta <- decode.optional_field("message", delta, delta_decoder())
@@ -431,7 +474,13 @@ fn decode_chunk(data: String, streaming: Bool) -> Result(List(Event), Error) {
 
 fn choice_events(choice: Choice) -> List(Event) {
   let Choice(index:, delta:, finish_reason: finish) = choice
-  let Delta(content:, refusal:, tool_calls:, ..) = delta
+  let Delta(content:, refusal:, reasoning:, tool_calls:, ..) = delta
+  // Reasoning shares the choice index with text — Chat Completions has no
+  // block indexing, so the event constructor is what distinguishes them.
+  let reasoning_events = case reasoning {
+    Some(text) -> [ReasoningDelta(index, text)]
+    None -> []
+  }
   let content_events = case content {
     Some(text) -> [TextDelta(index, text)]
     None -> []
@@ -442,25 +491,36 @@ fn choice_events(choice: Choice) -> List(Event) {
   }
   let tool_events =
     tool_calls
-    |> list.flat_map(fn(call) {
-      let ToolDelta(index:, id:, name:, arguments:) = call
+    |> list.index_map(fn(call, position) {
+      let ToolDelta(index: call_index, id:, name:, arguments:) = call
+      // Tool calls occupy the indices after the text block so text and tool
+      // events never collide in the normalized index space. Non-streaming
+      // tool_calls carry no index field, so fall back to list position.
+      let event_index = index + 1 + option.unwrap(call_index, position)
       let start = case id, name {
-        Some(id), Some(name) -> [ToolCallStart(index, id, name)]
-        Some(id), None -> [ToolCallStart(index, id, "")]
-        None, Some(name) -> [ToolCallStart(index, "", name)]
+        Some(id), Some(name) -> [ToolCallStart(event_index, id, name)]
+        Some(id), None -> [ToolCallStart(event_index, id, "")]
+        None, Some(name) -> [ToolCallStart(event_index, "", name)]
         None, None -> []
       }
       let arguments = case arguments {
-        Some(arguments) -> [ToolCallArgumentsDelta(index, arguments)]
+        Some(arguments) -> [ToolCallArgumentsDelta(event_index, arguments)]
         None -> []
       }
       list.append(start, arguments)
     })
+    |> list.flatten
   let finish = case finish {
     Some(reason) -> [Finished(finish_reason(reason))]
     None -> []
   }
-  list.flatten([content_events, refusal_events, tool_events, finish])
+  list.flatten([
+    reasoning_events,
+    content_events,
+    refusal_events,
+    tool_events,
+    finish,
+  ])
 }
 
 fn finish_reason(reason: String) -> FinishReason {

@@ -9,11 +9,12 @@ import harness3/llm.{
   type Content, type Error, type Event, type FinishReason, type HttpRequest,
   type MediaSource, type Message, type Provider, type Request, type Role,
   type Tool, AnthropicRedactedReasoning, AnthropicSignedReasoning, ApiError,
-  Assistant, Base64, ContentStart, Developer, Document, Finished, HttpRequest,
-  Image, InvalidRequest, InvalidResponse, Length, MessageStart, MessageStop,
-  Other, Reasoning, ReasoningContent, ReasoningDelta, ReasoningEncrypted, Stop,
-  System, Text, TextContent, TextDelta, ToolCall, ToolCallArgumentsDelta,
-  ToolCallStart, ToolResult, ToolUse, Url, Usage, UsageReported, User,
+  Assistant, Base64, ContentFilter, ContentStart, Developer, Document, Finished,
+  HttpRequest, Image, InvalidRequest, InvalidResponse, Length, MessageStart,
+  MessageStop, Other, Paused, Reasoning, ReasoningContent, ReasoningDelta,
+  ReasoningEncrypted, Stop, System, Text, TextContent, TextDelta, ToolCall,
+  ToolCallArgumentsDelta, ToolCallStart, ToolResult, ToolUse, Unsupported, Url,
+  Usage, UsageReported, User,
 }
 
 pub type Config {
@@ -47,8 +48,10 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     tools:,
     max_output_tokens:,
     temperature:,
+    reasoning_effort:,
     stream:,
   ) = request
+  let needs_files_beta = uses_file_ids(messages)
   use system <- result.try(encode_system(messages))
   use messages <- result.try(
     messages
@@ -63,9 +66,12 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     #("model", json.string(model)),
     #("max_tokens", json.int(max_output_tokens |> option_int(1024))),
     #("messages", json.preprocessed_array(messages)),
-    #("tools", json.preprocessed_array(tools)),
     #("stream", json.bool(stream)),
   ]
+  let fields = case tools {
+    [] -> fields
+    _ -> [#("tools", json.preprocessed_array(tools)), ..fields]
+  }
   let fields = case system {
     "" -> fields
     _ -> [#("system", json.string(system)), ..fields]
@@ -74,17 +80,47 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     Some(value) -> [#("temperature", json.float(value)), ..fields]
     None -> fields
   }
+  // Adaptive thinking with an effort hint; requires a Claude 4.6+ model.
+  let fields = case reasoning_effort {
+    Some(effort) -> [
+      #("thinking", json.object([#("type", json.string("adaptive"))])),
+      #("output_config", json.object([#("effort", json.string(effort))])),
+      ..fields
+    ]
+    None -> fields
+  }
   let Config(api_key:, api_version:, ..) = config
+  let headers = [
+    #("x-api-key", api_key),
+    #("anthropic-version", api_version),
+    #("content-type", "application/json"),
+  ]
+  // File references are rejected without the Files API beta opt-in.
+  let headers = case needs_files_beta {
+    True -> [#("anthropic-beta", "files-api-2025-04-14"), ..headers]
+    False -> headers
+  }
   Ok(HttpRequest(
     method: "POST",
     url: base_url(config) <> "/v1/messages",
-    headers: [
-      #("x-api-key", api_key),
-      #("anthropic-version", api_version),
-      #("content-type", "application/json"),
-    ],
+    headers:,
     body: json.object(fields) |> json.to_string,
   ))
+}
+
+fn uses_file_ids(messages: List(Message)) -> Bool {
+  list.any(messages, fn(message) {
+    let llm.Message(content:, ..) = message
+    list.any(content, content_uses_file_id)
+  })
+}
+
+fn content_uses_file_id(content: Content) -> Bool {
+  case content {
+    Image(llm.FileId(_), _) | Document(llm.FileId(_)) -> True
+    ToolResult(_, content, _) -> list.any(content, content_uses_file_id)
+    _ -> False
+  }
 }
 
 fn option_int(value: Option(Int), fallback: Int) -> Int {
@@ -203,7 +239,9 @@ fn encode_content(content: Content) -> Result(Json, Error) {
 
 fn encode_result_content(content: Content) -> Result(Json, Error) {
   case content {
-    Text(_) | Image(_, _) | Document(_) -> encode_content(content)
+    Text(_) | Image(_, _) -> encode_content(content)
+    Document(_) ->
+      Error(Unsupported("Anthropic document blocks inside tool results"))
     _ -> Error(InvalidRequest("nested tool calls/results are not supported"))
   }
 }
@@ -274,8 +312,18 @@ type MessageData {
   )
 }
 
-@external(erlang, "gleam_json_ffi", "json_to_string")
-fn dynamic_json_to_string(value: Dynamic) -> String
+// `gleam_json_ffi:json_to_string` only accepts iodata built by gleam_json's
+// encoders; a decoded term (an Erlang map) must be re-encoded via OTP's
+// `json` module, which gleam_json already requires.
+@external(erlang, "json", "encode")
+fn encode_json_term(value: Dynamic) -> Dynamic
+
+@external(erlang, "erlang", "iolist_to_binary")
+fn iodata_to_string(value: Dynamic) -> String
+
+fn dynamic_json_to_string(value: Dynamic) -> String {
+  value |> encode_json_term |> iodata_to_string
+}
 
 fn usage_decoder() -> decode.Decoder(UsageData) {
   use input <- decode.optional_field(
@@ -502,8 +550,10 @@ fn finish_events(reason: Option(String)) -> List(Event) {
 fn finish_reason(reason: String) -> FinishReason {
   case reason {
     "end_turn" | "stop_sequence" -> Stop
-    "max_tokens" -> Length
+    "max_tokens" | "model_context_window_exceeded" -> Length
     "tool_use" -> ToolUse
+    "refusal" -> ContentFilter
+    "pause_turn" -> Paused
     reason -> Other(reason)
   }
 }
