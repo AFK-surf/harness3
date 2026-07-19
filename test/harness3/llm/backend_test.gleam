@@ -201,6 +201,54 @@ pub fn encrypted_reasoning_requests_test() {
   assert !string.contains(chat_body, "openai-ciphertext")
 }
 
+pub fn reasoning_only_chat_replay_omits_empty_content_test() {
+  let request =
+    llm.request("test-model", [
+      llm.Message(llm.Assistant, [
+        llm.Reasoning(["Prior reasoning"], None),
+      ]),
+    ])
+  let provider =
+    openai_chat_completions.new(openai_chat_completions.Config(
+      api_key: "key",
+      base_url: "https://provider.example.test/v1",
+      max_tokens_field: openai_chat_completions.MaxCompletionTokens,
+      reasoning_replay_field: openai_chat_completions.ReasoningField,
+    ))
+  let assert Ok(llm.HttpRequest(body:, ..)) =
+    llm.build_request(provider, request)
+  assert string.contains(body, "\"reasoning\":\"Prior reasoning\"")
+  assert !string.contains(body, "\"content\":[]")
+}
+
+pub fn responses_replay_preserves_interleaved_item_order_test() {
+  let request =
+    llm.request("test-model", [
+      llm.Message(llm.Assistant, [
+        llm.Reasoning(
+          ["first"],
+          Some(llm.OpenAIEncryptedReasoning("rs_1", "cipher-first")),
+        ),
+        llm.ToolCall("call_1", "lookup", json.object([])),
+        llm.Reasoning(
+          ["second"],
+          Some(llm.OpenAIEncryptedReasoning("rs_2", "cipher-second")),
+        ),
+        llm.Text("answer-last"),
+      ]),
+    ])
+  let assert Ok(llm.HttpRequest(body:, ..)) =
+    llm.build_request(
+      openai_responses.new(openai_responses.config("key")),
+      request,
+    )
+  let assert Ok(#(_, after_first)) = string.split_once(body, "cipher-first")
+  let assert Ok(#(_, after_call)) = string.split_once(after_first, "call_1")
+  let assert Ok(#(_, after_second)) =
+    string.split_once(after_call, "cipher-second")
+  assert string.contains(after_second, "answer-last")
+}
+
 pub fn chat_completions_stream_test() {
   let provider =
     openai_chat_completions.new(openai_chat_completions.config("key"))
@@ -256,8 +304,8 @@ pub fn chat_completions_tool_call_indices_test() {
   // Text stays at the choice index; tool calls take the following indices so
   // parallel calls never collapse onto one block.
   assert list.contains(events, llm.TextDelta(0, "Let me check"))
-  assert list.contains(events, llm.ToolCallStart(1, "call_1", "lookup"))
-  assert list.contains(events, llm.ToolCallStart(2, "call_2", "lookup"))
+  assert list.contains(events, llm.ToolCallStart(2, "call_1", "lookup"))
+  assert list.contains(events, llm.ToolCallStart(3, "call_2", "lookup"))
   assert list.contains(events, llm.Finished(llm.ToolUse))
 }
 
@@ -284,6 +332,24 @@ pub fn chat_completions_max_tokens_field_test() {
   assert url == "https://api.fireworks.ai/inference/v1/chat/completions"
   assert string.contains(body, "\"max_tokens\":128")
   assert !string.contains(body, "max_completion_tokens")
+}
+
+pub fn chat_completions_versioned_base_url_test() {
+  let provider =
+    openai_chat_completions.new(openai_chat_completions.Config(
+      api_key: "key",
+      base_url: "https://provider.example.test/api/v3",
+      max_tokens_field: openai_chat_completions.MaxCompletionTokens,
+      reasoning_replay_field: openai_chat_completions.OmitReasoning,
+    ))
+  let assert Ok(llm.HttpRequest(url:, ..)) =
+    llm.build_request(
+      provider,
+      llm.request("provider-model", [
+        llm.Message(llm.User, [llm.Text("hello")]),
+      ]),
+    )
+  assert url == "https://provider.example.test/api/v3/chat/completions"
 }
 
 pub fn reasoning_effort_request_test() {
@@ -409,13 +475,15 @@ pub fn chat_completions_reasoning_delta_test() {
       provider,
       "{\"id\":\"chatcmpl_1\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Thinking\"},\"finish_reason\":null}]}",
     )
-  assert list.contains(fireworks, llm.ReasoningDelta(0, "Thinking"))
+  assert list.contains(fireworks, llm.ContentStart(1, llm.ReasoningContent))
+  assert list.contains(fireworks, llm.ReasoningDelta(1, "Thinking"))
   let assert Ok(openrouter) =
     llm.decode_stream_event(
       provider,
       "{\"id\":\"chatcmpl_1\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"More\"},\"finish_reason\":null}]}",
     )
-  assert list.contains(openrouter, llm.ReasoningDelta(0, "More"))
+  assert list.contains(openrouter, llm.ContentStart(1, llm.ReasoningContent))
+  assert list.contains(openrouter, llm.ReasoningDelta(1, "More"))
 }
 
 pub fn responses_base64_document_test() {
@@ -627,6 +695,17 @@ pub fn encrypted_reasoning_buffered_test() {
       1,
       llm.AnthropicRedactedReasoning("anthropic-ciphertext"),
     ),
+  )
+
+  let assert Ok(unsigned_events) =
+    llm.decode_response(
+      anthropic,
+      200,
+      "{\"id\":\"msg_2\",\"model\":\"claude-test\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Thinking\",\"signature\":\"\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}",
+    )
+  assert !list.contains(
+    unsigned_events,
+    llm.ReasoningEncrypted(0, llm.AnthropicSignedReasoning("")),
   )
 }
 

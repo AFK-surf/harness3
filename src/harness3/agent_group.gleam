@@ -196,8 +196,8 @@ pub fn resume_registered(
   use group <- result.try(decode_group_body(object.body))
   let profile_ids =
     group.agents
-    |> list.filter(fn(state) { state.status == agent.Ready })
     |> list.map(fn(state) { state.profile_id })
+    |> list.unique
   use profiles <- result.try(
     agent_profile.profiles(profile_ids)
     |> result.map_error(fn(error) { ProfileUnavailable(string.inspect(error)) }),
@@ -1121,7 +1121,20 @@ fn write_running_index(
     ])
     |> json.to_string
     |> bit_array.from_string
-  storage.put(backend, index_key, body, storage.IfAbsent)
+  case storage.put(backend, index_key, body, storage.IfAbsent) {
+    Ok(metadata) -> Ok(metadata)
+    Error(storage.PreconditionFailed(_)) ->
+      // Conditional HTTP writes can succeed remotely and lose their response;
+      // a retry then observes the object created by the first attempt. Accept
+      // only an exact read-back match as our own ambiguous success.
+      case storage.get(backend, index_key) {
+        Ok(object) if object.body == body -> Ok(object.metadata)
+        Ok(_) | Error(storage.NotFound(_)) ->
+          Error(storage.PreconditionFailed(index_key))
+        Error(error) -> Error(error)
+      }
+    Error(error) -> Error(error)
+  }
 }
 
 fn agent_is_terminal(state: agent.State) -> Bool {

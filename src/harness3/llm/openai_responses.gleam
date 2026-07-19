@@ -87,16 +87,45 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
 
 fn encode_message_items(message: Message) -> Result(List(Json), Error) {
   let llm.Message(role:, content:) = message
-  let regular = list.filter(content, is_regular_content)
-  let reasoning = list.filter(content, is_reasoning_content)
-  let special =
-    list.filter(content, fn(content) {
-      !is_regular_content(content) && !is_reasoning_content(content)
-    })
-  use regular <- result.try(list.try_map(regular, encode_content(role, _)))
-  use reasoning <- result.try(list.try_map(reasoning, encode_special_item))
-  use special <- result.try(list.try_map(special, encode_special_item))
-  let message = case regular {
+  encode_ordered_items(role, content, [], [])
+}
+
+fn encode_ordered_items(
+  role: Role,
+  remaining: List(Content),
+  regular: List(Json),
+  encoded: List(Json),
+) -> Result(List(Json), Error) {
+  case remaining {
+    [] -> Ok(list.append(encoded, regular_message(role, regular)))
+    [item, ..rest] ->
+      case is_regular_content(item) {
+        True -> {
+          use item <- result.try(encode_content(role, item))
+          encode_ordered_items(
+            role,
+            rest,
+            list.append(regular, [item]),
+            encoded,
+          )
+        }
+        False -> {
+          use item <- result.try(encode_special_item(item))
+          encode_ordered_items(
+            role,
+            rest,
+            [],
+            list.append(list.append(encoded, regular_message(role, regular)), [
+              item,
+            ]),
+          )
+        }
+      }
+  }
+}
+
+fn regular_message(role: Role, regular: List(Json)) -> List(Json) {
+  case regular {
     [] -> []
     _ -> [
       json.object([
@@ -106,21 +135,12 @@ fn encode_message_items(message: Message) -> Result(List(Json), Error) {
       ]),
     ]
   }
-  // A reasoning item precedes the visible output and tool calls it produced.
-  Ok(list.append(reasoning, list.append(message, special)))
 }
 
 fn is_regular_content(content: Content) -> Bool {
   case content {
     Text(_) | Image(_, _) | Document(_) -> True
     Reasoning(..) | ToolCall(..) | ToolResult(..) -> False
-  }
-}
-
-fn is_reasoning_content(content: Content) -> Bool {
-  case content {
-    Reasoning(..) -> True
-    _ -> False
   }
 }
 

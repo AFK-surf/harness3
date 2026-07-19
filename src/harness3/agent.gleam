@@ -1,3 +1,4 @@
+import exception
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Pid, type Subject}
@@ -10,6 +11,8 @@ import gleam/result
 import gleam/string
 import harness3/llm
 import harness3/plugin
+
+const callback_timeout_milliseconds = 5000
 
 pub type Status {
   Ready
@@ -297,6 +300,7 @@ type Accumulator {
     active_slots: Dict(Int, Int),
     next_slot: Int,
     stats: llm.Stats,
+    finish: Option(llm.FinishReason),
     error: Option(Error),
   )
 }
@@ -313,7 +317,7 @@ pub fn run_round(
   observe: fn(Event) -> Result(Nil, Error),
 ) -> Result(RoundResult, Error) {
   let Active(state:, config:, plugins:) = active
-  use accumulator <- result.try(start_accumulator(state.stats))
+  use accumulator <- result.try(start_accumulator())
   let system_prompt = plugin_prompt(plugins)
   let messages = case system_prompt {
     "" -> state.messages
@@ -347,6 +351,7 @@ pub fn run_round(
     Some(error) -> Error(error)
     None -> Ok(Nil)
   })
+  use _ <- result.try(validate_finish(accumulated.finish))
   use assistant_content <- result.try(parts_to_content(accumulated.parts))
   let assistant = llm.Message(llm.Assistant, assistant_content)
   use tool_messages <- result.try(execute_tools(
@@ -356,9 +361,10 @@ pub fn run_round(
     observe,
   ))
   let messages = list.append(state.messages, [assistant, ..tool_messages])
-  let disposition = case tool_messages {
-    [] -> Complete
-    _ -> Continue
+  let disposition = case accumulated.finish, tool_messages {
+    Some(llm.Paused), _ -> Continue
+    _, [] -> Complete
+    _, _ -> Continue
   }
   let status = case disposition {
     Continue -> Ready
@@ -370,7 +376,7 @@ pub fn run_round(
       ..state,
       round: state.round + 1,
       messages:,
-      stats: accumulated.stats,
+      stats: add_stats(state.stats, accumulated.stats),
       plugin_states: states,
       plugin_generation: generation,
       last_catalog_revision: Some(config.catalog_revision),
@@ -380,10 +386,15 @@ pub fn run_round(
   Ok(RoundResult(active, state, disposition))
 }
 
-fn start_accumulator(
-  initial_stats: llm.Stats,
-) -> Result(Subject(AccumulatorMessage), Error) {
-  actor.new(Accumulator(dict.new(), dict.new(), 0, initial_stats, None))
+fn start_accumulator() -> Result(Subject(AccumulatorMessage), Error) {
+  actor.new(Accumulator(
+    dict.new(),
+    dict.new(),
+    0,
+    llm.empty_stats(),
+    None,
+    None,
+  ))
   |> actor.on_message(handle_accumulator)
   |> actor.start
   |> result.map(fn(started) { started.data })
@@ -446,10 +457,45 @@ fn accumulate(state: Accumulator, event: llm.Event) -> Accumulator {
       })
     llm.UsageReported(usage) ->
       Accumulator(..state, stats: llm.apply_usage(state.stats, usage))
+    llm.Finished(reason) -> Accumulator(..state, finish: Some(reason))
     llm.ContentStop(index) ->
       Accumulator(..state, active_slots: dict.delete(state.active_slots, index))
     _ -> state
   }
+}
+
+fn validate_finish(finish: Option(llm.FinishReason)) -> Result(Nil, Error) {
+  case finish {
+    None | Some(llm.Stop) | Some(llm.ToolUse) | Some(llm.Paused) -> Ok(Nil)
+    Some(llm.Length) -> Error(InvalidModelOutput("model output was truncated"))
+    Some(llm.ContentFilter) ->
+      Error(InvalidModelOutput("model output was blocked by a content filter"))
+    Some(llm.Cancelled) -> Error(InvalidModelOutput("model turn was cancelled"))
+    Some(llm.Failed(reason)) -> Error(InvalidModelOutput(reason))
+    Some(llm.Other(reason)) ->
+      Error(InvalidModelOutput("model stopped unexpectedly: " <> reason))
+  }
+}
+
+fn add_stats(total: llm.Stats, round: llm.Stats) -> llm.Stats {
+  let llm.Stats(
+    input_tokens: total_input,
+    output_tokens: total_output,
+    cache_read_tokens: total_cache_read,
+    cache_write_tokens: total_cache_write,
+  ) = total
+  let llm.Stats(
+    input_tokens: round_input,
+    output_tokens: round_output,
+    cache_read_tokens: round_cache_read,
+    cache_write_tokens: round_cache_write,
+  ) = round
+  llm.Stats(
+    input_tokens: total_input + round_input,
+    output_tokens: total_output + round_output,
+    cache_read_tokens: total_cache_read + round_cache_read,
+    cache_write_tokens: total_cache_write + round_cache_write,
+  )
 }
 
 fn update_or_start_text(
@@ -474,13 +520,37 @@ fn start_part(
   external_index: Int,
   part: Part,
 ) -> Accumulator {
-  let slot = state.next_slot
-  Accumulator(
-    ..state,
-    parts: dict.insert(state.parts, slot, part),
-    active_slots: dict.insert(state.active_slots, external_index, slot),
-    next_slot: slot + 1,
-  )
+  case dict.get(state.active_slots, external_index) {
+    Ok(slot) -> {
+      let merged = case dict.get(state.parts, slot), part {
+        Ok(ToolPart(id, name, arguments)), ToolPart(next_id, next_name, _) ->
+          ToolPart(
+            prefer_nonempty(id, next_id),
+            prefer_nonempty(name, next_name),
+            arguments,
+          )
+        Ok(existing), _ -> existing
+        Error(_), replacement -> replacement
+      }
+      Accumulator(..state, parts: dict.insert(state.parts, slot, merged))
+    }
+    Error(_) -> {
+      let slot = state.next_slot
+      Accumulator(
+        ..state,
+        parts: dict.insert(state.parts, slot, part),
+        active_slots: dict.insert(state.active_slots, external_index, slot),
+        next_slot: slot + 1,
+      )
+    }
+  }
+}
+
+fn prefer_nonempty(current: String, candidate: String) -> String {
+  case current {
+    "" -> candidate
+    _ -> current
+  }
 }
 
 fn update_part(
@@ -692,9 +762,19 @@ pub fn call_callback(
   input: String,
 ) -> Result(CallbackResult, Error) {
   let Handle(plugins: PluginHost(subject), router:, ..) = handle
-  process.call_forever(subject, fn(reply) {
-    InvokeCallback(plugin_name, callback, input, router, reply)
+  exception.rescue(fn() {
+    process.call(subject, callback_timeout_milliseconds, fn(reply) {
+      InvokeCallback(plugin_name, callback, input, router, reply)
+    })
   })
+  |> result.map_error(fn(_) {
+    PluginError(plugin.HookFailed(
+      plugin_name,
+      callback,
+      "cross-agent callback timed out",
+    ))
+  })
+  |> result.flatten
 }
 
 pub fn stop(handle: Handle) -> Nil {

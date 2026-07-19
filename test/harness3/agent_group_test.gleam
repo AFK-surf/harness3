@@ -108,6 +108,29 @@ fn ambiguous_commit_storage(backend: storage.Storage) -> storage.Storage {
   )
 }
 
+fn ambiguous_index_storage(backend: storage.Storage) -> storage.Storage {
+  storage.from_functions(
+    get: fn(key) { storage.get(backend, key) },
+    head: fn(key) { storage.head(backend, key) },
+    put: fn(key, body, condition) {
+      case storage.put(backend, key, body, condition), condition {
+        Ok(metadata), storage.IfAbsent ->
+          case string.starts_with(key, agent_group.running_index_prefix()) {
+            True -> Error(storage.PreconditionFailed(key))
+            False -> Ok(metadata)
+          }
+        outcome, _ -> outcome
+      }
+    },
+    list: fn(prefix) { storage.list(backend, prefix) },
+    delete: fn(key) { storage.delete(backend, key) },
+    stream_get: fn(key, consume) { storage.get_stream(backend, key, consume) },
+    stream_put: fn(key, source, condition) {
+      storage.put_stream(backend, key, source, condition)
+    },
+  )
+}
+
 fn temporary_root(label: String) -> String {
   let suffix =
     crypto.strong_random_bytes(12) |> bit_array.base64_url_encode(False)
@@ -1065,5 +1088,212 @@ pub fn ambiguous_successful_cas_is_idempotent_and_fences_next_commit_test() {
   assert completed.status == agent.Completed
   assert completed.round == 2
   assert completed.revision == 2
+  remove_directory(root)
+}
+
+fn test_model() -> model_catalog.Model {
+  model_catalog.Model(
+    "model",
+    "test-model",
+    "https://example.test",
+    model_catalog.OpenAIResponses,
+    model_catalog.api_key("secret"),
+  )
+}
+
+fn completing_transport(text: String) -> agent.ModelTransport {
+  agent.model_transport(fn(_, _, consume) {
+    let assert Ok(Nil) = consume(llm.MessageStart("message", "test-model"))
+    let assert Ok(Nil) = consume(llm.TextDelta(0, text))
+    let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+    let assert Ok(Nil) = consume(llm.MessageStop)
+    Ok(Nil)
+  })
+}
+
+pub fn resume_registered_deduplicates_and_loads_dormant_profiles_test() {
+  let root = temporary_root("resume-shared-profile-test")
+  let backend = local.new(local.config(root))
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let shared =
+    agent_profile.AgentProfile(
+      "shared",
+      registry,
+      completing_transport("done"),
+      None,
+      None,
+      observe,
+    )
+  let waiting_a =
+    agent.State(
+      ..agent.state("a", "model"),
+      profile_id: "shared",
+      status: agent.Waiting,
+    )
+  let waiting_b =
+    agent.State(
+      ..agent.state("b", "model"),
+      profile_id: "shared",
+      status: agent.Waiting,
+    )
+  let config = agent_group.Config(backend, "groups/shared", [shared], 10, 100)
+  let assert Ok(_) =
+    agent_group.create(
+      config,
+      agent_group.new("shared", "catalog", [waiting_a, waiting_b]),
+    )
+
+  let assert Ok(loaded) =
+    agent_group.resume_registered(backend, "groups/shared", 10)
+  let assert Ok(group) = agent_group.wake(loaded)
+  let assert Ok(Nil) = agent_group.send_message(group, "a", "work on A")
+  let assert Ok(Nil) = agent_group.send_message(group, "b", "work on B")
+  process.sleep(100)
+  let assert Ok(snapshot) = agent_group.snapshot(group)
+  assert list.all(snapshot.agents, fn(state) {
+    state.status == agent.Completed && state.round == 1
+  })
+  let assert Ok(Nil) = agent_group.stop(group)
+  remove_directory(root)
+}
+
+pub fn ambiguous_running_index_write_is_confirmed_test() {
+  let root = temporary_root("ambiguous-index-test")
+  let backend = local.new(local.config(root)) |> ambiguous_index_storage
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      completing_transport("done"),
+      None,
+      None,
+      observe,
+    )
+  let config = agent_group.Config(backend, "groups/index", [profile], 10, 100)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("index", "catalog", [agent.state("agent", "model")]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  await_down(process.monitor(agent_group.pid(group)))
+  let assert Ok(snapshot) = agent_group.load(config)
+  let assert [completed] = snapshot.agents
+  assert completed.status == agent.Completed
+  remove_directory(root)
+}
+
+pub fn paused_turn_resumes_and_usage_accumulates_test() {
+  let root = temporary_root("paused-usage-test")
+  let backend = local.new(local.config(root))
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      let has_history = !list.is_empty(request.messages)
+      let assert Ok(Nil) = consume(llm.MessageStart("message", "test-model"))
+      let assert Ok(Nil) =
+        consume(
+          llm.TextDelta(0, case has_history {
+            True -> "final"
+            False -> "partial"
+          }),
+        )
+      let assert Ok(Nil) =
+        consume(
+          llm.UsageReported(llm.Usage(
+            input_tokens: Some(case has_history {
+              True -> 3
+              False -> 2
+            }),
+            output_tokens: Some(case has_history {
+              True -> 2
+              False -> 1
+            }),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+          )),
+        )
+      let assert Ok(Nil) =
+        consume(
+          llm.Finished(case has_history {
+            True -> llm.Stop
+            False -> llm.Paused
+          }),
+        )
+      let assert Ok(Nil) = consume(llm.MessageStop)
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config = agent_group.Config(backend, "groups/paused", [profile], 10, 100)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("paused", "catalog", [agent.state("agent", "model")]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  await_down(process.monitor(agent_group.pid(group)))
+  let assert Ok(snapshot) = agent_group.load(config)
+  let assert [completed] = snapshot.agents
+  assert completed.status == agent.Completed
+  assert completed.round == 2
+  assert completed.stats == llm.Stats(5, 3, 0, 0)
+  remove_directory(root)
+}
+
+pub fn truncated_turn_fails_instead_of_completing_test() {
+  let root = temporary_root("truncated-turn-test")
+  let backend = local.new(local.config(root))
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let transport =
+    agent.model_transport(fn(_, _, consume) {
+      let assert Ok(Nil) = consume(llm.TextDelta(0, "incomplete"))
+      let assert Ok(Nil) = consume(llm.Finished(llm.Length))
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/truncated", [profile], 10, 100)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("truncated", "catalog", [
+        agent.state("agent", "model"),
+      ]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  await_down(process.monitor(agent_group.pid(group)))
+  let assert Ok(snapshot) = agent_group.load(config)
+  let assert [failed] = snapshot.agents
+  let assert agent.Failed(reason) = failed.status
+  assert string.contains(reason, "truncated")
   remove_directory(root)
 }

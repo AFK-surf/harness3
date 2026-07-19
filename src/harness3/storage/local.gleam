@@ -16,6 +16,7 @@ import harness3/storage.{
   LocalVersion, Metadata, NotFound, Object, PreconditionFailed, S3Etag,
   StreamAborted, Unconditional,
 }
+import simplifile
 
 pub type Config {
   Config(root: String)
@@ -38,9 +39,6 @@ pub fn new(config: Config) -> Storage {
     },
   )
 }
-
-type DateTime =
-  #(#(Int, Int, Int), #(Int, Int, Int))
 
 type WriteOption {
   Read
@@ -101,9 +99,6 @@ fn is_dir(path: String) -> Bool
 @external(erlang, "filelib", "file_size")
 fn file_size(path: String) -> Int
 
-@external(erlang, "filelib", "last_modified")
-fn last_modified(path: String) -> DateTime
-
 @external(erlang, "filelib", "fold_files")
 fn fold_files(
   directory: String,
@@ -118,9 +113,6 @@ fn absname(path: String) -> String
 
 @external(erlang, "filename", "join")
 fn join_path(left: String, right: String) -> String
-
-@external(erlang, "calendar", "datetime_to_gregorian_seconds")
-fn gregorian_seconds(datetime: DateTime) -> Int
 
 @external(erlang, "erlang", "is_atom")
 fn is_atom(value: FileStatus) -> Bool
@@ -138,6 +130,21 @@ const lock_retry_ms = 10
 
 const lock_attempts = 3000
 
+const lock_stale_seconds = 15
+
+const lock_heartbeat_ms = 2000
+
+type TimeUnit {
+  Second
+}
+
+@external(erlang, "erlang", "system_time")
+fn system_time(unit: TimeUnit) -> Int
+
+type LockHeartbeat {
+  StopHeartbeat
+}
+
 fn lock_path(config: Config) -> String {
   join_path(root(config), ".harness3.lock")
 }
@@ -149,13 +156,38 @@ fn acquire_lock(path: String, attempts: Int) -> Result(Nil, Error) {
     Error(reason) ->
       case string.inspect(reason), attempts > 0 {
         "Eexist", True -> {
-          process.sleep(lock_retry_ms)
-          acquire_lock(path, attempts - 1)
+          case stale_lock(path) {
+            True -> {
+              let _ = file_delete(path)
+              acquire_lock(path, attempts - 1)
+            }
+            False -> {
+              process.sleep(lock_retry_ms)
+              acquire_lock(path, attempts - 1)
+            }
+          }
         }
         "Eexist", False ->
           Error(Backend(0, "timed out waiting for local storage lock"))
         _, _ -> Error(Backend(0, string.inspect(reason)))
       }
+  }
+}
+
+fn stale_lock(path: String) -> Bool {
+  case simplifile.file_info(path) {
+    Ok(info) -> system_time(Second) - info.mtime_seconds > lock_stale_seconds
+    Error(_) -> False
+  }
+}
+
+fn keep_lock_alive(path: String, stop: process.Subject(LockHeartbeat)) -> Nil {
+  case process.receive(stop, within: lock_heartbeat_ms) {
+    Ok(StopHeartbeat) -> Nil
+    Error(_) -> {
+      let _ = simplifile.touch(at: path)
+      keep_lock_alive(path, stop)
+    }
   }
 }
 
@@ -165,8 +197,17 @@ fn with_lock(
 ) -> Result(a, Error) {
   let path = lock_path(config)
   use _ <- result.try(acquire_lock(path, lock_attempts))
+  let heartbeat_ready = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      let stop = process.new_subject()
+      process.send(heartbeat_ready, stop)
+      keep_lock_alive(path, stop)
+    })
+  let assert Ok(heartbeat) = process.receive(heartbeat_ready, within: 5000)
   exception.defer(
     fn() {
+      process.send(heartbeat, StopHeartbeat)
       let _ = file_delete(path)
       Nil
     },
@@ -196,8 +237,12 @@ fn path_for(config: Config, key: String) -> Result(String, Error) {
 }
 
 fn mtime_seconds(path: String) -> Int {
-  // Erlang's Gregorian epoch precedes Unix's by this many seconds.
-  gregorian_seconds(last_modified(path)) - 62_167_219_200
+  case simplifile.file_info(path) {
+    Ok(info) -> info.mtime_seconds
+    // Preserve the conservative invalid-token behavior if a concurrent OS
+    // mutation removes the file between checks.
+    Error(_) -> 0
+  }
 }
 
 fn generation_path(config: Config, key: String) -> String {
@@ -404,24 +449,29 @@ fn list_(config: Config, prefix: String) -> Result(List(Metadata), Error) {
           [],
         )
     }
-    paths
-    |> list.filter_map(fn(path) {
-      let key = string.drop_start(path, string.length(base_prefix))
-      case string.starts_with(key, ".harness3/") || key == ".harness3.lock" {
-        True -> Error(NotFound(key))
-        False ->
-          case string.starts_with(key, prefix) {
-            True -> metadata_locked(config, key, path)
-            False -> Error(NotFound(key))
-          }
-      }
-    })
-    |> list.sort(fn(left, right) {
-      let Metadata(key: left_key, ..) = left
-      let Metadata(key: right_key, ..) = right
-      string.compare(left_key, right_key)
-    })
-    |> Ok
+    let paths =
+      paths
+      |> list.filter(fn(path) {
+        let key = string.drop_start(path, string.length(base_prefix))
+        !string.starts_with(key, ".harness3/")
+        && key != ".harness3.lock"
+        && string.starts_with(key, prefix)
+      })
+    use metadata <- result.try(
+      paths
+      |> list.try_map(fn(path) {
+        let key = string.drop_start(path, string.length(base_prefix))
+        metadata_locked(config, key, path)
+      }),
+    )
+    Ok(
+      metadata
+      |> list.sort(fn(left, right) {
+        let Metadata(key: left_key, ..) = left
+        let Metadata(key: right_key, ..) = right
+        string.compare(left_key, right_key)
+      }),
+    )
   })
 }
 

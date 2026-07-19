@@ -103,10 +103,20 @@ fn request(
 ) -> Result(Request(BitArray), Error) {
   use endpoint <- result.try(endpoint(config))
   let Endpoint(scheme, host, port) = endpoint
-  Ok(
+  let signed =
     Request(method, headers, body, scheme, host, port, path, query)
-    |> aws4_request.sign_bits(signer(config), _),
-  )
+    |> aws4_request.sign_bits(signer(config), _)
+  // Sign the raw S3 key (the signer canonicalizes each path segment), then
+  // send the corresponding percent-encoded wire path. Sending the raw path
+  // makes reserved characters diverge from the signed canonical request.
+  Ok(Request(..signed, path: wire_path(path)))
+}
+
+fn wire_path(path: String) -> String {
+  path
+  |> string.split("/")
+  |> list.map(uri.percent_encode)
+  |> string.join("/")
 }
 
 fn object_path(config: Config, key: String) -> String {
@@ -121,6 +131,24 @@ fn send(
     use req <- result.try(make_request())
     httpc.send_bits(req)
     |> result.map_error(fn(error) { Transport(string.inspect(error)) })
+  })
+}
+
+fn send_conditional_put(
+  make_request: fn() -> Result(Request(BitArray), Error),
+) -> Result(Response(BitArray), Error) {
+  retry.http(fn() {
+    use req <- result.try(make_request())
+    use response <- result.try(
+      httpc.send_bits(req)
+      |> result.map_error(fn(error) { Transport(string.inspect(error)) }),
+    )
+    // S3's ConditionalRequestConflict is explicitly retryable. A retry will
+    // either succeed or settle into the stable 412 fencing result.
+    case response.status {
+      409 -> Error(Transport("S3 conditional request conflict"))
+      _ -> Ok(response)
+    }
   })
 }
 
@@ -206,11 +234,13 @@ fn put_(
   condition: PutCondition,
 ) -> Result(Metadata, Error) {
   use headers <- result.try(condition_headers(condition))
-  use response <- result.try(
-    send(fn() {
-      request(config, http.Put, object_path(config, key), None, headers, body)
-    }),
-  )
+  let operation = fn() {
+    request(config, http.Put, object_path(config, key), None, headers, body)
+  }
+  use response <- result.try(case condition {
+    Unconditional -> send(operation)
+    _ -> send_conditional_put(operation)
+  })
   case response.status {
     200 ->
       Ok(Metadata(
@@ -219,6 +249,11 @@ fn put_(
         modified_at: response_header(response, "date"),
         version: S3Etag(response_header(response, "etag")),
       ))
+    404 ->
+      case condition {
+        IfUnchanged(_) -> Error(PreconditionFailed(key))
+        _ -> Error(NotFound(key))
+      }
     _ -> Error(status_error(response, key))
   }
 }
@@ -308,7 +343,8 @@ fn streaming_request(
       path,
       None,
     )
-  Ok(s3_sign.sign(signer(config), request, "UNSIGNED-PAYLOAD"))
+  let signed = s3_sign.sign(signer(config), request, "UNSIGNED-PAYLOAD")
+  Ok(Request(..signed, path: wire_path(path)))
 }
 
 fn stream_get_(
@@ -371,6 +407,11 @@ fn stream_put_(
             modified_at: http_stream.header(headers, "date"),
             version: S3Etag(http_stream.header(headers, "etag")),
           ))
+        404 ->
+          case condition {
+            IfUnchanged(_) -> Error(PreconditionFailed(key))
+            _ -> Error(NotFound(key))
+          }
         _ -> Error(status_error(Response(status, [], response_body), key))
       }
     }

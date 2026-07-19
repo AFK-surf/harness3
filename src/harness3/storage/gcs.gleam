@@ -137,10 +137,6 @@ fn send_once(
   |> result.map_error(fn(error) { Transport(string.inspect(error)) })
 }
 
-fn response_header(response: Response(body), name: String) -> String {
-  response.headers |> list.key_find(name) |> result.unwrap("")
-}
-
 fn body_message(body: BitArray) -> String {
   bit_array.to_string(body) |> result.unwrap(string.inspect(body))
 }
@@ -151,17 +147,6 @@ fn status_error(response: Response(BitArray), key: String) -> Error {
     409 | 412 -> PreconditionFailed(key)
     status -> Backend(status, body_message(response.body))
   }
-}
-
-fn response_metadata(response: Response(body), key: String) -> Metadata {
-  Metadata(
-    key:,
-    size: response_header(response, "content-length")
-      |> int.parse
-      |> result.unwrap(0),
-    modified_at: response_header(response, "last-modified"),
-    version: GcsGeneration(response_header(response, "x-goog-generation")),
-  )
 }
 
 fn decoded_metadata(object: GcsObject) -> Result(Metadata, Error) {
@@ -185,7 +170,13 @@ fn get_(config: Config, key: String) -> Result(Object, Error) {
     send(config, http.Get, object_url(config, key), [#("alt", "media")], <<>>),
   )
   case response.status {
-    200 -> Ok(Object(response_metadata(response, key), response.body))
+    200 -> {
+      // Media downloads expose HTTP-style metadata while `head` decodes the
+      // canonical JSON resource. Use the latter for a backend-wide stable
+      // Metadata representation.
+      use metadata <- result.try(head_(config, key))
+      Ok(Object(metadata, response.body))
+    }
     _ -> Error(status_error(response, key))
   }
 }

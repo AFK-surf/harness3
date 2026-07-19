@@ -8,11 +8,11 @@ import harness3/llm.{
   type Content, type Error, type Event, type FinishReason, type HttpRequest,
   type ImageDetail, type MediaSource, type Message, type Provider, type Request,
   type Role, type Tool, ApiError, Assistant, Auto, Base64, ContentFilter,
-  Developer, Document, FileId, Finished, High, HttpRequest, Image,
+  ContentStart, Developer, Document, FileId, Finished, High, HttpRequest, Image,
   InvalidRequest, InvalidResponse, Length, Low, MessageStart, MessageStop, Other,
-  Reasoning, ReasoningDelta, RefusalDelta, Stop, System, Text, TextDelta,
-  ToolCall, ToolCallArgumentsDelta, ToolCallStart, ToolResult, ToolUse,
-  Unsupported, Url, Usage, UsageReported, User,
+  Reasoning, ReasoningContent, ReasoningDelta, RefusalDelta, Stop, System, Text,
+  TextDelta, ToolCall, ToolCallArgumentsDelta, ToolCallStart, ToolResult,
+  ToolUse, Unsupported, Url, Usage, UsageReported, User,
 }
 
 /// Which request field carries the output-token limit. OpenAI expects
@@ -64,6 +64,22 @@ fn base_url(config: Config) -> String {
   }
 }
 
+fn chat_completions_url(config: Config) -> String {
+  let base = base_url(config)
+  // Pi-compatible provider configuration commonly supplies an already
+  // versioned API root (for example `/api/v3` or `/oai/api/v1`). Appending a
+  // second `/v1` makes those otherwise valid configurations unusable.
+  case has_versioned_suffix(base) {
+    True -> base <> "/chat/completions"
+    False -> base <> "/v1/chat/completions"
+  }
+}
+
+fn has_versioned_suffix(base: String) -> Bool {
+  ["/v1", "/v2", "/v3", "/v4"]
+  |> list.any(fn(suffix) { string.ends_with(base, suffix) })
+}
+
 fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
   let llm.Request(
     model:,
@@ -106,7 +122,7 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
   let Config(api_key:, ..) = config
   Ok(HttpRequest(
     method: "POST",
-    url: base_url(config) <> "/v1/chat/completions",
+    url: chat_completions_url(config),
     headers: [
       #("authorization", "Bearer " <> api_key),
       #("content-type", "application/json"),
@@ -152,9 +168,9 @@ fn encode_message(
       let fields = [#("role", json.string(role_name(role)))]
       // OpenAI rejects empty content arrays; omit content on tool-call-only
       // assistant turns.
-      let fields = case regular, calls {
-        [], [_, ..] -> fields
-        _, _ -> [#("content", json.preprocessed_array(regular)), ..fields]
+      let fields = case regular {
+        [] -> fields
+        _ -> [#("content", json.preprocessed_array(regular)), ..fields]
       }
       let fields = case calls {
         [] -> fields
@@ -558,18 +574,24 @@ fn decode_chunk_events(
 fn choice_events(choice: Choice) -> List(Event) {
   let Choice(index:, delta:, finish_reason: finish) = choice
   let Delta(content:, refusal:, reasoning:, tool_calls:, ..) = delta
-  // Reasoning shares the choice index with text — Chat Completions has no
-  // block indexing, so the event constructor is what distinguishes them.
+  // Chat Completions has no content-block indices. Allocate a disjoint range
+  // per choice so reasoning, visible text, and parallel tool calls can all be
+  // accumulated without overwriting one another.
+  let base_index = index * 1_000_000
+  let reasoning_index = base_index + 1
   let reasoning_events = case reasoning {
-    Some(text) -> [ReasoningDelta(index, text)]
+    Some(text) -> [
+      ContentStart(reasoning_index, ReasoningContent),
+      ReasoningDelta(reasoning_index, text),
+    ]
     None -> []
   }
   let content_events = case content {
-    Some(text) -> [TextDelta(index, text)]
+    Some(text) -> [TextDelta(base_index, text)]
     None -> []
   }
   let refusal_events = case refusal {
-    Some(text) -> [RefusalDelta(index, text)]
+    Some(text) -> [RefusalDelta(base_index, text)]
     None -> []
   }
   let tool_events =
@@ -579,7 +601,7 @@ fn choice_events(choice: Choice) -> List(Event) {
       // Tool calls occupy the indices after the text block so text and tool
       // events never collide in the normalized index space. Non-streaming
       // tool_calls carry no index field, so fall back to list position.
-      let event_index = index + 1 + option.unwrap(call_index, position)
+      let event_index = base_index + 2 + option.unwrap(call_index, position)
       let start = case id, name {
         Some(id), Some(name) -> [ToolCallStart(event_index, id, name)]
         Some(id), None -> [ToolCallStart(event_index, id, "")]

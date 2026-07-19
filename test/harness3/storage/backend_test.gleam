@@ -66,7 +66,9 @@ fn env(name: String) -> Option(String) {
 }
 
 fn exercise_backend(backend: storage.Storage, key: String) {
-  let prefix = key <> "-list-prefix"
+  // Reserved characters exercise S3's distinction between the raw key used
+  // for SigV4 canonicalization and the percent-encoded HTTP wire path.
+  let prefix = key <> "-list prefix:+%25"
   let key = prefix <> "/item"
 
   let assert Ok(created) =
@@ -109,6 +111,14 @@ fn exercise_backend(backend: storage.Storage, key: String) {
   let assert Ok(Nil) = storage.delete(backend, key)
   let assert Error(storage.NotFound(missing_key)) = storage.get(backend, key)
   assert missing_key == key
+  let assert Error(storage.PreconditionFailed(cas_key)) =
+    storage.put(
+      backend,
+      key,
+      <<"missing":utf8>>,
+      storage.IfUnchanged(updated.version),
+    )
+  assert cas_key == key
 }
 
 type CollectorMessage {

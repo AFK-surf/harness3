@@ -588,7 +588,10 @@ fn handle_control(
     Refresh(subject, reply) -> {
       let written = write_membership(backend, key, token, ip, port)
       case written, reply {
-        Ok(_), Some(reply) -> process.send(reply, Nil)
+        // Synchronous refresh is a liveness barrier. It must always release
+        // its caller even when this write fails; periodic refresh and recovery
+        // will retry while the caller can unwind or roll back its claim.
+        _, Some(reply) -> process.send(reply, Nil)
         _, _ -> Nil
       }
       case reply {

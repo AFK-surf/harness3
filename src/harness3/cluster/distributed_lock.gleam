@@ -1,4 +1,5 @@
 import gleam/bit_array
+import gleam/crypto
 import gleam/dynamic/decode
 import gleam/json
 import gleam/option.{type Option, None, Some}
@@ -21,6 +22,7 @@ pub opaque type Lock {
     lock_key: String,
     owner: String,
     lease_seconds: Int,
+    nonce: String,
     version: VersionToken,
   )
 }
@@ -50,60 +52,92 @@ fn do_try_acquire(
 ) -> Result(Option(Lock), Error) {
   let object_key = lock_object_key(key)
   let expires_at = system_time(Second) + lease_seconds
+  // The nonce makes an ambiguous-success read-back attributable to this
+  // acquisition even when two attempts reuse an owner within the same second.
+  let nonce = new_nonce()
+  let body = lock_body(key, owner, expires_at, nonce)
   case storage.get(backend, object_key) {
     Error(storage.NotFound(_)) ->
-      case
-        storage.put(
-          backend,
-          object_key,
-          lock_body(key, owner, expires_at),
-          storage.IfAbsent,
-        )
-      {
+      case storage.put(backend, object_key, body, storage.IfAbsent) {
         Ok(metadata) ->
           Ok(
-            Some(Lock(
+            Some(make_lock(
               backend,
               object_key,
               key,
               owner,
               lease_seconds,
+              nonce,
               metadata.version,
             )),
           )
         Error(storage.PreconditionFailed(_)) ->
-          do_try_acquire(backend, key, owner, lease_seconds)
-        Error(error) -> Error(StorageFailed(error))
-      }
-    Error(error) -> Error(StorageFailed(error))
-    Ok(object) -> {
-      use record <- result.try(decode_record(object.body))
-      case record.expires_at > system_time(Second) {
-        True -> Ok(None)
-        False ->
-          case
-            storage.put(
-              backend,
-              object_key,
-              lock_body(key, owner, expires_at),
-              storage.IfUnchanged(object.metadata.version),
-            )
-          {
-            Ok(metadata) ->
+          case confirm_lock_write(backend, object_key, body) {
+            Ok(Some(metadata)) ->
               Ok(
-                Some(Lock(
+                Some(make_lock(
                   backend,
                   object_key,
                   key,
                   owner,
                   lease_seconds,
+                  nonce,
                   metadata.version,
                 )),
               )
-            Error(storage.PreconditionFailed(_)) ->
-              do_try_acquire(backend, key, owner, lease_seconds)
-            Error(error) -> Error(StorageFailed(error))
+            Ok(None) -> do_try_acquire(backend, key, owner, lease_seconds)
+            Error(error) -> Error(error)
           }
+        Error(error) -> Error(StorageFailed(error))
+      }
+    Error(error) -> Error(StorageFailed(error))
+    Ok(object) -> {
+      case decode_record(object.body) {
+        Ok(record) ->
+          case record.expires_at > system_time(Second) {
+            True ->
+              // This exact body may be an ambiguous successful IfAbsent from
+              // this caller. Owner strings are not sufficient: they can be
+              // reused.
+              case object.body == body {
+                True ->
+                  Ok(
+                    Some(make_lock(
+                      backend,
+                      object_key,
+                      key,
+                      owner,
+                      lease_seconds,
+                      nonce,
+                      object.metadata.version,
+                    )),
+                  )
+                False -> Ok(None)
+              }
+            False ->
+              replace_lock(
+                backend,
+                object_key,
+                key,
+                owner,
+                lease_seconds,
+                nonce,
+                body,
+                object.metadata.version,
+              )
+          }
+        Error(CorruptLock(_)) ->
+          replace_lock(
+            backend,
+            object_key,
+            key,
+            owner,
+            lease_seconds,
+            nonce,
+            body,
+            object.metadata.version,
+          )
+        Error(error) -> Error(error)
       }
     }
   }
@@ -117,31 +151,113 @@ pub fn renew(lock: Lock) -> Result(Lock, Error) {
     lock_key:,
     owner:,
     lease_seconds:,
+    nonce:,
     version:,
   ) = lock
   let expires_at = system_time(Second) + lease_seconds
-  storage.put(
-    backend,
-    object_key,
-    lock_body(lock_key, owner, expires_at),
-    storage.IfUnchanged(version),
-  )
-  |> result.map(fn(metadata) { Lock(..lock, version: metadata.version) })
-  |> result.map_error(lock_write_error)
+  let body = lock_body(lock_key, owner, expires_at, nonce)
+  case storage.put(backend, object_key, body, storage.IfUnchanged(version)) {
+    Ok(metadata) -> Ok(Lock(..lock, version: metadata.version))
+    Error(storage.PreconditionFailed(_)) ->
+      case confirm_lock_write(backend, object_key, body) {
+        Ok(Some(metadata)) -> Ok(Lock(..lock, version: metadata.version))
+        Ok(None) -> Error(Lost)
+        Error(error) -> Error(error)
+      }
+    Error(error) -> Error(lock_write_error(error))
+  }
 }
 
 /// Releases a lock with CAS by replacing it with an immediately expired value.
 pub fn release(lock: Lock) -> Result(Nil, Error) {
-  let Lock(storage: backend, object_key:, lock_key:, owner:, version:, ..) =
-    lock
-  storage.put(
-    backend,
-    object_key,
-    lock_body(lock_key, owner, 0),
-    storage.IfUnchanged(version),
-  )
-  |> result.map(fn(_) { Nil })
-  |> result.map_error(lock_write_error)
+  let Lock(
+    storage: backend,
+    object_key:,
+    lock_key:,
+    owner:,
+    nonce:,
+    version:,
+    ..,
+  ) = lock
+  let body = lock_body(lock_key, owner, 0, nonce)
+  case storage.put(backend, object_key, body, storage.IfUnchanged(version)) {
+    Ok(_) -> Ok(Nil)
+    Error(storage.PreconditionFailed(_)) ->
+      case confirm_lock_write(backend, object_key, body) {
+        Ok(Some(_)) -> Ok(Nil)
+        Ok(None) -> Error(Lost)
+        Error(error) -> Error(error)
+      }
+    Error(error) -> Error(lock_write_error(error))
+  }
+}
+
+fn replace_lock(
+  backend: Storage,
+  object_key: String,
+  lock_key: String,
+  owner: String,
+  lease_seconds: Int,
+  nonce: String,
+  body: BitArray,
+  version: VersionToken,
+) -> Result(Option(Lock), Error) {
+  case storage.put(backend, object_key, body, storage.IfUnchanged(version)) {
+    Ok(metadata) ->
+      Ok(
+        Some(make_lock(
+          backend,
+          object_key,
+          lock_key,
+          owner,
+          lease_seconds,
+          nonce,
+          metadata.version,
+        )),
+      )
+    Error(storage.PreconditionFailed(_)) ->
+      case confirm_lock_write(backend, object_key, body) {
+        Ok(Some(metadata)) ->
+          Ok(
+            Some(make_lock(
+              backend,
+              object_key,
+              lock_key,
+              owner,
+              lease_seconds,
+              nonce,
+              metadata.version,
+            )),
+          )
+        Ok(None) -> do_try_acquire(backend, lock_key, owner, lease_seconds)
+        Error(error) -> Error(error)
+      }
+    Error(error) -> Error(StorageFailed(error))
+  }
+}
+
+fn confirm_lock_write(
+  backend: Storage,
+  object_key: String,
+  intended_body: BitArray,
+) -> Result(Option(storage.Metadata), Error) {
+  case storage.get(backend, object_key) {
+    Ok(object) if object.body == intended_body -> Ok(Some(object.metadata))
+    Ok(_) | Error(storage.NotFound(_)) -> Ok(None)
+    Error(error) -> Error(StorageFailed(error))
+  }
+}
+
+fn make_lock(
+  backend: Storage,
+  object_key: String,
+  lock_key: String,
+  owner: String,
+  lease_seconds: Int,
+  nonce: String,
+  version: VersionToken,
+) -> Lock {
+  Lock(backend, object_key, lock_key, owner, lease_seconds, nonce, version)
 }
 
 pub fn owner(lock: Lock) -> String {
@@ -160,12 +276,22 @@ fn lock_object_key(key: String) -> String {
   "cluster/locks/" <> uri.percent_encode(key)
 }
 
-fn lock_body(key: String, owner: String, expires_at: Int) -> BitArray {
+fn new_nonce() -> String {
+  crypto.strong_random_bytes(18) |> bit_array.base64_url_encode(False)
+}
+
+fn lock_body(
+  key: String,
+  owner: String,
+  expires_at: Int,
+  nonce: String,
+) -> BitArray {
   json.object([
     #("schema_version", json.int(1)),
     #("key", json.string(key)),
     #("owner", json.string(owner)),
     #("expires_at", json.int(expires_at)),
+    #("nonce", json.string(nonce)),
   ])
   |> json.to_string
   |> bit_array.from_string

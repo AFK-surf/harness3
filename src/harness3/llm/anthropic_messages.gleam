@@ -418,12 +418,22 @@ fn block_events(block: BlockData, index: Int) -> List(Event) {
       TextDelta(index, text),
       llm.ContentStop(index),
     ]
-    "thinking" -> [
-      ContentStart(index, ReasoningContent),
-      ReasoningDelta(index, thinking),
-      ReasoningEncrypted(index, AnthropicSignedReasoning(signature)),
-      llm.ContentStop(index),
-    ]
+    "thinking" -> {
+      let encrypted = case signature {
+        "" -> []
+        signature -> [
+          ReasoningEncrypted(index, AnthropicSignedReasoning(signature)),
+        ]
+      }
+      list.flatten([
+        [
+          ContentStart(index, ReasoningContent),
+          ReasoningDelta(index, thinking),
+        ],
+        encrypted,
+        [llm.ContentStop(index)],
+      ])
+    }
     "redacted_thinking" -> [
       ContentStart(index, ReasoningContent),
       ReasoningEncrypted(index, AnthropicRedactedReasoning(data)),
