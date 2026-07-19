@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>harness3 · coding teams</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div>
+            <strong>harness<span>3</span></strong>
+            <small>coding teams</small>
+          </div>
+        </div>
+
+        <button class="new-session" id="new-session-button" type="button">
+          <span aria-hidden="true">＋</span> New task
+          <kbd>N</kbd>
+        </button>
+
+        <div class="sidebar-label">Recent sessions</div>
+        <nav class="session-list" id="session-list" aria-label="Coding sessions"></nav>
+
+        <div class="sidebar-footer">
+          <span class="connection-dot" id="connection-dot"></span>
+          <div>
+            <span id="connection-label">Connecting…</span>
+            <small id="workspace-root"></small>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <section class="empty-state" id="empty-state">
+          <div class="empty-orbit" aria-hidden="true">
+            <span class="orbit orbit-one"></span>
+            <span class="orbit orbit-two"></span>
+            <span class="orbit orbit-three"></span>
+            <span class="orbit-core">3</span>
+          </div>
+          <p class="eyebrow">Durable · coordinated · local-first</p>
+          <h1>Give a coding task<br>to a focused team.</h1>
+          <p class="empty-copy">A lead agent can inspect and edit your workspace, run commands, and wake specialist teammates when the task calls for it.</p>
+          <button class="primary" id="empty-new-button" type="button">Start a coding session</button>
+          <div class="capabilities">
+            <span>Read &amp; write files</span>
+            <span>Execute tests</span>
+            <span>Message teammates</span>
+          </div>
+        </section>
+
+        <section class="workspace hidden" id="workspace">
+          <header class="workspace-header">
+            <div class="header-copy">
+              <div class="breadcrumb"><span>Session</span><b>/</b><span id="session-short-id"></span></div>
+              <h1 id="session-title"></h1>
+              <div class="session-meta">
+                <span class="status-pill" id="session-status"></span>
+                <span id="session-model"></span>
+                <span id="session-workspace"></span>
+              </div>
+            </div>
+            <button class="ghost danger" id="stop-button" type="button">Stop team</button>
+          </header>
+
+          <div class="workspace-body">
+            <section class="thread-panel">
+              <div class="thread-toolbar">
+                <div>
+                  <span class="sidebar-label">Agent thread</span>
+                  <strong id="thread-title"></strong>
+                </div>
+                <div class="poll-indicator" title="The durable group state is refreshed automatically"><span></span> live</div>
+              </div>
+              <div class="thread" id="thread" aria-live="polite"></div>
+              <form class="composer" id="message-form">
+                <div class="composer-row">
+                  <label for="target-agent">Send to</label>
+                  <select id="target-agent"></select>
+                </div>
+                <textarea id="message-input" rows="3" placeholder="Give this agent a follow-up, activate a dormant teammate, or redirect the work…" required></textarea>
+                <div class="composer-actions">
+                  <span><kbd>⌘</kbd><kbd>Enter</kbd> to send</span>
+                  <button class="send-button" type="submit">Send message <span>↗</span></button>
+                </div>
+              </form>
+            </section>
+
+            <aside class="team-panel">
+              <div class="team-heading">
+                <div>
+                  <span class="sidebar-label">Team</span>
+                  <h2>Agents</h2>
+                </div>
+                <span class="team-count" id="team-count"></span>
+              </div>
+              <div class="team-list" id="team-list"></div>
+              <div class="usage-card">
+                <span class="sidebar-label">Session usage</span>
+                <div><strong id="usage-total">0</strong><small>tokens</small></div>
+                <dl>
+                  <div><dt>Input</dt><dd id="usage-input">0</dd></div>
+                  <div><dt>Output</dt><dd id="usage-output">0</dd></div>
+                  <div><dt>Cache read</dt><dd id="usage-cache">0</dd></div>
+                </dl>
+              </div>
+            </aside>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="new-session-dialog">
+      <form method="dialog" class="dialog-card" id="new-session-form">
+        <div class="dialog-topline"></div>
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">New coding session</p>
+            <h2>What should the team build?</h2>
+          </div>
+          <button class="icon-button" value="cancel" aria-label="Close dialog" type="submit">×</button>
+        </div>
+
+        <label class="field">
+          <span>Task</span>
+          <textarea id="task-prompt" rows="7" placeholder="Describe the outcome, important constraints, and how the team should verify its work…" required></textarea>
+        </label>
+        <div class="field-grid">
+          <label class="field">
+            <span>Model</span>
+            <select id="model-select" required></select>
+          </label>
+          <label class="field">
+            <span>Team size</span>
+            <select id="team-size">
+              <option value="1">1 · Lead only</option>
+              <option value="2">2 · Lead + researcher</option>
+              <option value="3" selected>3 · Balanced team</option>
+              <option value="4">4 · Full team</option>
+            </select>
+          </label>
+        </div>
+        <label class="field">
+          <span>Workspace <small>relative to the configured root</small></span>
+          <input id="workspace-input" value="." autocomplete="off">
+        </label>
+        <div class="team-preview" id="team-preview"></div>
+        <div class="dialog-actions">
+          <button class="ghost" value="cancel" type="submit">Cancel</button>
+          <button class="primary" id="create-button" value="default" type="submit">Create &amp; run</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

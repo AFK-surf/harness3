@@ -436,15 +436,15 @@ fn delta_decoder() -> decode.Decoder(Delta) {
   )
   use tool_calls <- decode.optional_field(
     "tool_calls",
-    [],
-    decode.list(of: tool_delta_decoder()),
+    None,
+    decode.optional(decode.list(of: tool_delta_decoder())),
   )
   decode.success(Delta(
     role,
     content,
     refusal,
     option.or(reasoning_content, reasoning),
-    tool_calls,
+    option.unwrap(tool_calls, []),
   ))
 }
 

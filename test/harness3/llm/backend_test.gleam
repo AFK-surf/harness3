@@ -309,6 +309,19 @@ pub fn chat_completions_tool_call_indices_test() {
   assert list.contains(events, llm.Finished(llm.ToolUse))
 }
 
+pub fn chat_completions_accepts_explicit_null_tool_calls_test() {
+  let provider =
+    openai_chat_completions.new(openai_chat_completions.config("key"))
+  let assert Ok(events) =
+    llm.decode_response(
+      provider,
+      200,
+      "{\"id\":\"chatcmpl_1\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"done\",\"tool_calls\":null},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}",
+    )
+  assert list.contains(events, llm.TextDelta(0, "done"))
+  assert list.contains(events, llm.Finished(llm.Stop))
+}
+
 pub fn chat_completions_max_tokens_field_test() {
   let provider =
     openai_chat_completions.new(openai_chat_completions.Config(

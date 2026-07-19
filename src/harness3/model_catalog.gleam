@@ -1,3 +1,4 @@
+import envoy
 import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/json
@@ -17,11 +18,20 @@ pub type ModelType {
 }
 
 pub opaque type Credentials {
-  Credentials(value: String)
+  ApiKey(value: String)
+  EnvironmentVariable(name: String)
 }
 
+/// Stores an API key directly in the catalog. Prefer `environment_variable`
+/// for durable or shared storage backends.
 pub fn api_key(value: String) -> Credentials {
-  Credentials(value)
+  ApiKey(value)
+}
+
+/// Stores only an environment-variable name in the durable catalog. The key
+/// is resolved on the node each time a provider is constructed.
+pub fn environment_variable(name: String) -> Credentials {
+  EnvironmentVariable(name)
 }
 
 pub type Model {
@@ -155,7 +165,7 @@ fn storage_error(error: storage.Error) -> Error {
 }
 
 pub fn provider(model: Model) -> Provider {
-  let Credentials(api_key) = model.credentials
+  let api_key = resolve_credentials(model.credentials)
   case model.model_type {
     OpenAIChatCompletions ->
       openai_chat_completions.new(openai_chat_completions.Config(
@@ -188,7 +198,7 @@ pub fn validate(catalog: Catalog) -> Result(Nil, Error) {
 }
 
 fn validate_model(model: Model) -> Result(Nil, Error) {
-  let Credentials(secret) = model.credentials
+  let secret = credential_value(model.credentials)
   case
     string.trim(model.id),
     string.trim(model.name),
@@ -212,7 +222,10 @@ fn encode(catalog: Catalog) -> json.Json {
 }
 
 fn encode_model(model: Model) -> json.Json {
-  let Credentials(secret) = model.credentials
+  let #(credential_type, value) = case model.credentials {
+    ApiKey(value) -> #("api_key", value)
+    EnvironmentVariable(name) -> #("environment_variable", name)
+  }
   json.object([
     #("id", json.string(model.id)),
     #("name", json.string(model.name)),
@@ -221,8 +234,8 @@ fn encode_model(model: Model) -> json.Json {
     #(
       "credentials",
       json.object([
-        #("type", json.string("api_key")),
-        #("value", json.string(secret)),
+        #("type", json.string(credential_type)),
+        #("value", json.string(value)),
       ]),
     ),
   ])
@@ -252,8 +265,22 @@ fn credentials_decoder() -> decode.Decoder(Credentials) {
   use kind <- decode.field("type", decode.string)
   use value <- decode.field("value", decode.string)
   case kind {
-    "api_key" -> decode.success(Credentials(value))
-    _ -> decode.failure(Credentials(""), "unsupported credential type")
+    "api_key" -> decode.success(ApiKey(value))
+    "environment_variable" -> decode.success(EnvironmentVariable(value))
+    _ -> decode.failure(ApiKey(""), "unsupported credential type")
+  }
+}
+
+fn credential_value(credentials: Credentials) -> String {
+  case credentials {
+    ApiKey(value) | EnvironmentVariable(value) -> value
+  }
+}
+
+fn resolve_credentials(credentials: Credentials) -> String {
+  case credentials {
+    ApiKey(value) -> value
+    EnvironmentVariable(name) -> envoy.get(name) |> result.unwrap("")
   }
 }
 
