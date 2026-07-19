@@ -1,9 +1,10 @@
 import aws4_request
 import bucket/list_objects
+import exception
 import gleam/bit_array
 import gleam/http
 import gleam/http/request.{type Request, Request}
-import gleam/http/response.{type Response}
+import gleam/http/response.{type Response, Response}
 import gleam/httpc
 import gleam/int
 import gleam/list
@@ -12,11 +13,14 @@ import gleam/result
 import gleam/string
 import gleam/uri.{Uri}
 import harness3/storage.{
-  type Error, type Metadata, type Object, type PutCondition, type Storage,
-  Backend, GcsGeneration, IfAbsent, IfUnchanged, InvalidCondition, LocalVersion,
-  Metadata, NotFound, Object, PreconditionFailed, S3Etag, Transport,
-  Unconditional,
+  type BodySource, type Error, type Metadata, type Object, type PutCondition,
+  type Storage, Backend, GcsGeneration, IfAbsent, IfUnchanged, InvalidCondition,
+  LocalVersion, Metadata, NotFound, Object, PreconditionFailed, S3Etag,
+  StreamAborted, Transport, Unconditional,
 }
+import harness3/storage/http_stream
+import harness3/storage/retry
+import harness3/storage/s3_sign
 
 pub type Config {
   Config(
@@ -53,6 +57,10 @@ pub fn new(config: Config) -> Storage {
     put: fn(key, body, condition) { put_(config, key, body, condition) },
     list: fn(prefix) { list_(config, prefix) },
     delete: fn(key) { delete_(config, key) },
+    stream_get: fn(key, consume) { stream_get_(config, key, consume) },
+    stream_put: fn(key, body, condition) {
+      stream_put_(config, key, body, condition)
+    },
   )
 }
 
@@ -64,7 +72,8 @@ fn endpoint(config: Config) -> Result(Endpoint, Error) {
   let Config(endpoint: endpoint_url, ..) = config
   case uri.parse(endpoint_url) {
     Ok(Uri(scheme: Some(scheme), host: Some(host), port:, path:, ..))
-      if path == "" || path == "/" ->
+      if path == "" || path == "/"
+    ->
       case http.scheme_from_string(scheme) {
         Ok(scheme) -> Ok(Endpoint(scheme, host, port))
         Error(_) -> Error(Backend(0, "S3 endpoint must use http or https"))
@@ -74,13 +83,8 @@ fn endpoint(config: Config) -> Result(Endpoint, Error) {
 }
 
 fn signer(config: Config) -> aws4_request.Signer {
-  let Config(
-    region:,
-    access_key_id:,
-    secret_access_key:,
-    session_token:,
-    ..
-  ) = config
+  let Config(region:, access_key_id:, secret_access_key:, session_token:, ..) =
+    config
   let signer =
     aws4_request.signer(access_key_id, secret_access_key, region, "s3")
   case session_token {
@@ -110,9 +114,14 @@ fn object_path(config: Config, key: String) -> String {
   "/" <> bucket <> "/" <> key
 }
 
-fn send(req: Request(BitArray)) -> Result(Response(BitArray), Error) {
-  httpc.send_bits(req)
-  |> result.map_error(fn(error) { Transport(string.inspect(error)) })
+fn send(
+  make_request: fn() -> Result(Request(BitArray), Error),
+) -> Result(Response(BitArray), Error) {
+  retry.http(fn() {
+    use req <- result.try(make_request())
+    httpc.send_bits(req)
+    |> result.map_error(fn(error) { Transport(string.inspect(error)) })
+  })
 }
 
 fn response_header(response: Response(body), name: String) -> String {
@@ -151,29 +160,36 @@ fn status_error(response: Response(BitArray), key: String) -> Error {
 }
 
 fn get_(config: Config, key: String) -> Result(Object, Error) {
-  use req <- result.try(
-    request(config, http.Get, object_path(config, key), None, [], <<>>),
+  use response <- result.try(
+    send(fn() {
+      request(config, http.Get, object_path(config, key), None, [], <<>>)
+    }),
   )
-  use response <- result.try(send(req))
   case response.status {
     200 ->
-      Ok(Object(response_metadata(response, key, bit_array.byte_size(response.body)), response.body))
+      Ok(Object(
+        response_metadata(response, key, bit_array.byte_size(response.body)),
+        response.body,
+      ))
     _ -> Error(status_error(response, key))
   }
 }
 
 fn head_(config: Config, key: String) -> Result(Metadata, Error) {
-  use req <- result.try(
-    request(config, http.Head, object_path(config, key), None, [], <<>>),
+  use response <- result.try(
+    send(fn() {
+      request(config, http.Head, object_path(config, key), None, [], <<>>)
+    }),
   )
-  use response <- result.try(send(req))
   case response.status {
     200 -> Ok(response_metadata(response, key, 0))
     _ -> Error(status_error(response, key))
   }
 }
 
-fn condition_headers(condition: PutCondition) -> Result(List(#(String, String)), Error) {
+fn condition_headers(
+  condition: PutCondition,
+) -> Result(List(#(String, String)), Error) {
   case condition {
     Unconditional -> Ok([])
     IfAbsent -> Ok([#("if-none-match", "*")])
@@ -190,20 +206,19 @@ fn put_(
   condition: PutCondition,
 ) -> Result(Metadata, Error) {
   use headers <- result.try(condition_headers(condition))
-  use req <- result.try(
-    request(config, http.Put, object_path(config, key), None, headers, body),
+  use response <- result.try(
+    send(fn() {
+      request(config, http.Put, object_path(config, key), None, headers, body)
+    }),
   )
-  use response <- result.try(send(req))
   case response.status {
     200 ->
-      Ok(
-        Metadata(
-          key:,
-          size: bit_array.byte_size(body),
-          modified_at: response_header(response, "date"),
-          version: S3Etag(response_header(response, "etag")),
-        ),
-      )
+      Ok(Metadata(
+        key:,
+        size: bit_array.byte_size(body),
+        modified_at: response_header(response, "date"),
+        version: S3Etag(response_header(response, "etag")),
+      ))
     _ -> Error(status_error(response, key))
   }
 }
@@ -223,10 +238,11 @@ fn list_pages(
     [#("list-type", "2"), #("prefix", prefix)]
     |> add_optional_query("start-after", start_after)
     |> uri.query_to_string
-  use req <- result.try(
-    request(config, http.Get, "/" <> bucket, Some(query), [], <<>>),
+  use response <- result.try(
+    send(fn() {
+      request(config, http.Get, "/" <> bucket, Some(query), [], <<>>)
+    }),
   )
-  use response <- result.try(send(req))
   case list_objects.response(response) {
     Ok(list_objects.ListObjectsResult(is_truncated:, contents:)) -> {
       let contents = list.reverse(contents)
@@ -240,7 +256,8 @@ fn list_pages(
       case is_truncated, list.last(contents) {
         True, Ok(list_objects.Object(key:, ..)) ->
           list_pages(config, prefix, Some(key), accumulator)
-        True, Error(_) -> Error(Backend(200, "truncated S3 listing had no continuation key"))
+        True, Error(_) ->
+          Error(Backend(200, "truncated S3 listing had no continuation key"))
         False, _ -> Ok(accumulator)
       }
     }
@@ -260,12 +277,149 @@ fn add_optional_query(
 }
 
 fn delete_(config: Config, key: String) -> Result(Nil, Error) {
-  use req <- result.try(
-    request(config, http.Delete, object_path(config, key), None, [], <<>>),
+  use response <- result.try(
+    send(fn() {
+      request(config, http.Delete, object_path(config, key), None, [], <<>>)
+    }),
   )
-  use response <- result.try(send(req))
   case response.status {
     204 -> Ok(Nil)
     _ -> Error(status_error(response, key))
   }
+}
+
+fn streaming_request(
+  config: Config,
+  method: http.Method,
+  path: String,
+  headers: List(#(String, String)),
+  size: Int,
+) -> Result(Request(Nil), Error) {
+  use endpoint <- result.try(endpoint(config))
+  let Endpoint(scheme, host, port) = endpoint
+  let request =
+    Request(
+      method,
+      [#("content-length", int.to_string(size)), ..headers],
+      Nil,
+      scheme,
+      host,
+      port,
+      path,
+      None,
+    )
+  Ok(s3_sign.sign(signer(config), request, "UNSIGNED-PAYLOAD"))
+}
+
+fn stream_get_(
+  config: Config,
+  key: String,
+  consume: fn(BitArray) -> Result(Nil, Error),
+) -> Result(Metadata, Error) {
+  use response <- result.try(
+    http_stream.open_download(fn() {
+      streaming_request(config, http.Get, object_path(config, key), [], 0)
+    }),
+  )
+  let http_stream.StreamingResponse(connection:, ..) = response
+  use <- exception.defer(fn() { http_stream.close(connection) })
+  let http_stream.StreamingResponse(status:, headers:, ..) = response
+  case status {
+    200 -> {
+      use _ <- result.try(http_stream.consume(response, consume))
+      Ok(metadata_from_headers(headers, key, 0))
+    }
+    _ -> {
+      use body <- result.try(http_stream.collect(response))
+      Error(status_error(Response(status, [], body), key))
+    }
+  }
+}
+
+fn stream_put_(
+  config: Config,
+  key: String,
+  body: BodySource,
+  condition: PutCondition,
+) -> Result(Metadata, Error) {
+  let size = storage.body_source_size(body)
+  case size < 0 {
+    True -> Error(StreamAborted("stream size cannot be negative"))
+    False -> {
+      use headers <- result.try(condition_headers(condition))
+      use connection <- result.try(
+        http_stream.connect_retry(fn() {
+          streaming_request(
+            config,
+            http.Put,
+            object_path(config, key),
+            headers,
+            size,
+          )
+        }),
+      )
+      use <- exception.defer(fn() { http_stream.close(connection) })
+      use _ <- result.try(send_source(connection, body, size, 0))
+      use response <- result.try(http_stream.finish(connection))
+      let http_stream.StreamingResponse(status:, headers:, ..) = response
+      use response_body <- result.try(http_stream.collect(response))
+      case status {
+        200 ->
+          Ok(Metadata(
+            key:,
+            size:,
+            modified_at: http_stream.header(headers, "date"),
+            version: S3Etag(http_stream.header(headers, "etag")),
+          ))
+        _ -> Error(status_error(Response(status, [], response_body), key))
+      }
+    }
+  }
+}
+
+fn send_source(
+  connection: http_stream.Connection,
+  source: BodySource,
+  expected_size: Int,
+  sent: Int,
+) -> Result(Nil, Error) {
+  use next <- result.try(storage.read_body_chunk(source))
+  case next {
+    None ->
+      case sent == expected_size {
+        True -> Ok(Nil)
+        False ->
+          Error(StreamAborted(
+            "stream ended after "
+            <> int.to_string(sent)
+            <> " bytes; expected "
+            <> int.to_string(expected_size),
+          ))
+      }
+    Some(chunk) -> {
+      let sent = sent + bit_array.byte_size(chunk)
+      case sent > expected_size {
+        True -> Error(StreamAborted("stream exceeded its declared size"))
+        False -> {
+          use _ <- result.try(http_stream.send_chunk(connection, chunk))
+          send_source(connection, source, expected_size, sent)
+        }
+      }
+    }
+  }
+}
+
+fn metadata_from_headers(
+  headers: List(#(String, String)),
+  key: String,
+  fallback_size: Int,
+) -> Metadata {
+  Metadata(
+    key:,
+    size: http_stream.header(headers, "content-length")
+      |> int.parse
+      |> result.unwrap(fallback_size),
+    modified_at: http_stream.header(headers, "last-modified"),
+    version: S3Etag(http_stream.header(headers, "etag")),
+  )
 }
