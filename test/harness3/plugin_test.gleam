@@ -104,3 +104,39 @@ pub fn agent_callbacks_are_unavailable_during_activation_test() {
   let assert Ok(registry) = plugin.registry([value])
   let assert Ok(_) = plugin.activate(registry, dict.new())
 }
+
+pub fn missing_plugin_state_survives_until_plugin_returns_test() {
+  let available =
+    plugin.new("available", "{\"count\":0}")
+    |> plugin.on_activate(
+      plugin.activation_hook(fn(state, context) {
+        assert state == "{\"count\":2}"
+        Ok(plugin.hook_result("{\"count\":3}", context, Nil))
+      }),
+    )
+  let persisted =
+    dict.from_list([
+      #("available", "{\"count\":2}"),
+      #("temporarily_missing", "{\"count\":9}"),
+    ])
+  let assert Ok(registry) = plugin.registry([available])
+  let assert Ok(runtime) = plugin.activate(registry, persisted)
+  let states = plugin.encoded_states(runtime)
+  assert dict.get(states, "available") == Ok("{\"count\":3}")
+  assert dict.get(states, "temporarily_missing") == Ok("{\"count\":9}")
+
+  let restored =
+    plugin.new("temporarily_missing", "{\"count\":0}")
+    |> plugin.on_activate(
+      plugin.activation_hook(fn(state, context) {
+        assert state == "{\"count\":9}"
+        Ok(plugin.hook_result("{\"count\":10}", context, Nil))
+      }),
+    )
+  let assert Ok(restored_registry) = plugin.registry([restored])
+  let assert Ok(restored_runtime) = plugin.activate(restored_registry, states)
+  let restored_states = plugin.encoded_states(restored_runtime)
+  assert dict.get(restored_states, "temporarily_missing")
+    == Ok("{\"count\":10}")
+  assert dict.get(restored_states, "available") == Ok("{\"count\":3}")
+}

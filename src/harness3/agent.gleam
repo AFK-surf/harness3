@@ -593,17 +593,23 @@ pub fn start(
   checkpointer: Checkpointer,
   router: CallbackRouter,
   observe: fn(Event) -> Result(Nil, Error),
+  on_exit: fn() -> Nil,
 ) -> Handle {
   let ready = process.new_subject()
   let Active(plugins:, ..) = active
   let pid =
     process.spawn_unlinked(fn() {
+      let plugin_pid = plugin_host_pid(plugins)
+      let assert True = process.link(plugin_pid)
       let gate = process.new_subject()
       process.send(ready, gate)
       let assert Ok(Nil) = process.receive(gate, within: 60_000)
       run_loop(active, checkpointer, router, observe)
+      stop_plugin_host(plugins)
+      on_exit()
     })
   let assert Ok(gate) = process.receive(ready, within: 5000)
+  process.unlink(plugin_host_pid(plugins))
   Handle(pid, plugins, router, gate)
 }
 
@@ -649,6 +655,22 @@ pub fn pid(handle: Handle) -> Pid {
   pid
 }
 
+fn plugin_host_pid(host: PluginHost) -> Pid {
+  let PluginHost(subject) = host
+  let assert Ok(pid) = process.subject_owner(subject)
+  pid
+}
+
+fn stop_plugin_host(host: PluginHost) -> Nil {
+  let PluginHost(subject) = host
+  let pid = plugin_host_pid(host)
+  let monitor = process.monitor(pid)
+  process.send(subject, StopPlugins)
+  process.new_selector()
+  |> process.select_specific_monitor(monitor, fn(_) { Nil })
+  |> process.selector_receive_forever
+}
+
 pub fn call_callback(
   handle: Handle,
   plugin_name: String,
@@ -662,9 +684,9 @@ pub fn call_callback(
 }
 
 pub fn stop(handle: Handle) -> Nil {
-  let Handle(pid:, plugins: PluginHost(subject), ..) = handle
+  let Handle(pid:, ..) = handle
+  process.unlink(pid)
   process.kill(pid)
-  process.send(subject, StopPlugins)
 }
 
 /// Stable JSON representation used by the agent-group snapshot.

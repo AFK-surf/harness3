@@ -2,7 +2,7 @@ import gleam/bit_array
 import gleam/crypto
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
-import gleam/erlang/process.{type Subject}
+import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/json
 import gleam/list
@@ -102,7 +102,10 @@ type Message {
     reply: Subject(Result(CommitReceipt, Error)),
   )
   Snapshot(reply: Subject(Result(AgentGroup, Error)))
-  RegisterChild(id: String, handle: agent.Handle)
+  AgentPids(reply: Subject(List(#(String, Pid))))
+  RegisterChild(id: String, handle: agent.Handle, reply: Subject(Nil))
+  AgentExited(id: String)
+  StopIfEmpty
   CallAgentCallback(
     source_id: String,
     target_id: String,
@@ -143,14 +146,7 @@ pub fn resume(config: Config) -> Result(Group, Error) {
     storage.get(config.storage, config.object_key)
     |> result.map_error(StorageFailed),
   )
-  use body <- result.try(
-    bit_array.to_string(object.body)
-    |> result.map_error(fn(_) { DecodeFailed("agent group is not UTF-8 JSON") }),
-  )
-  use group <- result.try(
-    json.parse(body, group_decoder())
-    |> result.map_error(fn(error) { DecodeFailed(string.inspect(error)) }),
-  )
+  use group <- result.try(decode_group_body(object.body))
   use _ <- result.try(validate(config, group))
   use _ <- result.try(ensure_claimable(group.execution))
   let owner = owner_token()
@@ -167,6 +163,26 @@ pub fn resume(config: Config) -> Result(Group, Error) {
     |> result.map_error(storage_error),
   )
   start_coordinator(config, claimed, metadata.version, owner)
+}
+
+/// Loads the durable group state without claiming it or starting processes.
+pub fn load(config: Config) -> Result(AgentGroup, Error) {
+  use object <- result.try(
+    storage.get(config.storage, config.object_key)
+    |> result.map_error(StorageFailed),
+  )
+  use group <- result.try(decode_group_body(object.body))
+  use _ <- result.try(validate(config, group))
+  Ok(group)
+}
+
+fn decode_group_body(body: BitArray) -> Result(AgentGroup, Error) {
+  use body <- result.try(
+    bit_array.to_string(body)
+    |> result.map_error(fn(_) { DecodeFailed("agent group is not UTF-8 JSON") }),
+  )
+  json.parse(body, group_decoder())
+  |> result.map_error(fn(error) { DecodeFailed(string.inspect(error)) })
 }
 
 fn start_coordinator(
@@ -197,6 +213,7 @@ fn start_coordinator(
   schedule_renewal(started.data, config.lease_duration_seconds)
   let children = list.map(prepared, fn(item) { launch_agent(handle, item) })
   list.each(children, agent.release)
+  process.send(started.data, StopIfEmpty)
   Ok(handle)
 }
 
@@ -250,9 +267,13 @@ fn launch_agent(group: Group, prepared: PreparedAgent) -> agent.Handle {
         agent.CommitFailed(string.inspect(error))
       })
     })
-  let child = agent.start(active, checkpoint, router, definition.observe)
+  let child =
+    agent.start(active, checkpoint, router, definition.observe, fn() {
+      let Group(subject) = group
+      process.send(subject, AgentExited(id))
+    })
   let Group(subject) = group
-  process.send(subject, RegisterChild(id, child))
+  process.call_forever(subject, fn(reply) { RegisterChild(id, child, reply) })
   child
 }
 
@@ -295,6 +316,17 @@ pub fn snapshot(group: Group) -> Result(AgentGroup, Error) {
   process.call_forever(subject, Snapshot)
 }
 
+pub fn pid(group: Group) -> Pid {
+  let Group(subject) = group
+  let assert Ok(pid) = process.subject_owner(subject)
+  pid
+}
+
+pub fn agent_pids(group: Group) -> List(#(String, Pid)) {
+  let Group(subject) = group
+  process.call_forever(subject, AgentPids)
+}
+
 pub fn stop(group: Group) -> Result(Nil, Error) {
   let Group(subject) = group
   process.call_forever(subject, Stop)
@@ -334,10 +366,38 @@ fn handle_message(
       })
       actor.continue(state)
     }
-    RegisterChild(id, handle) ->
+    AgentPids(reply) -> {
+      process.send(reply, list.map(state.children, fn(child) {
+        #(child.0, agent.pid(child.1))
+      }))
+      actor.continue(state)
+    }
+    RegisterChild(id, handle, reply) -> {
+      let assert True = process.link(agent.pid(handle))
+      process.send(reply, Nil)
       actor.continue(
         CoordinatorState(..state, children: [#(id, handle), ..state.children]),
       )
+    }
+    AgentExited(id) -> {
+      let children =
+        list.filter(state.children, fn(child) { child.0 != id })
+      case children {
+        [] -> {
+          let _ = release(CoordinatorState(..state, children:))
+          actor.stop()
+        }
+        _ -> actor.continue(CoordinatorState(..state, children:))
+      }
+    }
+    StopIfEmpty ->
+      case state.children {
+        [] -> {
+          let _ = release(state)
+          actor.stop()
+        }
+        _ -> actor.continue(state)
+      }
     CallAgentCallback(
       source,
       target_id,
@@ -359,7 +419,7 @@ fn handle_message(
           process.send(reply, Error(AgentCallbackUnavailable(target_id)))
         False, True, Ok(handle) -> {
           let _ =
-            process.spawn_unlinked(fn() {
+            process.spawn(fn() {
               let response = case
                 agent.call_callback(handle, plugin_name, callback, input)
               {

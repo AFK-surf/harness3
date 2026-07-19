@@ -271,19 +271,12 @@ pub fn activate(
   registry: Registry,
   persisted_states: Dict(String, String),
 ) -> Result(Runtime, Error) {
-  let Registry(ordered:, by_name:) = registry
-  use _ <- result.try(
-    persisted_states
-    |> dict.to_list
-    |> list.try_each(fn(entry) {
-      case dict.has_key(by_name, entry.0) {
-        True -> Ok(Nil)
-        False -> Error(UnknownPlugin(entry.0))
-      }
-    }),
-  )
+  let Registry(ordered:, ..) = registry
+  // Keep state belonging to unavailable plugins as opaque dormant data. This
+  // lets a group pass through a node with an older plugin set without losing
+  // state needed when the plugin becomes available again.
   use states <- result.try(
-    list.try_fold(ordered, dict.new(), fn(states, plugin) {
+    list.try_fold(ordered, persisted_states, fn(states, plugin) {
       let state =
         dict.get(persisted_states, plugin.name)
         |> result.unwrap(plugin.initial_state)

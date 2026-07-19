@@ -2,7 +2,7 @@ import gleam/bit_array
 import gleam/crypto
 import gleam/dict
 import gleam/dynamic.{type Dynamic}
-import gleam/erlang/process.{type Subject}
+import gleam/erlang/process.{type Monitor, type Subject}
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
@@ -42,8 +42,25 @@ fn gated_transport(
   })
 }
 
+fn crashing_gated_transport(gate: Subject(GateMessage)) -> agent.ModelTransport {
+  agent.model_transport(fn(_, _, _) {
+    let release = process.new_subject()
+    process.send(gate, Started(release))
+    let assert Ok(Nil) = process.receive(release, within: 5000)
+    panic as "intentional agent crash"
+  })
+}
+
 fn observe(_event: agent.Event) -> Result(Nil, agent.Error) {
   Ok(Nil)
+}
+
+fn await_down(monitor: Monitor) -> Nil {
+  let assert Ok(_) =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(down) { down })
+    |> process.selector_receive(5000)
+  Nil
 }
 
 pub fn parallel_agents_commit_through_group_test() {
@@ -92,6 +109,10 @@ pub fn parallel_agents_commit_through_group_test() {
       agent.state("b", "model"),
     ])
   let assert Ok(group) = agent_group.create(config, initial)
+  let group_monitor = process.monitor(agent_group.pid(group))
+  let agent_monitors =
+    agent_group.agent_pids(group)
+    |> list.map(fn(entry) { process.monitor(entry.1) })
 
   // Both workers must reach the transport before either is released.
   let assert Ok(Started(release_a)) = process.receive(gate, within: 5000)
@@ -99,30 +120,86 @@ pub fn parallel_agents_commit_through_group_test() {
   process.send(release_a, Nil)
   process.send(release_b, Nil)
 
-  let assert Ok(snapshot) = await_completed(group, 100)
+  list.each(agent_monitors, await_down)
+  await_down(group_monitor)
+  let assert Ok(snapshot) = agent_group.load(config)
   assert snapshot.revision >= 3
   assert list.all(snapshot.agents, fn(state) {
     state.status == agent.Completed && state.revision == 1
   })
   let assert agent_group.Completed = snapshot.execution
-  let assert Ok(Nil) = agent_group.stop(group)
 
   remove_directory(root)
 }
 
-fn await_completed(
-  group: agent_group.Group,
-  attempts: Int,
-) -> Result(agent_group.AgentGroup, Nil) {
-  let assert Ok(snapshot) = agent_group.snapshot(group)
-  case snapshot.execution, attempts {
-    agent_group.Completed, _ -> Ok(snapshot)
-    _, 0 -> Error(Nil)
-    _, _ -> {
-      process.sleep(10)
-      await_completed(group, attempts - 1)
-    }
-  }
+pub fn linked_agent_crash_terminates_process_tree_test() {
+  let root = temporary_root("agent-group-crash-test")
+  let storage = local.new(local.config(root))
+  let model =
+    model_catalog.Model(
+      id: "model",
+      name: "test-model",
+      endpoint: "https://example.test",
+      model_type: model_catalog.OpenAIResponses,
+      credentials: model_catalog.api_key("secret"),
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(registry) = plugin.registry([])
+  let crashing_gate = process.new_subject()
+  let sibling_gate = process.new_subject()
+  let config =
+    agent_group.Config(
+      storage:,
+      object_key: "groups/crash",
+      catalog:,
+      definitions: [
+        agent_group.AgentDefinition(
+          id: "crashing",
+          registry:,
+          transport: crashing_gated_transport(crashing_gate),
+          max_output_tokens: None,
+          reasoning_effort: None,
+          observe:,
+        ),
+        agent_group.AgentDefinition(
+          id: "sibling",
+          registry:,
+          transport: gated_transport(sibling_gate, "never completed"),
+          max_output_tokens: None,
+          reasoning_effort: None,
+          observe:,
+        ),
+      ],
+      lease_duration_seconds: 10,
+    )
+  let initial =
+    agent_group.new("crash", [
+      agent.state("crashing", "model"),
+      agent.state("sibling", "model"),
+    ])
+  let started = process.new_subject()
+  let owner =
+    process.spawn_unlinked(fn() {
+      process.send(started, agent_group.create(config, initial))
+      process.sleep_forever()
+    })
+  let assert Ok(Ok(group)) = process.receive(started, within: 5000)
+  let agent_pids = agent_group.agent_pids(group)
+  assert list.length(agent_pids) == 2
+  let group_monitor = process.monitor(agent_group.pid(group))
+  let owner_monitor = process.monitor(owner)
+  let agent_monitors =
+    list.map(agent_pids, fn(entry) { process.monitor(entry.1) })
+
+  let assert Ok(Started(crash)) = process.receive(crashing_gate, within: 5000)
+  let assert Ok(Started(_sibling)) = process.receive(sibling_gate, within: 5000)
+  process.send(crash, Nil)
+
+  list.each(agent_monitors, await_down)
+  await_down(group_monitor)
+  await_down(owner_monitor)
+
+  remove_directory(root)
 }
 
 pub fn encrypted_reasoning_state_round_trip_test() {
@@ -257,7 +334,9 @@ pub fn full_agent_loop_with_mocked_llm_test() {
       config,
       agent_group.new("full-loop", [agent.state("agent", "model")]),
     )
-  let assert Ok(snapshot) = await_completed(group, 100)
+  let group_monitor = process.monitor(agent_group.pid(group))
+  await_down(group_monitor)
+  let assert Ok(snapshot) = agent_group.load(config)
   let assert [completed] = snapshot.agents
   assert completed.status == agent.Completed
   assert completed.round == 2
@@ -266,17 +345,14 @@ pub fn full_agent_loop_with_mocked_llm_test() {
   assert contains_tool_result(completed.messages)
   let assert Ok(llm.Message(llm.Assistant, [llm.Text("final answer")])) =
     list.last(completed.messages)
-  let assert Ok(Nil) = agent_group.stop(group)
 
   // The completed state is read from the single persisted group object.
-  let assert Ok(resumed) = agent_group.resume(config)
-  let assert Ok(resumed_snapshot) = agent_group.snapshot(resumed)
+  let assert Ok(resumed_snapshot) = agent_group.load(config)
   let assert [resumed_agent] = resumed_snapshot.agents
   assert resumed_agent.round == 2
   assert resumed_agent.revision == 2
   assert dict.get(resumed_agent.plugin_states, "stateful")
     == Ok("{\"calls\":1}")
-  let assert Ok(Nil) = agent_group.stop(resumed)
 
   remove_directory(root)
 }
@@ -410,7 +486,9 @@ pub fn plugin_callback_between_agents_test() {
         agent.state("receiver", "model"),
       ]),
     )
-  let assert Ok(snapshot) = await_completed(group, 200)
+  let group_monitor = process.monitor(agent_group.pid(group))
+  await_down(group_monitor)
+  let assert Ok(snapshot) = agent_group.load(config)
   let assert Ok(caller) =
     list.find(snapshot.agents, fn(state) { state.id == "caller" })
   let assert Ok(receiver) =
@@ -426,7 +504,6 @@ pub fn plugin_callback_between_agents_test() {
     == Ok("{\"calls\":1}")
   assert receiver.plugin_generation == 1
   assert snapshot.revision >= 5
-  let assert Ok(Nil) = agent_group.stop(group)
 
   remove_directory(root)
 }
