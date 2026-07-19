@@ -1,7 +1,7 @@
 import gleam/bit_array
-import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/charlist.{type Charlist}
+import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/result
@@ -22,6 +22,7 @@ pub fn config(root: String) -> Config {
 }
 
 pub fn new(config: Config) -> Storage {
+  with_lock(fn() { generation_store_ensure() })
   storage.from_functions(
     get: fn(key) { get_(config, key) },
     head: fn(key) { head_(config, key) },
@@ -51,10 +52,18 @@ type LockResource {
 
 type GenerationStore {
   Harness3LocalStorageGenerations
+  Undefined
 }
 
-type LocalState {
-  LocalState(mtime_seconds: Int, generation: Int)
+type EtsInfoItem {
+  Name
+}
+
+type EtsOption {
+  NamedTable
+  Set
+  Public
+  ReadConcurrency(Bool)
 }
 
 type FileStatus
@@ -120,11 +129,48 @@ fn is_atom(value: FileStatus) -> Bool
 @external(erlang, "global", "trans")
 fn global_transaction(lock: #(LockResource, Dynamic), transaction: fn() -> a) -> a
 
-@external(erlang, "persistent_term", "get")
-fn persistent_get(key: GenerationStore, default: Dict(String, LocalState)) -> Dict(String, LocalState)
+@external(erlang, "ets", "info")
+fn ets_info(table: GenerationStore, item: EtsInfoItem) -> GenerationStore
 
-@external(erlang, "persistent_term", "put")
-fn persistent_put(key: GenerationStore, value: Dict(String, LocalState)) -> Nil
+@external(erlang, "ets", "new")
+fn ets_new(name: GenerationStore, options: List(EtsOption)) -> GenerationStore
+
+@external(erlang, "ets", "lookup")
+fn ets_lookup(
+  table: GenerationStore,
+  path: String,
+) -> List(#(String, Int, Int))
+
+@external(erlang, "ets", "insert")
+fn ets_insert(
+  table: GenerationStore,
+  entry: #(String, Int, Int),
+) -> Bool
+
+fn generation_store_ensure() -> Nil {
+  case ets_info(Harness3LocalStorageGenerations, Name) {
+    Harness3LocalStorageGenerations -> Nil
+    Undefined -> {
+      let ready = process.new_subject()
+      process.spawn_unlinked(fn() {
+        let _ =
+          ets_new(Harness3LocalStorageGenerations, [
+            NamedTable,
+            Set,
+            Public,
+            ReadConcurrency(True),
+          ])
+        process.send(ready, Nil)
+        process.sleep_forever()
+      })
+      process.receive_forever(ready)
+    }
+  }
+}
+
+fn generation_store_insert(path: String, mtime: Int, generation: Int) -> Bool {
+  ets_insert(Harness3LocalStorageGenerations, #(path, mtime, generation))
+}
 
 fn with_lock(transaction: fn() -> a) -> a {
   global_transaction(#(Harness3LocalStorageLock, self()), transaction)
@@ -162,26 +208,20 @@ fn generation_for(path: String, mtime: Int) -> Int {
   // Current and deleted entries remain for the node lifetime. This deliberately
   // exceeds the two-second minimum needed to disambiguate second-resolution
   // mtimes.
-  let generations = persistent_get(Harness3LocalStorageGenerations, dict.new())
-  case dict.get(generations, path) {
-    Ok(LocalState(mtime_seconds: stored_mtime, generation:))
-      if stored_mtime == mtime ->
+  case ets_lookup(Harness3LocalStorageGenerations, path) {
+    [#(_, stored_mtime, generation)] if stored_mtime == mtime ->
       generation
     _ -> {
       let generation = next_generation()
-      generations
-      |> dict.insert(path, LocalState(mtime, generation))
-      |> persistent_put(Harness3LocalStorageGenerations, _)
+      let _ = generation_store_insert(path, mtime, generation)
       generation
     }
   }
 }
 
 fn remember_deleted(path: String) -> Nil {
-  let generations = persistent_get(Harness3LocalStorageGenerations, dict.new())
-  generations
-  |> dict.insert(path, LocalState(-1, next_generation()))
-  |> persistent_put(Harness3LocalStorageGenerations, _)
+  let _ = generation_store_insert(path, -1, next_generation())
+  Nil
 }
 
 fn metadata_locked(key: String, path: String) -> Result(Metadata, Error) {
@@ -276,10 +316,7 @@ fn put_(
       Ok(Nil) -> {
         let mtime = mtime_seconds(path)
         let generation = next_generation()
-        let generations =
-          persistent_get(Harness3LocalStorageGenerations, dict.new())
-          |> dict.insert(path, LocalState(mtime, generation))
-        persistent_put(Harness3LocalStorageGenerations, generations)
+        let _ = generation_store_insert(path, mtime, generation)
         Ok(
           Metadata(
             key:,
