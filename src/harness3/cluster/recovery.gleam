@@ -217,18 +217,44 @@ fn dispatch_candidates(
   case nodes {
     [] -> Nil
     _ ->
-      list.each(candidates, fn(candidate) {
-        case dispatch_candidate(dispatch, candidate, nodes) {
-          False -> Nil
-          True ->
-            running
-            |> list.filter(fn(entry) { entry.group_id == candidate.group_id })
-            |> list.each(fn(entry) {
-              let _ = storage.delete(backend, entry.index_key)
-              Nil
-            })
-        }
-      })
+      dispatch_round_robin(
+        backend,
+        dispatch,
+        candidates,
+        list.shuffle(nodes),
+        running,
+      )
+  }
+}
+
+fn dispatch_round_robin(
+  backend: Storage,
+  dispatch: fn(String, Int, String, String) -> Result(Nil, String),
+  candidates: List(agent_group.RunningIndexEntry),
+  nodes: List(Membership),
+  running: List(agent_group.RunningIndexEntry),
+) -> Nil {
+  case candidates, nodes {
+    [], _ | _, [] -> Nil
+    [candidate, ..rest], [node, ..remaining_nodes] -> {
+      case dispatch_candidate(dispatch, candidate, nodes) {
+        False -> Nil
+        True ->
+          running
+          |> list.filter(fn(entry) { entry.group_id == candidate.group_id })
+          |> list.each(fn(entry) {
+            let _ = storage.delete(backend, entry.index_key)
+            Nil
+          })
+      }
+      dispatch_round_robin(
+        backend,
+        dispatch,
+        rest,
+        list.append(remaining_nodes, [node]),
+        running,
+      )
+    }
   }
 }
 
