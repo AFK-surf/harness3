@@ -13,8 +13,11 @@ import gleam/uri
 import harness3/agent
 import harness3/agent_group_registry
 import harness3/agent_profile
+import harness3/llm
 import harness3/model_catalog
 import harness3/storage.{type Metadata, type Storage, type VersionToken}
+
+const default_minimum_lifetime_milliseconds = 10_000
 
 pub type ExecutionState {
   Idle
@@ -57,11 +60,13 @@ pub type Config {
     object_key: String,
     profiles: List(agent_profile.AgentProfile),
     lease_duration_seconds: Int,
+    minimum_lifetime_milliseconds: Int,
   )
 }
 
 pub type Error {
   InvalidGroup(reason: String)
+  InvalidMessage(reason: String)
   MissingAgent(id: String)
   MissingProfile(id: String)
   DuplicateAgent(id: String)
@@ -81,7 +86,7 @@ pub type Error {
 }
 
 pub type CommitReceipt {
-  CommitReceipt(agent_revision: Int, group_revision: Int)
+  CommitReceipt(state: agent.State, group_revision: Int)
 }
 
 pub opaque type Group {
@@ -104,6 +109,9 @@ type CoordinatorState {
     owned: Bool,
     children: List(#(String, agent.Handle)),
     helpers: List(Pid),
+    profiles: List(agent_profile.AgentProfile),
+    minimum_lifetime_milliseconds: Int,
+    minimum_lifetime_elapsed: Bool,
   )
 }
 
@@ -117,9 +125,9 @@ type Message {
   Snapshot(reply: Subject(Result(AgentGroup, Error)))
   AgentPids(reply: Subject(List(#(String, Pid))))
   RegisterChild(id: String, handle: agent.Handle, reply: Subject(Nil))
-  AgentExited(id: String)
-  CallbackHelperExited(pid: Pid)
-  StopIfEmpty
+  AgentExited(id: String, pid: Pid, coordinator: Subject(Message))
+  CallbackHelperExited(pid: Pid, coordinator: Subject(Message))
+  StopIfEmpty(coordinator: Subject(Message))
   CallAgentCallback(
     source_id: String,
     target_id: String,
@@ -133,6 +141,12 @@ type Message {
     target_id: String,
     plugin_states: Dict(String, String),
     plugin_generation: Int,
+    reply: Subject(Result(Nil, Error)),
+  )
+  SendGroupMessage(
+    agent_id: String,
+    content: String,
+    coordinator: Subject(Message),
     reply: Subject(Result(Nil, Error)),
   )
   Renew(subject: Subject(Message))
@@ -188,7 +202,14 @@ pub fn resume_registered(
     agent_profile.profiles(profile_ids)
     |> result.map_error(fn(error) { ProfileUnavailable(string.inspect(error)) }),
   )
-  let config = Config(storage, object_key, profiles, lease_duration_seconds)
+  let config =
+    Config(
+      storage,
+      object_key,
+      profiles,
+      lease_duration_seconds,
+      default_minimum_lifetime_milliseconds,
+    )
   use _ <- result.try(validate(config, group))
   Ok(LoadedGroup(config, group, object.metadata.version))
 }
@@ -200,6 +221,21 @@ pub fn loaded_state(loaded: LoadedGroup) -> AgentGroup {
 
 /// Claims a loaded group and starts its coordinator and agent processes.
 pub fn wake(loaded: LoadedGroup) -> Result(Group, Error) {
+  wake_as(loaded, owner_token())
+}
+
+/// Claims and runs a group using a stable node owner token.
+pub fn wake_as(loaded: LoadedGroup, owner: String) -> Result(Group, Error) {
+  wake_as_with_membership_refresh(loaded, owner, fn() { Nil })
+}
+
+/// Claims and runs a group, synchronously publishing membership after local
+/// registration and before creating the durable running index.
+pub fn wake_as_with_membership_refresh(
+  loaded: LoadedGroup,
+  owner: String,
+  refresh_membership: fn() -> Nil,
+) -> Result(Group, Error) {
   let LoadedGroup(config:, group:, version:) = loaded
   use catalog_session <- result.try(
     model_catalog.resume(config.storage, group.model_catalog_key)
@@ -208,7 +244,6 @@ pub fn wake(loaded: LoadedGroup) -> Result(Group, Error) {
   let catalog = model_catalog.catalog(catalog_session)
   use _ <- result.try(validate_models(group, catalog))
   use _ <- result.try(ensure_claimable(group.execution))
-  let owner = owner_token()
   let claimed = claim(group, owner, config.lease_duration_seconds)
   let claimed_body =
     encode_group(claimed) |> json.to_string |> bit_array.from_string
@@ -222,7 +257,15 @@ pub fn wake(loaded: LoadedGroup) -> Result(Group, Error) {
     |> result.map_error(storage_error),
   )
   let index_key = running_index_key(claimed, owner)
-  start_coordinator(config, claimed, metadata, owner, index_key, catalog)
+  start_coordinator(
+    config,
+    claimed,
+    metadata,
+    owner,
+    index_key,
+    catalog,
+    refresh_membership,
+  )
 }
 
 /// Loads the durable group state without claiming it or starting processes.
@@ -252,6 +295,7 @@ fn start_coordinator(
   owner: String,
   index_key: String,
   catalog: model_catalog.Catalog,
+  refresh_membership: fn() -> Nil,
 ) -> Result(Group, Error) {
   use prepared <- result.try(prepare_agents(config, group, catalog))
   let state =
@@ -266,6 +310,9 @@ fn start_coordinator(
       True,
       [],
       [],
+      config.profiles,
+      config.minimum_lifetime_milliseconds,
+      False,
     )
   use started <- result.try(
     actor.new(state)
@@ -274,9 +321,26 @@ fn start_coordinator(
     |> result.map_error(fn(error) { ProcessStartFailed(string.inspect(error)) }),
   )
   let handle = Group(started.data)
-  agent_group_registry.register(group.id, started.pid, fn() {
-    stop(handle) |> result.map_error(string.inspect)
-  })
+  agent_group_registry.register(
+    group.id,
+    started.pid,
+    fn() { stop(handle) |> result.map_error(string.inspect) },
+    fn(agent_id, message) {
+      send_message(handle, agent_id, message)
+      |> result.map_error(string.inspect)
+    },
+  )
+
+  // RECOVERY ORDERING INVARIANT: recovery deliberately snapshots the running
+  // index before it reads membership. A new claim must therefore become
+  // visible in this exact order:
+  //
+  //   local registry -> acknowledged membership refresh -> running index
+  //
+  // Never move write_running_index above this refresh. Doing so creates a
+  // window where recovery sees an indexed group but cannot see its live owner,
+  // and may incorrectly dispatch a second claimant.
+  refresh_membership()
   case
     write_running_index(
       config.storage,
@@ -288,6 +352,9 @@ fn start_coordinator(
   {
     Error(error) -> {
       agent_group_registry.unregister(group.id, started.pid)
+      // The index was not published, so remove the now-stale membership claim
+      // promptly instead of waiting for the periodic registry sweep.
+      refresh_membership()
       process.unlink(started.pid)
       process.kill(started.pid)
       Error(StorageFailed(error))
@@ -305,7 +372,12 @@ fn start_agents(
   schedule_renewal(subject, config.lease_duration_seconds)
   let children = list.map(prepared, fn(item) { launch_agent(handle, item) })
   list.each(children, agent.release)
-  process.send(subject, StopIfEmpty)
+  let _ =
+    process.send_after(
+      subject,
+      config.minimum_lifetime_milliseconds,
+      StopIfEmpty(subject),
+    )
   Ok(handle)
 }
 
@@ -341,13 +413,21 @@ fn prepare_agents(
 }
 
 fn launch_agent(group: Group, prepared: PreparedAgent) -> agent.Handle {
+  let child = make_agent(group, prepared)
+  let PreparedAgent(id:, ..) = prepared
+  let Group(subject) = group
+  process.call_forever(subject, fn(reply) { RegisterChild(id, child, reply) })
+  child
+}
+
+fn make_agent(group: Group, prepared: PreparedAgent) -> agent.Handle {
   let PreparedAgent(id:, active:, profile:) = prepared
   let checkpoint =
     agent.checkpointer(fn(expected, state) {
       commit_agent(group, id, expected, state)
       |> result.map(fn(receipt) {
-        let CommitReceipt(agent_revision:, group_revision:) = receipt
-        agent.CommitReceipt(agent_revision, group_revision)
+        let CommitReceipt(state:, group_revision:) = receipt
+        agent.CommitReceipt(state, group_revision)
       })
       |> result.map_error(fn(error) {
         agent.CommitFailed(string.inspect(error))
@@ -363,10 +443,8 @@ fn launch_agent(group: Group, prepared: PreparedAgent) -> agent.Handle {
   let child =
     agent.start(active, checkpoint, router, profile.observe, fn() {
       let Group(subject) = group
-      process.send(subject, AgentExited(id))
+      process.send(subject, AgentExited(id, process.self(), subject))
     })
-  let Group(subject) = group
-  process.call_forever(subject, fn(reply) { RegisterChild(id, child, reply) })
   child
 }
 
@@ -425,6 +503,19 @@ pub fn stop(group: Group) -> Result(Nil, Error) {
   process.call_forever(subject, Stop)
 }
 
+/// Durably queues a user message and starts a new parallel agent round when
+/// the group has no agents currently executing.
+pub fn send_message(
+  group: Group,
+  agent_id: String,
+  content: String,
+) -> Result(Nil, Error) {
+  let Group(subject) = group
+  process.call_forever(subject, fn(reply) {
+    SendGroupMessage(agent_id, content, subject, reply)
+  })
+}
+
 fn handle_message(
   state: CoordinatorState,
   message: Message,
@@ -470,37 +561,34 @@ fn handle_message(
         CoordinatorState(..state, children: [#(id, handle), ..state.children]),
       )
     }
-    AgentExited(id) -> {
-      let children = list.filter(state.children, fn(child) { child.0 != id })
-      case children, state.helpers {
-        [], [] -> {
-          let _ = finish(CoordinatorState(..state, children:))
-          agent_group_registry.unregister(state.group.id, process.self())
-          actor.stop()
-        }
-        _, _ -> actor.continue(CoordinatorState(..state, children:))
+    AgentExited(id, pid, coordinator) -> {
+      let children =
+        list.filter(state.children, fn(child) {
+          child.0 != id || agent.pid(child.1) != pid
+        })
+      let state = CoordinatorState(..state, children:)
+      case find_agent(state.group.agents, id) {
+        Ok(current) ->
+          case current.pending_messages {
+            [] -> settle_idle(state)
+            [_, ..] ->
+              case inject_and_start(state, current, [], coordinator) {
+                Ok(next) -> actor.continue(next)
+                Error(_) -> {
+                  abandon(state)
+                  actor.stop()
+                }
+              }
+          }
+        _ -> settle_idle(state)
       }
     }
-    CallbackHelperExited(pid) -> {
+    CallbackHelperExited(pid, _coordinator) -> {
       let helpers = list.filter(state.helpers, fn(helper) { helper != pid })
-      case state.children, helpers {
-        [], [] -> {
-          let _ = finish(CoordinatorState(..state, helpers:))
-          agent_group_registry.unregister(state.group.id, process.self())
-          actor.stop()
-        }
-        _, _ -> actor.continue(CoordinatorState(..state, helpers:))
-      }
+      settle_idle(CoordinatorState(..state, helpers:))
     }
-    StopIfEmpty ->
-      case state.children, state.helpers {
-        [], [] -> {
-          let _ = finish(state)
-          agent_group_registry.unregister(state.group.id, process.self())
-          actor.stop()
-        }
-        _, _ -> actor.continue(state)
-      }
+    StopIfEmpty(_coordinator) ->
+      settle_idle(CoordinatorState(..state, minimum_lifetime_elapsed: True))
     CallAgentCallback(
       source,
       target_id,
@@ -551,7 +639,10 @@ fn handle_message(
                 }
               }
               process.send(reply, response)
-              process.send(coordinator, CallbackHelperExited(process.self()))
+              process.send(
+                coordinator,
+                CallbackHelperExited(process.self(), coordinator),
+              )
             })
           CoordinatorState(..state, helpers: [helper, ..state.helpers])
         }
@@ -580,6 +671,24 @@ fn handle_message(
             }
             _ -> actor.continue(state)
           }
+        }
+      }
+    }
+    SendGroupMessage(agent_id, content, coordinator, reply) -> {
+      case deliver_message(state, agent_id, content, coordinator) {
+        Error(error) -> {
+          process.send(reply, Error(error))
+          case error {
+            ConcurrentGroupUpdate | LostGroupOwnership -> {
+              abandon(state)
+              actor.stop()
+            }
+            _ -> actor.continue(state)
+          }
+        }
+        Ok(next) -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(next)
         }
       }
     }
@@ -614,6 +723,148 @@ fn abandon(state: CoordinatorState) -> Nil {
   list.each(state.children, fn(child) { agent.stop(child.1) })
   list.each(state.helpers, stop_helper)
   agent_group_registry.unregister(state.group.id, process.self())
+}
+
+fn settle_idle(
+  state: CoordinatorState,
+) -> actor.Next(CoordinatorState, Message) {
+  case state.children, state.helpers {
+    [], [] if state.minimum_lifetime_elapsed -> {
+      let _ = finish(state)
+      agent_group_registry.unregister(state.group.id, process.self())
+      actor.stop()
+    }
+    _, _ -> actor.continue(state)
+  }
+}
+
+fn deliver_message(
+  state: CoordinatorState,
+  target_id: String,
+  content: String,
+  coordinator: Subject(Message),
+) -> Result(CoordinatorState, Error) {
+  use _ <- result.try(case string.trim(content) {
+    "" -> Error(InvalidMessage("message cannot be empty"))
+    _ -> Ok(Nil)
+  })
+  use _ <- result.try(case state.owned {
+    True -> Ok(Nil)
+    False -> Error(LostGroupOwnership)
+  })
+  use current <- result.try(find_agent(state.group.agents, target_id))
+  let incoming = llm.Message(llm.User, [llm.Text(content)])
+  let running =
+    state.children
+    |> list.find(fn(child) { child.0 == target_id })
+    |> result.map(fn(child) { process.is_alive(agent.pid(child.1)) })
+    |> result.unwrap(False)
+  case running {
+    True -> queue_pending_message(state, current, incoming)
+    False -> inject_and_start(state, current, [incoming], coordinator)
+  }
+}
+
+fn queue_pending_message(
+  state: CoordinatorState,
+  current: agent.State,
+  incoming: llm.Message,
+) -> Result(CoordinatorState, Error) {
+  // The active worker still commits against this same agent revision. Persist
+  // the inbox without advancing that revision; its next commit atomically
+  // consumes the pending messages into the conversation.
+  let replacement =
+    agent.State(
+      ..current,
+      pending_messages: list.append(current.pending_messages, [incoming]),
+    )
+  persist_agents(state, replace_agent(state.group.agents, replacement))
+}
+
+fn inject_and_start(
+  state: CoordinatorState,
+  current: agent.State,
+  incoming: List(llm.Message),
+  coordinator: Subject(Message),
+) -> Result(CoordinatorState, Error) {
+  // No worker owns this state, so move both the durable inbox and the new
+  // message into `messages` in one CAS write. A message is never persisted in
+  // both collections, nor absent from both collections, across this handoff.
+  let next_agent =
+    agent.State(
+      ..current,
+      revision: current.revision + 1,
+      messages: list.append(
+        current.messages,
+        list.append(current.pending_messages, incoming),
+      ),
+      pending_messages: [],
+      status: agent.Ready,
+    )
+  use catalog_session <- result.try(
+    model_catalog.resume(state.storage, state.group.model_catalog_key)
+    |> result.map_error(ModelCatalogFailed),
+  )
+  let catalog = model_catalog.catalog(catalog_session)
+  let single = AgentGroup(..state.group, agents: [next_agent])
+  use _ <- result.try(validate_models(single, catalog))
+  let config =
+    Config(
+      state.storage,
+      state.key,
+      state.profiles,
+      state.lease_duration_seconds,
+      state.minimum_lifetime_milliseconds,
+    )
+  use prepared <- result.try(prepare_agents(config, single, catalog))
+  let assert [prepared] = prepared
+  use state <- result.try(persist_agents(
+    state,
+    replace_agent(state.group.agents, next_agent),
+  ))
+  let child = make_agent(Group(coordinator), prepared)
+  let assert True = process.link(agent.pid(child))
+  agent.release(child)
+  let children = [
+    #(next_agent.id, child),
+    ..list.filter(state.children, fn(child) { child.0 != next_agent.id })
+  ]
+  Ok(CoordinatorState(..state, children:))
+}
+
+fn persist_agents(
+  state: CoordinatorState,
+  agents: List(agent.State),
+) -> Result(CoordinatorState, Error) {
+  let group =
+    AgentGroup(
+      ..state.group,
+      revision: state.group.revision + 1,
+      agents:,
+      execution: extend_claim(state),
+    )
+  use metadata <- result.try(write_group(state, group))
+  Ok(CoordinatorState(..state, group:, metadata:))
+}
+
+fn replace_agent(
+  agents: List(agent.State),
+  replacement: agent.State,
+) -> List(agent.State) {
+  list.map(agents, fn(item) {
+    case item.id == replacement.id {
+      True -> replacement
+      False -> item
+    }
+  })
+}
+
+fn extend_claim(state: CoordinatorState) -> ExecutionState {
+  Claimed(
+    state.owner,
+    execution_epoch(state.group.execution),
+    system_time(Second) + state.lease_duration_seconds,
+  )
 }
 
 fn stop_helper(pid: Pid) -> Nil {
@@ -659,7 +910,22 @@ fn do_commit_agent(
       )
     False -> new_agent
   }
-  let new_agent = agent.State(..new_agent, revision: agent_revision)
+  let has_pending = !list.is_empty(current.pending_messages)
+  // This group CAS is the active-worker handoff: the new model output and all
+  // messages that arrived during its LLM call are committed together, while
+  // the inbox is cleared. The returned authoritative state makes the worker
+  // continue immediately when anything was injected.
+  let new_agent =
+    agent.State(
+      ..new_agent,
+      revision: agent_revision,
+      messages: list.append(new_agent.messages, current.pending_messages),
+      pending_messages: [],
+      status: case has_pending {
+        True -> agent.Ready
+        False -> new_agent.status
+      },
+    )
   let agents =
     list.map(state.group.agents, fn(item) {
       case item.id == id {
@@ -668,21 +934,18 @@ fn do_commit_agent(
       }
     })
   let group_revision = state.group.revision + 1
-  let execution = case list.all(agents, agent_is_terminal) {
-    True -> Completed
-    False ->
-      Claimed(
-        state.owner,
-        execution_epoch(state.group.execution),
-        system_time(Second) + state.lease_duration_seconds,
-      )
-  }
+  let execution =
+    Claimed(
+      state.owner,
+      execution_epoch(state.group.execution),
+      system_time(Second) + state.lease_duration_seconds,
+    )
   let group =
     AgentGroup(..state.group, revision: group_revision, agents:, execution:)
   use metadata <- result.try(write_group(state, group))
   Ok(#(
     CoordinatorState(..state, group:, metadata:),
-    CommitReceipt(agent_revision, group_revision),
+    CommitReceipt(new_agent, group_revision),
   ))
 }
 
@@ -772,19 +1035,14 @@ fn renew(state: CoordinatorState) -> Result(CoordinatorState, Error) {
 }
 
 fn release(state: CoordinatorState) -> Result(CoordinatorState, Error) {
-  case state.group.execution {
-    Completed -> Ok(CoordinatorState(..state, owned: False))
-    _ -> {
-      let group =
-        AgentGroup(
-          ..state.group,
-          revision: state.group.revision + 1,
-          execution: Idle,
-        )
-      use metadata <- result.try(write_group(state, group))
-      Ok(CoordinatorState(..state, group:, metadata:, owned: False))
-    }
+  let execution = case list.all(state.group.agents, agent_is_terminal) {
+    True -> Completed
+    False -> Idle
   }
+  let group =
+    AgentGroup(..state.group, revision: state.group.revision + 1, execution:)
+  use metadata <- result.try(write_group(state, group))
+  Ok(CoordinatorState(..state, group:, metadata:, owned: False))
 }
 
 fn finish(state: CoordinatorState) -> Result(CoordinatorState, Error) {
@@ -917,6 +1175,11 @@ fn validate(config: Config, group: AgentGroup) -> Result(Nil, Error) {
     True -> Ok(Nil)
     False -> Error(InvalidGroup("lease duration must be positive"))
   })
+  use _ <- result.try(case config.minimum_lifetime_milliseconds >= 0 {
+    True -> Ok(Nil)
+    False ->
+      Error(InvalidGroup("minimum lifetime milliseconds cannot be negative"))
+  })
   use _ <- result.try(
     case
       string.trim(group.id),
@@ -1006,16 +1269,27 @@ fn claim(
   AgentGroup(
     ..group,
     revision: group.revision + 1,
-    execution: case list.all(group.agents, agent_is_terminal) {
-      True -> Completed
-      False ->
-        Claimed(
-          owner,
-          execution_epoch(group.execution) + 1,
-          system_time(Second) + lease_duration_seconds,
-        )
-    },
+    agents: list.map(group.agents, inject_pending),
+    execution: Claimed(
+      owner,
+      execution_epoch(group.execution) + 1,
+      system_time(Second) + lease_duration_seconds,
+    ),
   )
+}
+
+fn inject_pending(state: agent.State) -> agent.State {
+  case state.pending_messages {
+    [] -> state
+    pending ->
+      agent.State(
+        ..state,
+        revision: state.revision + 1,
+        messages: list.append(state.messages, pending),
+        pending_messages: [],
+        status: agent.Ready,
+      )
+  }
 }
 
 fn execution_epoch(execution: ExecutionState) -> Int {

@@ -34,6 +34,38 @@ type AmbiguityMessage {
   )
 }
 
+type CallbackGateState {
+  CallbackGateState(signaled: Bool, waiters: List(Subject(Nil)))
+}
+
+type CallbackGateMessage {
+  WaitForCallback(reply: Subject(Nil))
+  CallbackRan
+}
+
+fn handle_callback_gate(
+  state: CallbackGateState,
+  message: CallbackGateMessage,
+) -> actor.Next(CallbackGateState, CallbackGateMessage) {
+  case message {
+    CallbackRan -> {
+      list.each(state.waiters, fn(reply) { process.send(reply, Nil) })
+      actor.continue(CallbackGateState(True, []))
+    }
+    WaitForCallback(reply) ->
+      case state.signaled {
+        True -> {
+          process.send(reply, Nil)
+          actor.continue(state)
+        }
+        False ->
+          actor.continue(
+            CallbackGateState(..state, waiters: [reply, ..state.waiters]),
+          )
+      }
+  }
+}
+
 fn handle_ambiguity(
   triggered: Bool,
   message: AmbiguityMessage,
@@ -117,7 +149,7 @@ fn await_down(monitor: Monitor) -> Nil {
   let assert Ok(_) =
     process.new_selector()
     |> process.select_specific_monitor(monitor, fn(down) { down })
-    |> process.selector_receive(5000)
+    |> process.selector_receive(15_000)
   Nil
 }
 
@@ -160,6 +192,7 @@ pub fn parallel_agents_commit_through_group_test() {
       object_key: "groups/group",
       profiles:,
       lease_duration_seconds: 10,
+      minimum_lifetime_milliseconds: 100,
     )
   let initial =
     agent_group.new("group", "catalog", [
@@ -230,6 +263,7 @@ pub fn linked_agent_crash_terminates_process_tree_test() {
         ),
       ],
       lease_duration_seconds: 10,
+      minimum_lifetime_milliseconds: 100,
     )
   let initial =
     agent_group.new("crash", "catalog", [
@@ -282,6 +316,7 @@ pub fn encrypted_reasoning_state_round_trip_test() {
           llm.Text("answer"),
         ]),
       ],
+      pending_messages: [],
       stats: llm.Stats(10, 5, 2, 1),
       plugin_states: dict.from_list([#("plugin", "{\"count\":1}")]),
       plugin_generation: 3,
@@ -392,6 +427,7 @@ pub fn full_agent_loop_with_mocked_llm_test() {
         ),
       ],
       lease_duration_seconds: 10,
+      minimum_lifetime_milliseconds: 100,
     )
   let assert Ok(loaded) =
     agent_group.create(
@@ -434,6 +470,154 @@ fn contains_tool_result(messages: List(llm.Message)) -> Bool {
   })
 }
 
+fn contains_user_text(messages: List(llm.Message), expected: String) -> Bool {
+  list.any(messages, fn(message) {
+    case message {
+      llm.Message(llm.User, content) ->
+        list.any(content, fn(part) {
+          case part {
+            llm.Text(text) -> text == expected
+            _ -> False
+          }
+        })
+      _ -> False
+    }
+  })
+}
+
+pub fn message_sent_to_active_agent_is_injected_after_current_call_test() {
+  let root = temporary_root("active-agent-message-test")
+  let backend = local.new(local.config(root))
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let first_call = process.new_subject()
+  let second_call = process.new_subject()
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      let _ = case contains_user_text(request.messages, "during-call") {
+        False -> {
+          let release = process.new_subject()
+          process.send(first_call, Started(release))
+          let assert Ok(Nil) = process.receive(release, within: 5000)
+          let assert Ok(Nil) = consume(llm.MessageStart("first", "test-model"))
+          let assert Ok(Nil) = consume(llm.TextDelta(0, "first answer"))
+          let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+        }
+        True -> {
+          process.send(second_call, Nil)
+          let assert Ok(Nil) = consume(llm.MessageStart("second", "test-model"))
+          let assert Ok(Nil) = consume(llm.TextDelta(0, "second answer"))
+          let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+        }
+      }
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/active-message", [profile], 10, 100)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("active-message", "catalog", [
+        agent.state("agent", "model"),
+      ]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let group_monitor = process.monitor(agent_group.pid(group))
+  let assert Ok(Started(release)) = process.receive(first_call, within: 5000)
+
+  let assert Ok(Nil) = agent_group.send_message(group, "agent", "during-call")
+  let assert Ok(queued) = agent_group.load(config)
+  let assert [queued_agent] = queued.agents
+  assert contains_user_text(queued_agent.pending_messages, "during-call")
+  assert !contains_user_text(queued_agent.messages, "during-call")
+
+  process.send(release, Nil)
+  let assert Ok(Nil) = process.receive(second_call, within: 5000)
+  await_down(group_monitor)
+  let assert Ok(completed) = agent_group.load(config)
+  let assert [completed_agent] = completed.agents
+  assert list.is_empty(completed_agent.pending_messages)
+  assert contains_user_text(completed_agent.messages, "during-call")
+  assert completed_agent.round == 2
+  assert completed_agent.status == agent.Completed
+  remove_directory(root)
+}
+
+pub fn message_sent_to_inactive_agent_persists_and_starts_it_test() {
+  let root = temporary_root("inactive-agent-message-test")
+  let backend = local.new(local.config(root))
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let gate = process.new_subject()
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      gated_transport(gate, "message handled"),
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/inactive-message", [profile], 10, 100)
+  let inactive =
+    agent.State(..agent.state("agent", "model"), status: agent.Completed)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("inactive-message", "catalog", [inactive]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let group_monitor = process.monitor(agent_group.pid(group))
+  assert list.is_empty(agent_group.agent_pids(group))
+
+  let assert Ok(Nil) = agent_group.send_message(group, "agent", "wake up")
+  let assert Ok(Started(release)) = process.receive(gate, within: 5000)
+  let assert Ok(injected) = agent_group.load(config)
+  let assert [injected_agent] = injected.agents
+  assert list.is_empty(injected_agent.pending_messages)
+  assert contains_user_text(injected_agent.messages, "wake up")
+
+  process.send(release, Nil)
+  await_down(group_monitor)
+  let assert Ok(completed) = agent_group.load(config)
+  let assert [completed_agent] = completed.agents
+  assert list.is_empty(completed_agent.pending_messages)
+  assert contains_user_text(completed_agent.messages, "wake up")
+  assert completed_agent.round == 1
+  assert completed_agent.status == agent.Completed
+  remove_directory(root)
+}
+
 pub fn plugin_callback_between_agents_test() {
   let root = temporary_root("cross-agent-callback-test")
   let storage = local.new(local.config(root))
@@ -448,12 +632,18 @@ pub fn plugin_callback_between_agents_test() {
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(storage, "catalog", catalog)
 
+  let assert Ok(callback_gate) =
+    actor.new(CallbackGateState(False, []))
+    |> actor.on_message(handle_callback_gate)
+    |> actor.start
+
   let receiver_plugin =
     plugin.new("receiver_plugin", "{\"calls\":0}")
     |> plugin.with_callback(
       plugin.callback_hook("ping", fn(state, context, input) {
         assert state == "{\"calls\":0}"
         assert input == "{}"
+        process.send(callback_gate.data, CallbackRan)
         Ok(plugin.hook_result("{\"calls\":1}", context, "{\"reply\":\"pong\"}"))
       }),
     )
@@ -513,6 +703,7 @@ pub fn plugin_callback_between_agents_test() {
     })
   let receiver_transport =
     agent.model_transport(fn(_, _, consume) {
+      process.call_forever(callback_gate.data, WaitForCallback)
       let assert Ok(Nil) = consume(llm.MessageStart("receiver", "test-model"))
       let assert Ok(Nil) = consume(llm.TextDelta(0, "receiver ready"))
       let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
@@ -542,6 +733,7 @@ pub fn plugin_callback_between_agents_test() {
         ),
       ],
       lease_duration_seconds: 10,
+      minimum_lifetime_milliseconds: 100,
     )
   let assert Ok(loaded) =
     agent_group.create(
@@ -598,7 +790,8 @@ pub fn create_is_dormant_and_wake_registers_and_indexes_until_stop_test() {
       None,
       observe,
     )
-  let config = agent_group.Config(backend, "groups/lifecycle", [profile], 10)
+  let config =
+    agent_group.Config(backend, "groups/lifecycle", [profile], 10, 100)
   let state =
     agent.State(
       ..agent.state("agent-instance", "model"),
@@ -668,7 +861,7 @@ pub fn wake_loads_the_model_catalog_on_demand_test() {
       None,
       observe,
     )
-  let config = agent_group.Config(backend, "groups/catalog", [profile], 10)
+  let config = agent_group.Config(backend, "groups/catalog", [profile], 10, 100)
   let assert Ok(loaded) =
     agent_group.create(
       config,
@@ -719,6 +912,7 @@ pub fn concurrent_storage_update_terminates_and_unregisters_coordinator_test() {
         ),
       ],
       10,
+      100,
     )
   let assert Ok(loaded) =
     agent_group.create(
@@ -777,6 +971,7 @@ pub fn expired_lease_terminates_and_unregisters_coordinator_test() {
         ),
       ],
       1,
+      100,
     )
   let assert Ok(loaded) =
     agent_group.create(
@@ -856,7 +1051,8 @@ pub fn ambiguous_successful_cas_is_idempotent_and_fences_next_commit_test() {
       None,
       observe,
     )
-  let config = agent_group.Config(backend, "groups/ambiguous", [profile], 10)
+  let config =
+    agent_group.Config(backend, "groups/ambiguous", [profile], 10, 100)
   let assert Ok(loaded) =
     agent_group.create(
       config,

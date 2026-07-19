@@ -26,6 +26,7 @@ pub type State {
     model_id: String,
     round: Int,
     messages: List(llm.Message),
+    pending_messages: List(llm.Message),
     stats: llm.Stats,
     plugin_states: Dict(String, String),
     plugin_generation: Int,
@@ -42,6 +43,7 @@ pub fn state(id: String, model_id: String) -> State {
     model_id:,
     round: 0,
     messages: [],
+    pending_messages: [],
     stats: llm.empty_stats(),
     plugin_states: plugin.empty_states(),
     plugin_generation: 0,
@@ -568,7 +570,7 @@ fn execute_tools(
 }
 
 pub type CommitReceipt {
-  CommitReceipt(agent_revision: Int, group_revision: Int)
+  CommitReceipt(state: State, group_revision: Int)
 }
 
 pub opaque type Checkpointer {
@@ -631,20 +633,30 @@ fn run_loop(
     Error(error) -> {
       let failed = State(..state, status: Failed(string.inspect(error)))
       let Checkpointer(commit:) = checkpointer
-      let _ = commit(state.revision, failed)
-      Nil
+      case commit(state.revision, failed) {
+        Ok(CommitReceipt(state: committed, ..)) if committed.status == Ready -> {
+          let Active(config:, plugins:, ..) = active
+          run_loop(
+            Active(committed, config, plugins),
+            checkpointer,
+            router,
+            observe,
+          )
+        }
+        _ -> Nil
+      }
     }
     Ok(RoundResult(active:, state: next_state, disposition:)) -> {
       let Checkpointer(commit:) = checkpointer
       case commit(state.revision, next_state) {
         Error(_) -> Nil
-        Ok(CommitReceipt(agent_revision:, ..)) -> {
+        Ok(CommitReceipt(state: committed, ..)) -> {
           let Active(config:, plugins:, ..) = active
-          let next_state = State(..next_state, revision: agent_revision)
-          let active = Active(next_state, config, plugins)
-          case disposition {
-            Continue -> run_loop(active, checkpointer, router, observe)
-            Complete -> Nil
+          let active = Active(committed, config, plugins)
+          case disposition, committed.status {
+            _, Ready -> run_loop(active, checkpointer, router, observe)
+            Continue, _ -> run_loop(active, checkpointer, router, observe)
+            Complete, _ -> Nil
           }
         }
       }
@@ -700,6 +712,7 @@ pub fn encode_state(state: State) -> Json {
     #("model_id", json.string(state.model_id)),
     #("round", json.int(state.round)),
     #("messages", json.array(state.messages, encode_message)),
+    #("pending_messages", json.array(state.pending_messages, encode_message)),
     #("stats", encode_stats(state.stats)),
     #(
       "plugin_states",
@@ -726,6 +739,10 @@ pub fn state_decoder() -> decode.Decoder(State) {
   use model_id <- decode.field("model_id", decode.string)
   use round <- decode.field("round", decode.int)
   use messages <- decode.field("messages", decode.list(of: message_decoder()))
+  use pending_messages <- decode.field(
+    "pending_messages",
+    decode.list(of: message_decoder()),
+  )
   use stats <- decode.field("stats", stats_decoder())
   use plugin_states <- decode.field(
     "plugin_states",
@@ -753,6 +770,7 @@ pub fn state_decoder() -> decode.Decoder(State) {
     model_id,
     round,
     messages,
+    pending_messages,
     stats,
     dict.from_list(plugin_states),
     plugin_generation,

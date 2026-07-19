@@ -148,6 +148,10 @@ fn elect_and_scan(state: State) -> State {
 
 /// Reads the running index first, then reads membership to avoid missing a
 /// group that is moving from an old node to a newly advertising node.
+///
+/// Claim publication must pair with this ordering by registering locally and
+/// completing an acknowledged membership refresh before writing its running
+/// index entry. See `agent_group.start_coordinator`.
 fn scan(backend: Storage) -> Result(Scan, storage.Error) {
   use running_metadata <- result.try(storage.list(
     backend,

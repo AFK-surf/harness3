@@ -15,11 +15,16 @@ pub fn live_entries_force_stop_and_dead_entries_are_swept_test() {
   let dead_id = unique_id("registry-dead")
   let stopped = process.new_subject()
   let live = process.spawn_unlinked(fn() { process.sleep_forever() })
-  agent_group_registry.register(live_id, live, fn() {
-    process.send(stopped, Nil)
-    process.kill(live)
-    Ok(Nil)
-  })
+  agent_group_registry.register(
+    live_id,
+    live,
+    fn() {
+      process.send(stopped, Nil)
+      process.kill(live)
+      Ok(Nil)
+    },
+    fn(_, _) { Ok(Nil) },
+  )
   assert list.contains(agent_group_registry.alive_ids(), live_id)
   assert agent_group_registry.force_stop(live_id) == Ok(Nil)
   let assert Ok(Nil) = process.receive(stopped, within: 1000)
@@ -30,7 +35,9 @@ pub fn live_entries_force_stop_and_dead_entries_are_swept_test() {
     process.new_selector()
     |> process.select_specific_monitor(monitor, fn(message) { message })
     |> process.selector_receive(1000)
-  agent_group_registry.register(dead_id, dead, fn() { Ok(Nil) })
+  agent_group_registry.register(dead_id, dead, fn() { Ok(Nil) }, fn(_, _) {
+    Ok(Nil)
+  })
 
   let alive = agent_group_registry.alive_ids()
   assert !list.contains(alive, live_id)

@@ -63,7 +63,7 @@ pub fn resume_and_force_stop_agent_group_rpc_test() {
     )
   let state =
     agent.State(..agent.state("agent", "model"), profile_id: "profile")
-  let config = agent_group.Config(backend, "groups/rpc", [profile], 10)
+  let config = agent_group.Config(backend, "groups/rpc", [profile], 10, 100)
   let assert Ok(_) =
     agent_group.create(config, agent_group.new("rpc-group", "catalog", [state]))
 

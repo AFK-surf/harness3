@@ -17,19 +17,30 @@ type TableOption {
 pub type StopHandle =
   fn() -> Result(Nil, String)
 
+pub type MessageHandle =
+  fn(String, String) -> Result(Nil, String)
+
 pub type Error {
   NotFound(id: String)
   StopFailed(reason: String)
+  MessageFailed(reason: String)
 }
 
 /// Registers a running agent group in the node-wide registry.
-pub fn register(id: String, pid: Pid, stop: StopHandle) -> Nil {
+pub fn register(
+  id: String,
+  pid: Pid,
+  stop: StopHandle,
+  send_message: MessageHandle,
+) -> Nil {
   ensure_table()
   case
-    exception.rescue(fn() { ets_insert(Harness3AgentGroups, #(id, pid, stop)) })
+    exception.rescue(fn() {
+      ets_insert(Harness3AgentGroups, #(id, pid, stop, send_message))
+    })
   {
     Ok(_) -> Nil
-    Error(_) -> register(id, pid, stop)
+    Error(_) -> register(id, pid, stop, send_message)
   }
 }
 
@@ -37,7 +48,7 @@ pub fn register(id: String, pid: Pid, stop: StopHandle) -> Nil {
 pub fn unregister(id: String, pid: Pid) -> Nil {
   ensure_table()
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
-    Ok([#(_, registered_pid, _) as entry]) if registered_pid == pid -> {
+    Ok([#(_, registered_pid, _, _) as entry]) if registered_pid == pid -> {
       let _ =
         exception.rescue(fn() { ets_delete_object(Harness3AgentGroups, entry) })
       Nil
@@ -52,7 +63,7 @@ pub fn force_stop(id: String) -> Result(Nil, Error) {
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
     Error(_) -> force_stop(id)
     Ok([]) -> Error(NotFound(id))
-    Ok([#(_, pid, stop) as entry]) ->
+    Ok([#(_, pid, stop, _) as entry]) ->
       case process.is_alive(pid) {
         False -> {
           let _ = ets_delete_object(Harness3AgentGroups, entry)
@@ -62,6 +73,32 @@ pub fn force_stop(id: String) -> Result(Nil, Error) {
           case exception.rescue(stop) {
             Error(error) -> Error(StopFailed(string.inspect(error)))
             Ok(Error(reason)) -> Error(StopFailed(reason))
+            Ok(Ok(Nil)) -> Ok(Nil)
+          }
+      }
+    Ok(_) -> Error(NotFound(id))
+  }
+}
+
+pub fn send_message(
+  id: String,
+  agent_id: String,
+  message: String,
+) -> Result(Nil, Error) {
+  ensure_table()
+  case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
+    Error(_) -> send_message(id, agent_id, message)
+    Ok([]) -> Error(NotFound(id))
+    Ok([#(_, pid, _, send) as entry]) ->
+      case process.is_alive(pid) {
+        False -> {
+          let _ = ets_delete_object(Harness3AgentGroups, entry)
+          Error(NotFound(id))
+        }
+        True ->
+          case exception.rescue(fn() { send(agent_id, message) }) {
+            Error(error) -> Error(MessageFailed(string.inspect(error)))
+            Ok(Error(reason)) -> Error(MessageFailed(reason))
             Ok(Ok(Nil)) -> Ok(Nil)
           }
       }
@@ -135,16 +172,24 @@ fn table_exists() -> Bool {
 fn ets_new(name: TableName, options: List(TableOption)) -> Dynamic
 
 @external(erlang, "ets", "insert")
-fn ets_insert(table: TableName, entry: #(String, Pid, StopHandle)) -> Bool
+fn ets_insert(
+  table: TableName,
+  entry: #(String, Pid, StopHandle, MessageHandle),
+) -> Bool
 
 @external(erlang, "ets", "delete_object")
 fn ets_delete_object(
   table: TableName,
-  entry: #(String, Pid, StopHandle),
+  entry: #(String, Pid, StopHandle, MessageHandle),
 ) -> Bool
 
 @external(erlang, "ets", "lookup")
-fn lookup(table: TableName, id: String) -> List(#(String, Pid, StopHandle))
+fn lookup(
+  table: TableName,
+  id: String,
+) -> List(#(String, Pid, StopHandle, MessageHandle))
 
 @external(erlang, "ets", "tab2list")
-fn ets_entries(table: TableName) -> List(#(String, Pid, StopHandle))
+fn ets_entries(
+  table: TableName,
+) -> List(#(String, Pid, StopHandle, MessageHandle))

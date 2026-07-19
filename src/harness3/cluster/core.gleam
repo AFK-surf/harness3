@@ -65,8 +65,27 @@ pub type RpcError {
   InternalError(reason: String)
 }
 
+pub opaque type RpcContext {
+  RpcContext(token: String, refresh_membership: fn() -> Nil)
+}
+
+pub fn context_token(context: RpcContext) -> String {
+  let RpcContext(token:, ..) = context
+  token
+}
+
+/// Forces the receiving node's `Refresh` control command and returns only
+/// after its membership object has been written.
+pub fn context_refresh_membership(context: RpcContext) -> Nil {
+  let RpcContext(refresh_membership:, ..) = context
+  refresh_membership()
+}
+
 pub opaque type Method {
-  Method(name: String, invoke: fn(Dynamic) -> Result(BitArray, RpcError))
+  Method(
+    name: String,
+    invoke: fn(RpcContext, Dynamic) -> Result(BitArray, RpcError),
+  )
 }
 
 /// Defines a typed RPC method. The decoder validates the decoded Erlang term;
@@ -76,7 +95,7 @@ pub fn method(
   decoder: decode.Decoder(request),
   handler: fn(request) -> Result(response, RpcError),
 ) -> Method {
-  Method(name, fn(term) {
+  Method(name, fn(_, term) {
     use request <- result.try(
       decode.run(term, decoder)
       |> result.map_error(fn(errors) {
@@ -87,12 +106,29 @@ pub fn method(
   })
 }
 
+/// Defines a typed RPC method that can identify the receiving cluster node.
+pub fn contextual_method(
+  name: String,
+  decoder: decode.Decoder(request),
+  handler: fn(RpcContext, request) -> Result(response, RpcError),
+) -> Method {
+  Method(name, fn(context, term) {
+    use request <- result.try(
+      decode.run(term, decoder)
+      |> result.map_error(fn(errors) {
+        InvalidArguments(string.inspect(errors))
+      }),
+    )
+    handler(context, request) |> result.map(term_to_binary)
+  })
+}
+
 /// Defines a method that receives the decoded term directly.
 pub fn raw_method(
   name: String,
   handler: fn(Dynamic) -> Result(Dynamic, RpcError),
 ) -> Method {
-  Method(name, fn(term) { handler(term) |> result.map(term_to_binary) })
+  Method(name, fn(_, term) { handler(term) |> result.map(term_to_binary) })
 }
 
 pub opaque type RpcPlugin {
@@ -127,6 +163,7 @@ pub opaque type Cluster {
     membership_key: String,
     listener: Pid,
     refresher: Subject(Control),
+    refresh_proxy: Subject(RefreshProxyMessage),
     recovery: recovery.Handle,
   )
 }
@@ -231,6 +268,19 @@ type RefreshState {
   )
 }
 
+type RefreshProxyState {
+  RefreshProxyState(
+    target: Option(Subject(Control)),
+    waiting: List(Subject(Nil)),
+  )
+}
+
+type RefreshProxyMessage {
+  BindRefresh(target: Subject(Control))
+  RequestRefresh(reply: Subject(Nil))
+  StopRefreshProxy
+}
+
 pub fn start(config: Config) -> Result(Cluster, StartError) {
   use _ <- result.try(validate_config(config))
   use registry <- result.try(build_registry(config.rpc_plugins))
@@ -238,11 +288,22 @@ pub fn start(config: Config) -> Result(Cluster, StartError) {
   let token =
     crypto.strong_random_bytes(32)
     |> bit_array.base64_url_encode(False)
+  use refresh_proxy <- result.try(
+    actor.new(RefreshProxyState(None, []))
+    |> actor.on_message(handle_refresh_proxy)
+    |> actor.start
+    |> result.map_error(fn(error) { RefresherFailed(string.inspect(error)) }),
+  )
+  let actor.Started(data: refresh_proxy_subject, ..) = refresh_proxy
+  let context =
+    RpcContext(token, fn() {
+      process.call_forever(refresh_proxy_subject, RequestRefresh)
+    })
   let listener_info = process.new_subject()
   let failure =
     rpc_response(413, InvalidTerm("request body exceeds configured limit"))
   let handler = fn(request) {
-    handle_request(request, token, registry, config.max_request_bytes)
+    handle_request(request, context, registry, config.max_request_bytes)
   }
 
   let listener =
@@ -263,7 +324,10 @@ pub fn start(config: Config) -> Result(Cluster, StartError) {
 
   use listener <- result.try(
     listener
-    |> result.map_error(fn(error) { ListenerFailed(string.inspect(error)) }),
+    |> result.map_error(fn(error) {
+      process.send(refresh_proxy_subject, StopRefreshProxy)
+      ListenerFailed(string.inspect(error))
+    }),
   )
   let actor.Started(pid: listener_pid, ..) = listener
 
@@ -271,6 +335,7 @@ pub fn start(config: Config) -> Result(Cluster, StartError) {
     process.receive(listener_info, within: 1000)
     |> result.map_error(fn(_) {
       process.send_exit(listener_pid)
+      process.send(refresh_proxy_subject, StopRefreshProxy)
       ListenerAddressUnavailable
     }),
   )
@@ -281,6 +346,7 @@ pub fn start(config: Config) -> Result(Cluster, StartError) {
     write_membership(config.storage, key, token, ip, port)
     |> result.map_error(fn(error) {
       process.send_exit(listener_pid)
+      process.send(refresh_proxy_subject, StopRefreshProxy)
       MembershipWriteFailed(error)
     }),
   )
@@ -294,11 +360,13 @@ pub fn start(config: Config) -> Result(Cluster, StartError) {
     refresher
     |> result.map_error(fn(error) {
       process.send_exit(listener_pid)
+      process.send(refresh_proxy_subject, StopRefreshProxy)
       let _ = storage.delete(config.storage, key)
       RefresherFailed(string.inspect(error))
     }),
   )
   let actor.Started(data: refresh_subject, ..) = refresher
+  process.send(refresh_proxy_subject, BindRefresh(refresh_subject))
   let _ =
     process.send_after(
       refresh_subject,
@@ -314,6 +382,7 @@ pub fn start(config: Config) -> Result(Cluster, StartError) {
     })
     |> result.map_error(fn(error) {
       process.send(refresh_subject, Shutdown)
+      process.send(refresh_proxy_subject, StopRefreshProxy)
       process.send_exit(listener_pid)
       RecoveryLeaderFailed(string.inspect(error))
     }),
@@ -326,14 +395,22 @@ pub fn start(config: Config) -> Result(Cluster, StartError) {
     key,
     listener_pid,
     refresh_subject,
+    refresh_proxy_subject,
     recovery_handle,
   ))
 }
 
 pub fn stop(cluster: Cluster) -> Nil {
-  let Cluster(listener:, refresher:, recovery: recovery_handle, ..) = cluster
+  let Cluster(
+    listener:,
+    refresher:,
+    refresh_proxy:,
+    recovery: recovery_handle,
+    ..,
+  ) = cluster
   recovery.stop(recovery_handle)
   process.send(refresher, Shutdown)
+  process.send(refresh_proxy, StopRefreshProxy)
   process.send_exit(listener)
 }
 
@@ -395,16 +472,17 @@ fn insert_methods(
 
 fn handle_request(
   request: http_request.Request(BitArray),
-  token: String,
+  context: RpcContext,
   registry: Registry,
   _max_request_bytes: Int,
 ) -> Response(ResponseData) {
+  let token = context_token(context)
   case authenticated(request, token) {
     False -> rpc_response(401, Unauthorized)
     True ->
       case request.method, http_request.path_segments(request) {
         http.Post, ["rpc", method_name] ->
-          invoke(registry, method_name, request.body)
+          invoke(registry, context, method_name, request.body)
         _, ["rpc", _] ->
           rpc_response(405, InvalidTerm("RPC requests must use POST"))
         _, _ -> rpc_response(404, UnknownMethod(""))
@@ -425,6 +503,7 @@ fn authenticated(request: http_request.Request(body), token: String) -> Bool {
 
 fn invoke(
   registry: Registry,
+  context: RpcContext,
   method_name: String,
   body: BitArray,
 ) -> Response(ResponseData) {
@@ -434,7 +513,7 @@ fn invoke(
       case decode_term(body) {
         Error(error) -> rpc_response(400, error)
         Ok(term) ->
-          case exception.rescue(fn() { invoke(term) }) {
+          case exception.rescue(fn() { invoke(context, term) }) {
             Error(error) ->
               rpc_response(500, InternalError(string.inspect(error)))
             Ok(Error(error)) -> rpc_response(error_status(error), error)
@@ -512,13 +591,49 @@ fn handle_control(
         Ok(_), Some(reply) -> process.send(reply, Nil)
         _, _ -> Nil
       }
-      let _ =
-        process.send_after(subject, refresh_interval_ms, Refresh(subject, None))
+      case reply {
+        None -> {
+          let _ =
+            process.send_after(
+              subject,
+              refresh_interval_ms,
+              Refresh(subject, None),
+            )
+          Nil
+        }
+        Some(_) -> Nil
+      }
       actor.continue(state)
     }
     Shutdown -> {
       let _ = storage.delete(backend, key)
       actor.stop()
     }
+  }
+}
+
+fn handle_refresh_proxy(
+  state: RefreshProxyState,
+  message: RefreshProxyMessage,
+) -> actor.Next(RefreshProxyState, RefreshProxyMessage) {
+  case message {
+    BindRefresh(target) -> {
+      list.each(state.waiting, fn(reply) {
+        process.send(target, Refresh(target, Some(reply)))
+      })
+      actor.continue(RefreshProxyState(Some(target), []))
+    }
+    RequestRefresh(reply) ->
+      case state.target {
+        Some(target) -> {
+          process.send(target, Refresh(target, Some(reply)))
+          actor.continue(state)
+        }
+        None ->
+          actor.continue(
+            RefreshProxyState(..state, waiting: [reply, ..state.waiting]),
+          )
+      }
+    StopRefreshProxy -> actor.stop()
   }
 }
