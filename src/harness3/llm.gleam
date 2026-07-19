@@ -24,10 +24,19 @@ pub type ImageDetail {
   High
 }
 
+/// Provider-bound encrypted reasoning state. These values are opaque and must
+/// be returned to the same provider unchanged when continuing a conversation.
+pub type EncryptedReasoning {
+  OpenAIEncryptedReasoning(id: String, encrypted_content: String)
+  AnthropicSignedReasoning(signature: String)
+  AnthropicRedactedReasoning(data: String)
+}
+
 pub type Content {
   Text(text: String)
   Image(source: MediaSource, detail: ImageDetail)
   Document(source: MediaSource)
+  Reasoning(summary: List(String), encrypted: Option(EncryptedReasoning))
   ToolCall(id: String, name: String, arguments: Json)
   ToolResult(tool_call_id: String, content: List(Content), is_error: Bool)
 }
@@ -96,8 +105,12 @@ pub fn empty_stats() -> Stats {
 /// Applies a provider usage report. Missing fields retain their prior values;
 /// provider reports are cumulative snapshots, not additive deltas.
 pub fn apply_usage(stats: Stats, usage: Usage) -> Stats {
-  let Stats(input_tokens:, output_tokens:, cache_read_tokens:, cache_write_tokens:) =
-    stats
+  let Stats(
+    input_tokens:,
+    output_tokens:,
+    cache_read_tokens:,
+    cache_write_tokens:,
+  ) = stats
   let Usage(
     input_tokens: new_input,
     output_tokens: new_output,
@@ -142,6 +155,7 @@ pub type Event {
   ContentStart(index: Int, kind: ContentKind)
   TextDelta(index: Int, text: String)
   ReasoningDelta(index: Int, text: String)
+  ReasoningEncrypted(index: Int, encrypted: EncryptedReasoning)
   RefusalDelta(index: Int, text: String)
   ToolCallStart(index: Int, id: String, name: String)
   ToolCallArgumentsDelta(index: Int, json_fragment: String)

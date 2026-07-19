@@ -8,12 +8,12 @@ import gleam/string
 import harness3/llm.{
   type Content, type Error, type Event, type FinishReason, type HttpRequest,
   type MediaSource, type Message, type Provider, type Request, type Role,
-  type Tool, ApiError, Assistant, Base64, ContentStart, Developer, Document,
-  Finished, HttpRequest, Image, InvalidRequest, InvalidResponse, Length,
-  MessageStart, MessageStop, Other, ReasoningContent, ReasoningDelta, Stop,
+  type Tool, AnthropicRedactedReasoning, AnthropicSignedReasoning, ApiError,
+  Assistant, Base64, ContentStart, Developer, Document, Finished, HttpRequest,
+  Image, InvalidRequest, InvalidResponse, Length, MessageStart, MessageStop,
+  Other, Reasoning, ReasoningContent, ReasoningDelta, ReasoningEncrypted, Stop,
   System, Text, TextContent, TextDelta, ToolCall, ToolCallArgumentsDelta,
-  ToolCallStart, ToolResult, ToolUse, Url, Usage,
-  UsageReported, User,
+  ToolCallStart, ToolResult, ToolUse, Url, Usage, UsageReported, User,
 }
 
 pub type Config {
@@ -116,10 +116,12 @@ fn encode_system(messages: List(Message)) -> Result(String, Error) {
 fn encode_message(message: Message) -> Result(Json, Error) {
   let llm.Message(role:, content:) = message
   use content <- result.try(list.try_map(content, encode_content))
-  Ok(json.object([
-    #("role", json.string(role_name(role))),
-    #("content", json.preprocessed_array(content)),
-  ]))
+  Ok(
+    json.object([
+      #("role", json.string(role_name(role))),
+      #("content", json.preprocessed_array(content)),
+    ]),
+  )
 }
 
 fn role_name(role: Role) -> String {
@@ -132,33 +134,70 @@ fn role_name(role: Role) -> String {
 
 fn encode_content(content: Content) -> Result(Json, Error) {
   case content {
-    Text(text) -> Ok(json.object([
-      #("type", json.string("text")),
-      #("text", json.string(text)),
-    ]))
-    Image(source, _) -> Ok(json.object([
-      #("type", json.string("image")),
-      #("source", encode_source(source)),
-    ]))
-    Document(source) -> Ok(json.object([
-      #("type", json.string("document")),
-      #("source", encode_source(source)),
-    ]))
-    ToolCall(id, name, arguments) -> Ok(json.object([
-      #("type", json.string("tool_use")),
-      #("id", json.string(id)),
-      #("name", json.string(name)),
-      #("input", arguments),
-    ]))
+    Text(text) ->
+      Ok(
+        json.object([
+          #("type", json.string("text")),
+          #("text", json.string(text)),
+        ]),
+      )
+    Image(source, _) ->
+      Ok(
+        json.object([
+          #("type", json.string("image")),
+          #("source", encode_source(source)),
+        ]),
+      )
+    Document(source) ->
+      Ok(
+        json.object([
+          #("type", json.string("document")),
+          #("source", encode_source(source)),
+        ]),
+      )
+    ToolCall(id, name, arguments) ->
+      Ok(
+        json.object([
+          #("type", json.string("tool_use")),
+          #("id", json.string(id)),
+          #("name", json.string(name)),
+          #("input", arguments),
+        ]),
+      )
     ToolResult(id, content, is_error) -> {
       use content <- result.try(list.try_map(content, encode_result_content))
-      Ok(json.object([
-        #("type", json.string("tool_result")),
-        #("tool_use_id", json.string(id)),
-        #("content", json.preprocessed_array(content)),
-        #("is_error", json.bool(is_error)),
-      ]))
+      Ok(
+        json.object([
+          #("type", json.string("tool_result")),
+          #("tool_use_id", json.string(id)),
+          #("content", json.preprocessed_array(content)),
+          #("is_error", json.bool(is_error)),
+        ]),
+      )
     }
+    Reasoning(summary, Some(AnthropicSignedReasoning(signature))) ->
+      Ok(
+        json.object([
+          #("type", json.string("thinking")),
+          #("thinking", json.string(string.concat(summary))),
+          #("signature", json.string(signature)),
+        ]),
+      )
+    Reasoning(_, Some(AnthropicRedactedReasoning(data))) ->
+      Ok(
+        json.object([
+          #("type", json.string("redacted_thinking")),
+          #("data", json.string(data)),
+        ]),
+      )
+    Reasoning(_, Some(_)) ->
+      Error(InvalidRequest(
+        "encrypted reasoning belongs to a different provider",
+      ))
+    Reasoning(_, None) ->
+      Error(InvalidRequest(
+        "Anthropic reasoning input requires signed or redacted provider state",
+      ))
   }
 }
 
@@ -171,19 +210,22 @@ fn encode_result_content(content: Content) -> Result(Json, Error) {
 
 fn encode_source(source: MediaSource) -> Json {
   case source {
-    Url(url) -> json.object([
-      #("type", json.string("url")),
-      #("url", json.string(url)),
-    ])
-    Base64(media_type, data) -> json.object([
-      #("type", json.string("base64")),
-      #("media_type", json.string(media_type)),
-      #("data", json.string(data)),
-    ])
-    llm.FileId(id) -> json.object([
-      #("type", json.string("file")),
-      #("file_id", json.string(id)),
-    ])
+    Url(url) ->
+      json.object([
+        #("type", json.string("url")),
+        #("url", json.string(url)),
+      ])
+    Base64(media_type, data) ->
+      json.object([
+        #("type", json.string("base64")),
+        #("media_type", json.string(media_type)),
+        #("data", json.string(data)),
+      ])
+    llm.FileId(id) ->
+      json.object([
+        #("type", json.string("file")),
+        #("file_id", json.string(id)),
+      ])
   }
 }
 
@@ -217,6 +259,8 @@ type BlockData {
     id: String,
     name: String,
     input: Option(Dynamic),
+    signature: String,
+    data: String,
   )
 }
 
@@ -234,8 +278,16 @@ type MessageData {
 fn dynamic_json_to_string(value: Dynamic) -> String
 
 fn usage_decoder() -> decode.Decoder(UsageData) {
-  use input <- decode.optional_field("input_tokens", None, decode.optional(decode.int))
-  use output <- decode.optional_field("output_tokens", None, decode.optional(decode.int))
+  use input <- decode.optional_field(
+    "input_tokens",
+    None,
+    decode.optional(decode.int),
+  )
+  use output <- decode.optional_field(
+    "output_tokens",
+    None,
+    decode.optional(decode.int),
+  )
   use cache_read <- decode.optional_field(
     "cache_read_input_tokens",
     None,
@@ -255,15 +307,38 @@ fn block_decoder() -> decode.Decoder(BlockData) {
   use thinking <- decode.optional_field("thinking", "", decode.string)
   use id <- decode.optional_field("id", "", decode.string)
   use name <- decode.optional_field("name", "", decode.string)
-  use input <- decode.optional_field("input", None, decode.optional(decode.dynamic))
-  decode.success(BlockData(kind, text, thinking, id, name, input))
+  use input <- decode.optional_field(
+    "input",
+    None,
+    decode.optional(decode.dynamic),
+  )
+  use signature <- decode.optional_field("signature", "", decode.string)
+  use data <- decode.optional_field("data", "", decode.string)
+  decode.success(BlockData(
+    kind,
+    text,
+    thinking,
+    id,
+    name,
+    input,
+    signature,
+    data,
+  ))
 }
 
 fn message_decoder() -> decode.Decoder(MessageData) {
   use id <- decode.field("id", decode.string)
   use model <- decode.field("model", decode.string)
-  use content <- decode.optional_field("content", [], decode.list(of: block_decoder()))
-  use stop_reason <- decode.optional_field("stop_reason", None, decode.optional(decode.string))
+  use content <- decode.optional_field(
+    "content",
+    [],
+    decode.list(of: block_decoder()),
+  )
+  use stop_reason <- decode.optional_field(
+    "stop_reason",
+    None,
+    decode.optional(decode.string),
+  )
   use usage <- decode.field("usage", usage_decoder())
   decode.success(MessageData(id, model, content, stop_reason, usage))
 }
@@ -275,23 +350,36 @@ fn decode_response(status: Int, body: String) -> Result(List(Event), Error) {
       use message <- result.try(parse(body, message_decoder()))
       let MessageData(id:, model:, content:, stop_reason:, usage:) = message
       let content = content |> list.index_map(block_events) |> list.flatten
-      Ok(list.flatten([
-        [MessageStart(id, model)],
-        content,
-        finish_events(stop_reason),
-        [usage_event(usage), MessageStop],
-      ]))
+      Ok(
+        list.flatten([
+          [MessageStart(id, model)],
+          content,
+          finish_events(stop_reason),
+          [usage_event(usage), MessageStop],
+        ]),
+      )
     }
   }
 }
 
 fn block_events(block: BlockData, index: Int) -> List(Event) {
-  let BlockData(kind:, text:, thinking:, id:, name:, input:) = block
+  let BlockData(kind:, text:, thinking:, id:, name:, input:, signature:, data:) =
+    block
   case kind {
-    "text" -> [ContentStart(index, TextContent), TextDelta(index, text), llm.ContentStop(index)]
+    "text" -> [
+      ContentStart(index, TextContent),
+      TextDelta(index, text),
+      llm.ContentStop(index),
+    ]
     "thinking" -> [
       ContentStart(index, ReasoningContent),
       ReasoningDelta(index, thinking),
+      ReasoningEncrypted(index, AnthropicSignedReasoning(signature)),
+      llm.ContentStop(index),
+    ]
+    "redacted_thinking" -> [
+      ContentStart(index, ReasoningContent),
+      ReasoningEncrypted(index, AnthropicRedactedReasoning(data)),
       llm.ContentStop(index),
     ]
     "tool_use" -> {
@@ -310,22 +398,26 @@ fn block_events(block: BlockData, index: Int) -> List(Event) {
 }
 
 fn decode_stream_event(data: String) -> Result(List(Event), Error) {
-  use kind <- result.try(parse(data, {
-    use kind <- decode.field("type", decode.string)
-    decode.success(kind)
-  }))
+  use kind <- result.try(
+    parse(data, {
+      use kind <- decode.field("type", decode.string)
+      decode.success(kind)
+    }),
+  )
   case kind {
-    "message_start" -> parse(data, {
-      use message <- decode.field("message", message_decoder())
-      let MessageData(id:, model:, usage:, ..) = message
-      decode.success([MessageStart(id, model), usage_event(usage)])
-    })
+    "message_start" ->
+      parse(data, {
+        use message <- decode.field("message", message_decoder())
+        let MessageData(id:, model:, usage:, ..) = message
+        decode.success([MessageStart(id, model), usage_event(usage)])
+      })
     "content_block_start" -> decode_block_start(data)
     "content_block_delta" -> decode_block_delta(data)
-    "content_block_stop" -> parse(data, {
-      use index <- decode.field("index", decode.int)
-      decode.success([llm.ContentStop(index)])
-    })
+    "content_block_stop" ->
+      parse(data, {
+        use index <- decode.field("index", decode.int)
+        decode.success([llm.ContentStop(index)])
+      })
     "message_delta" -> decode_message_delta(data)
     "message_stop" -> Ok([MessageStop])
     "ping" -> Ok([])
@@ -338,10 +430,14 @@ fn decode_block_start(data: String) -> Result(List(Event), Error) {
   parse(data, {
     use index <- decode.field("index", decode.int)
     use block <- decode.field("content_block", block_decoder())
-    let BlockData(kind:, id:, name:, ..) = block
+    let BlockData(kind:, id:, name:, data:, ..) = block
     decode.success(case kind {
       "text" -> [ContentStart(index, TextContent)]
       "thinking" -> [ContentStart(index, ReasoningContent)]
+      "redacted_thinking" -> [
+        ContentStart(index, ReasoningContent),
+        ReasoningEncrypted(index, AnthropicRedactedReasoning(data)),
+      ]
       "tool_use" -> [ToolCallStart(index, id, name)]
       kind -> [llm.UnknownEvent(kind)]
     })
@@ -355,15 +451,26 @@ fn decode_block_delta(data: String) -> Result(List(Event), Error) {
       use kind <- decode.field("type", decode.string)
       use text <- decode.optional_field("text", "", decode.string)
       use thinking <- decode.optional_field("thinking", "", decode.string)
-      use partial_json <- decode.optional_field("partial_json", "", decode.string)
-      decode.success(#(kind, text, thinking, partial_json))
+      use partial_json <- decode.optional_field(
+        "partial_json",
+        "",
+        decode.string,
+      )
+      use signature <- decode.optional_field("signature", "", decode.string)
+      decode.success(#(kind, text, thinking, partial_json, signature))
     })
     decode.success(case delta {
-      #("text_delta", text, _, _) -> [TextDelta(index, text)]
-      #("thinking_delta", _, thinking, _) -> [ReasoningDelta(index, thinking)]
-      #("input_json_delta", _, _, partial_json) ->
-        [ToolCallArgumentsDelta(index, partial_json)]
-      #(kind, _, _, _) -> [llm.UnknownEvent(kind)]
+      #("text_delta", text, _, _, _) -> [TextDelta(index, text)]
+      #("thinking_delta", _, thinking, _, _) -> [
+        ReasoningDelta(index, thinking),
+      ]
+      #("signature_delta", _, _, _, signature) -> [
+        ReasoningEncrypted(index, AnthropicSignedReasoning(signature)),
+      ]
+      #("input_json_delta", _, _, partial_json, _) -> [
+        ToolCallArgumentsDelta(index, partial_json),
+      ]
+      #(kind, _, _, _, _) -> [llm.UnknownEvent(kind)]
     })
   })
 }
@@ -371,11 +478,17 @@ fn decode_block_delta(data: String) -> Result(List(Event), Error) {
 fn decode_message_delta(data: String) -> Result(List(Event), Error) {
   parse(data, {
     use stop_reason <- decode.field("delta", {
-      use reason <- decode.optional_field("stop_reason", None, decode.optional(decode.string))
+      use reason <- decode.optional_field(
+        "stop_reason",
+        None,
+        decode.optional(decode.string),
+      )
       decode.success(reason)
     })
     use usage <- decode.field("usage", usage_decoder())
-    decode.success(list.append(finish_events(stop_reason), [usage_event(usage)]))
+    decode.success(
+      list.append(finish_events(stop_reason), [usage_event(usage)]),
+    )
   })
 }
 

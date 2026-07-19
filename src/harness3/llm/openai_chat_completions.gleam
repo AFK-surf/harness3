@@ -7,13 +7,12 @@ import gleam/string
 import harness3/llm.{
   type Content, type Error, type Event, type FinishReason, type HttpRequest,
   type ImageDetail, type MediaSource, type Message, type Provider, type Request,
-  type Role, type Tool, ApiError, Assistant, Auto, Base64,
-  ContentFilter, Developer, Document, FileId, Finished,
-  High, HttpRequest, Image, InvalidRequest, InvalidResponse, Length, Low,
-  MessageStart, MessageStop, Other, RefusalDelta, Stop, System, Text,
-  TextDelta, ToolCall, ToolCallArgumentsDelta,
-  ToolCallStart, ToolResult, ToolUse, Unsupported, Url, Usage,
-  UsageReported, User,
+  type Role, type Tool, ApiError, Assistant, Auto, Base64, ContentFilter,
+  Developer, Document, FileId, Finished, High, HttpRequest, Image,
+  InvalidRequest, InvalidResponse, Length, Low, MessageStart, MessageStop, Other,
+  Reasoning, RefusalDelta, Stop, System, Text, TextDelta, ToolCall,
+  ToolCallArgumentsDelta, ToolCallStart, ToolResult, ToolUse, Unsupported, Url,
+  Usage, UsageReported, User,
 }
 
 pub type Config {
@@ -57,7 +56,8 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     #("tools", json.preprocessed_array(tools)),
     #("stream", json.bool(stream)),
   ]
-  let fields = add_optional_int(fields, "max_completion_tokens", max_output_tokens)
+  let fields =
+    add_optional_int(fields, "max_completion_tokens", max_output_tokens)
   let fields = add_optional_float(fields, "temperature", temperature)
   let fields = case stream {
     True -> [
@@ -67,17 +67,15 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
     False -> fields
   }
   let Config(api_key:, ..) = config
-  Ok(
-    HttpRequest(
-      method: "POST",
-      url: base_url(config) <> "/v1/chat/completions",
-      headers: [
-        #("authorization", "Bearer " <> api_key),
-        #("content-type", "application/json"),
-      ],
-      body: json.object(fields) |> json.to_string,
-    ),
-  )
+  Ok(HttpRequest(
+    method: "POST",
+    url: base_url(config) <> "/v1/chat/completions",
+    headers: [
+      #("authorization", "Bearer " <> api_key),
+      #("content-type", "application/json"),
+    ],
+    body: json.object(fields) |> json.to_string,
+  ))
 }
 
 fn role_name(role: Role) -> String {
@@ -95,7 +93,10 @@ fn encode_message(message: Message) -> Result(Json, Error) {
   case role {
     llm.ToolRole -> encode_tool_result_message(content)
     _ -> {
-      let regular = list.filter(content, fn(part) { !is_tool_call(part) })
+      let regular =
+        list.filter(content, fn(part) {
+          !is_tool_call(part) && !is_reasoning(part)
+        })
       let calls = list.filter(content, is_tool_call)
       use regular <- result.try(list.try_map(regular, encode_content))
       use calls <- result.try(list.try_map(calls, encode_tool_call))
@@ -119,29 +120,51 @@ fn is_tool_call(content: Content) -> Bool {
   }
 }
 
+fn is_reasoning(content: Content) -> Bool {
+  case content {
+    Reasoning(..) -> True
+    _ -> False
+  }
+}
+
 fn encode_content(content: Content) -> Result(Json, Error) {
   case content {
-    Text(text) -> Ok(json.object([
-      #("type", json.string("text")),
-      #("text", json.string(text)),
-    ]))
+    Text(text) ->
+      Ok(
+        json.object([
+          #("type", json.string("text")),
+          #("text", json.string(text)),
+        ]),
+      )
     Image(source, detail) -> {
       use url <- result.try(image_url(source))
-      Ok(json.object([
-        #("type", json.string("image_url")),
-        #("image_url", json.object([
-          #("url", json.string(url)),
-          #("detail", json.string(detail_name(detail))),
-        ])),
-      ]))
+      Ok(
+        json.object([
+          #("type", json.string("image_url")),
+          #(
+            "image_url",
+            json.object([
+              #("url", json.string(url)),
+              #("detail", json.string(detail_name(detail))),
+            ]),
+          ),
+        ]),
+      )
     }
-    Document(FileId(id)) -> Ok(json.object([
-      #("type", json.string("file")),
-      #("file", json.object([#("file_id", json.string(id))])),
-    ]))
+    Document(FileId(id)) ->
+      Ok(
+        json.object([
+          #("type", json.string("file")),
+          #("file", json.object([#("file_id", json.string(id))])),
+        ]),
+      )
     Document(_) -> Error(Unsupported("Chat Completions document URLs/base64"))
-    ToolCall(..) -> Error(InvalidRequest("tool calls must be assistant content"))
-    ToolResult(..) -> Error(InvalidRequest("tool results require the tool role"))
+    Reasoning(..) ->
+      Error(Unsupported("Chat Completions encrypted reasoning input"))
+    ToolCall(..) ->
+      Error(InvalidRequest("tool calls must be assistant content"))
+    ToolResult(..) ->
+      Error(InvalidRequest("tool results require the tool role"))
   }
 }
 
@@ -163,14 +186,20 @@ fn detail_name(detail: ImageDetail) -> String {
 
 fn encode_tool_call(content: Content) -> Result(Json, Error) {
   case content {
-    ToolCall(id, name, arguments) -> Ok(json.object([
-      #("id", json.string(id)),
-      #("type", json.string("function")),
-      #("function", json.object([
-        #("name", json.string(name)),
-        #("arguments", json.string(json.to_string(arguments))),
-      ])),
-    ]))
+    ToolCall(id, name, arguments) ->
+      Ok(
+        json.object([
+          #("id", json.string(id)),
+          #("type", json.string("function")),
+          #(
+            "function",
+            json.object([
+              #("name", json.string(name)),
+              #("arguments", json.string(json.to_string(arguments))),
+            ]),
+          ),
+        ]),
+      )
     _ -> Error(InvalidRequest("expected a tool call"))
   }
 }
@@ -179,11 +208,13 @@ fn encode_tool_result_message(content: List(Content)) -> Result(Json, Error) {
   case content {
     [ToolResult(id, result_content, _)] -> {
       use text <- result.try(text_only(result_content))
-      Ok(json.object([
-        #("role", json.string("tool")),
-        #("tool_call_id", json.string(id)),
-        #("content", json.string(text)),
-      ]))
+      Ok(
+        json.object([
+          #("role", json.string("tool")),
+          #("tool_call_id", json.string(id)),
+          #("content", json.string(text)),
+        ]),
+      )
     }
     _ -> Error(InvalidRequest("tool messages require exactly one ToolResult"))
   }
@@ -207,13 +238,18 @@ fn encode_tool(tool: Tool) -> Result(Json, Error) {
     #("parameters", input_schema),
   ]
   let function = case description {
-    Some(description) -> [#("description", json.string(description)), ..function]
+    Some(description) -> [
+      #("description", json.string(description)),
+      ..function
+    ]
     None -> function
   }
-  Ok(json.object([
-    #("type", json.string("function")),
-    #("function", json.object(function)),
-  ]))
+  Ok(
+    json.object([
+      #("type", json.string("function")),
+      #("function", json.object(function)),
+    ]),
+  )
 }
 
 fn add_optional_int(fields, name, value: Option(Int)) {
@@ -235,7 +271,12 @@ type UsageData {
 }
 
 type ToolDelta {
-  ToolDelta(index: Int, id: Option(String), name: Option(String), arguments: Option(String))
+  ToolDelta(
+    index: Int,
+    id: Option(String),
+    name: Option(String),
+    arguments: Option(String),
+  )
 }
 
 type Delta {
@@ -252,59 +293,96 @@ type Choice {
 }
 
 type Chunk {
-  Chunk(id: String, model: String, choices: List(Choice), usage: Option(UsageData))
+  Chunk(
+    id: String,
+    model: String,
+    choices: List(Choice),
+    usage: Option(UsageData),
+  )
 }
 
 fn usage_decoder() -> decode.Decoder(UsageData) {
   use input <- decode.field("prompt_tokens", decode.int)
   use output <- decode.field("completion_tokens", decode.int)
-  use cached <- decode.optional_field(
-    "prompt_tokens_details",
-    0,
-    {
-      use cached <- decode.optional_field("cached_tokens", 0, decode.int)
-      decode.success(cached)
-    },
-  )
+  use cached <- decode.optional_field("prompt_tokens_details", 0, {
+    use cached <- decode.optional_field("cached_tokens", 0, decode.int)
+    decode.success(cached)
+  })
   decode.success(UsageData(input, output, cached))
 }
 
 fn tool_delta_decoder() -> decode.Decoder(ToolDelta) {
   use index <- decode.optional_field("index", 0, decode.int)
   use id <- decode.optional_field("id", None, decode.optional(decode.string))
-  use function <- decode.optional_field(
-    "function",
-    #(None, None),
-    {
-      use name <- decode.optional_field("name", None, decode.optional(decode.string))
-      use arguments <- decode.optional_field("arguments", None, decode.optional(decode.string))
-      decode.success(#(name, arguments))
-    },
-  )
+  use function <- decode.optional_field("function", #(None, None), {
+    use name <- decode.optional_field(
+      "name",
+      None,
+      decode.optional(decode.string),
+    )
+    use arguments <- decode.optional_field(
+      "arguments",
+      None,
+      decode.optional(decode.string),
+    )
+    decode.success(#(name, arguments))
+  })
   decode.success(ToolDelta(index, id, function.0, function.1))
 }
 
 fn delta_decoder() -> decode.Decoder(Delta) {
-  use role <- decode.optional_field("role", None, decode.optional(decode.string))
-  use content <- decode.optional_field("content", None, decode.optional(decode.string))
-  use refusal <- decode.optional_field("refusal", None, decode.optional(decode.string))
-  use tool_calls <- decode.optional_field("tool_calls", [], decode.list(of: tool_delta_decoder()))
+  use role <- decode.optional_field(
+    "role",
+    None,
+    decode.optional(decode.string),
+  )
+  use content <- decode.optional_field(
+    "content",
+    None,
+    decode.optional(decode.string),
+  )
+  use refusal <- decode.optional_field(
+    "refusal",
+    None,
+    decode.optional(decode.string),
+  )
+  use tool_calls <- decode.optional_field(
+    "tool_calls",
+    [],
+    decode.list(of: tool_delta_decoder()),
+  )
   decode.success(Delta(role, content, refusal, tool_calls))
 }
 
 fn choice_decoder() -> decode.Decoder(Choice) {
   use index <- decode.field("index", decode.int)
-  use delta <- decode.optional_field("delta", Delta(None, None, None, []), delta_decoder())
+  use delta <- decode.optional_field(
+    "delta",
+    Delta(None, None, None, []),
+    delta_decoder(),
+  )
   use delta <- decode.optional_field("message", delta, delta_decoder())
-  use finish <- decode.optional_field("finish_reason", None, decode.optional(decode.string))
+  use finish <- decode.optional_field(
+    "finish_reason",
+    None,
+    decode.optional(decode.string),
+  )
   decode.success(Choice(index, delta, finish))
 }
 
 fn chunk_decoder() -> decode.Decoder(Chunk) {
   use id <- decode.optional_field("id", "", decode.string)
   use model <- decode.optional_field("model", "", decode.string)
-  use choices <- decode.optional_field("choices", [], decode.list(of: choice_decoder()))
-  use usage <- decode.optional_field("usage", None, decode.optional(usage_decoder()))
+  use choices <- decode.optional_field(
+    "choices",
+    [],
+    decode.list(of: choice_decoder()),
+  )
+  use usage <- decode.optional_field(
+    "usage",
+    None,
+    decode.optional(usage_decoder()),
+  )
   decode.success(Chunk(id, model, choices, usage))
 }
 
@@ -326,18 +404,22 @@ fn decode_chunk(data: String, streaming: Bool) -> Result(List(Event), Error) {
   )
   let Chunk(id:, model:, choices:, usage:) = chunk
   let start = case streaming, choices {
-    True, [Choice(delta: Delta(role: Some(_), ..), ..), ..] -> [MessageStart(id, model)]
+    True, [Choice(delta: Delta(role: Some(_), ..), ..), ..] -> [
+      MessageStart(id, model),
+    ]
     False, _ -> [MessageStart(id, model)]
     _, _ -> []
   }
   let events = choices |> list.flat_map(choice_events)
   let usage = case usage {
-    Some(UsageData(input, output, cached)) -> [UsageReported(Usage(
-      input_tokens: Some(input),
-      output_tokens: Some(output),
-      cache_read_tokens: Some(cached),
-      cache_write_tokens: None,
-    ))]
+    Some(UsageData(input, output, cached)) -> [
+      UsageReported(Usage(
+        input_tokens: Some(input),
+        output_tokens: Some(output),
+        cache_read_tokens: Some(cached),
+        cache_write_tokens: None,
+      )),
+    ]
     None -> []
   }
   let stop = case streaming {
@@ -358,20 +440,22 @@ fn choice_events(choice: Choice) -> List(Event) {
     Some(text) -> [RefusalDelta(index, text)]
     None -> []
   }
-  let tool_events = tool_calls |> list.flat_map(fn(call) {
-    let ToolDelta(index:, id:, name:, arguments:) = call
-    let start = case id, name {
-      Some(id), Some(name) -> [ToolCallStart(index, id, name)]
-      Some(id), None -> [ToolCallStart(index, id, "")]
-      None, Some(name) -> [ToolCallStart(index, "", name)]
-      None, None -> []
-    }
-    let arguments = case arguments {
-      Some(arguments) -> [ToolCallArgumentsDelta(index, arguments)]
-      None -> []
-    }
-    list.append(start, arguments)
-  })
+  let tool_events =
+    tool_calls
+    |> list.flat_map(fn(call) {
+      let ToolDelta(index:, id:, name:, arguments:) = call
+      let start = case id, name {
+        Some(id), Some(name) -> [ToolCallStart(index, id, name)]
+        Some(id), None -> [ToolCallStart(index, id, "")]
+        None, Some(name) -> [ToolCallStart(index, "", name)]
+        None, None -> []
+      }
+      let arguments = case arguments {
+        Some(arguments) -> [ToolCallArgumentsDelta(index, arguments)]
+        None -> []
+      }
+      list.append(start, arguments)
+    })
   let finish = case finish {
     Some(reason) -> [Finished(finish_reason(reason))]
     None -> []
