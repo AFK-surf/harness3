@@ -176,15 +176,19 @@ fn acquire_lock(path: String, attempts: Int) -> Result(String, Error) {
   use _ <- result.try(ensure_dir(path) |> status_result)
   case file_open(path, [Write, Raw, Exclusive]) {
     Ok(file) -> {
-      use _ <- result.try(file_close(file) |> status_result)
       let token =
         crypto.strong_random_bytes(12) |> bit_array.base64_url_encode(False)
-      // Only the holder writes here: everyone else backs off while the file
-      // exists, and a fresh lock is never broken.
+      // Stamp the token through the descriptor from the exclusive create,
+      // never by path: a holder stalled between the create and a path-based
+      // reopen could stamp over a successor's lock after a breaker removed
+      // its own. A write through the descriptor lands on this holder's
+      // (possibly already unlinked) inode instead, which is harmless.
       use _ <- result.try(
-        file_write(path, bit_array.from_string(token), [Raw, Binary, Sync])
+        file_write_chunk(file, bit_array.from_string(token))
         |> status_result,
       )
+      use _ <- result.try(file_sync(file) |> status_result)
+      use _ <- result.try(file_close(file) |> status_result)
       Ok(token)
     }
     Error(reason) ->
@@ -585,15 +589,11 @@ fn put_(
     // generation instead of accepting a stale conditional token.
     use _ <- result.try(write_generation(config, key, -2, generation))
     use _ <- result.try(ensure_dir(path) |> status_result)
-    let temporary =
-      join_path(
-        root(config),
-        ".harness3/temporary/"
-          <> bit_array.base16_encode(crypto.hash(
-          crypto.Sha256,
-          bit_array.from_string(key),
-        )),
-      )
+    // Random per-attempt temp path, like `stream_put_`. A deterministic
+    // per-key path is shared between holders: a stalled holder's resumed
+    // temp write could land between a new holder's write and rename for the
+    // same key, silently renaming the wrong bytes into place.
+    let temporary = unique_temporary_path(config, key)
     use _ <- result.try(ensure_dir(temporary) |> status_result)
     use _ <- result.try(
       file_write(temporary, body, [Raw, Binary, Sync])
@@ -689,6 +689,10 @@ fn delete_(config: Config, key: String) -> Result(Nil, Error) {
           -1,
           stored_generation + 1,
         ))
+        // The delete is its own destructive commit: without this verify, a
+        // holder stalled through the tombstone write could remove an object
+        // a new lock holder just committed.
+        use _ <- result.try(verify_lock(config, token))
         file_delete(path) |> status_result
       }
     }
