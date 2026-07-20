@@ -14,7 +14,9 @@ const sessionList = $("#session-list");
 const emptyState = $("#empty-state");
 const workspace = $("#workspace");
 const dialog = $("#new-session-dialog");
+const mcpDialog = $("#mcp-server-dialog");
 const newForm = $("#new-session-form");
+const mcpForm = $("#mcp-server-form");
 const messageForm = $("#message-form");
 
 async function api(path, options = {}) {
@@ -75,14 +77,192 @@ async function loadModels() {
 
 async function loadMcpConfigurations() {
   const body = await api("/api/mcp/configurations");
-  state.mcpConfigurations = body.configurations.filter((configuration) => configuration.enabled);
+  state.mcpConfigurations = body.configurations;
   const select = $("#mcp-configuration-select");
-  const options = state.mcpConfigurations.map((configuration) =>
+  const selected = select.value;
+  const enabled = state.mcpConfigurations.filter((configuration) => configuration.enabled && configuration.servers.length);
+  const options = enabled.map((configuration) =>
     `<option value="${escapeHtml(configuration.id)}">${escapeHtml(configuration.label)} · ${configuration.tool_count} tools</option>`
   );
   if (!options.length) options.push(`<option value="">No MCP configuration installed</option>`);
   select.innerHTML = options.join("");
+  if (enabled.some((configuration) => configuration.id === selected)) select.value = selected;
+  renderMcpManager();
   updateTeamPreview();
+}
+
+function renderMcpManager() {
+  const selector = $("#mcp-add-configuration");
+  const selected = selector.value;
+  const options = state.mcpConfigurations.map((configuration) =>
+    `<option value="${escapeHtml(configuration.id)}">${escapeHtml(configuration.label)} · ${escapeHtml(configuration.id)}</option>`
+  );
+  options.push(`<option value="">＋ New configuration</option>`);
+  selector.innerHTML = options.join("");
+  selector.value = state.mcpConfigurations.some((configuration) => configuration.id === selected)
+    ? selected
+    : state.mcpConfigurations[0]?.id || "";
+  updateMcpConfigurationFields();
+
+  const list = $("#mcp-server-list");
+  const serverCount = state.mcpConfigurations.reduce((count, configuration) => count + configuration.servers.length, 0);
+  if (!serverCount) {
+    list.innerHTML = `<div class="mcp-empty">No MCP servers installed yet.</div>`;
+    return;
+  }
+  list.innerHTML = state.mcpConfigurations.map((configuration) => {
+    if (!configuration.servers.length) return "";
+    return `<div class="mcp-configuration-card">
+      <div class="mcp-configuration-title">
+        <strong>${escapeHtml(configuration.label)}</strong>
+        <span>${escapeHtml(configuration.id)}</span>
+      </div>
+      ${configuration.servers.map((server) => {
+        const transport = server.transport;
+        const location = transport.type === "streamable_http"
+          ? transport.endpoint
+          : transport.executable;
+        const kind = transport.type === "streamable_http" ? "HTTP" : "stdio";
+        const argumentCount = transport.argument_count ? ` · ${transport.argument_count} arg${transport.argument_count === 1 ? "" : "s"}` : "";
+        const bindings = transport.binding_count ? ` · ${transport.binding_count} binding${transport.binding_count === 1 ? "" : "s"}` : "";
+        return `<div class="mcp-server-row">
+          <div>
+            <strong>${escapeHtml(server.id)}</strong>
+            <small>${escapeHtml(kind)} · ${number(server.timeout_milliseconds)} ms${argumentCount}${bindings}</small>
+            <code>${escapeHtml(location)}</code>
+          </div>
+          <button class="icon-button danger" type="button" aria-label="Remove ${escapeHtml(server.id)}" data-remove-mcp-configuration="${escapeHtml(configuration.id)}" data-remove-mcp-server="${escapeHtml(server.id)}">×</button>
+        </div>`;
+      }).join("")}
+    </div>`;
+  }).join("");
+  list.querySelectorAll("[data-remove-mcp-server]").forEach((button) => {
+    button.addEventListener("click", () => removeMcpServer(button.dataset.removeMcpConfiguration, button.dataset.removeMcpServer));
+  });
+}
+
+function updateMcpConfigurationFields() {
+  const selected = $("#mcp-add-configuration").value;
+  const existing = state.mcpConfigurations.find((configuration) => configuration.id === selected);
+  const id = $("#mcp-configuration-id");
+  const label = $("#mcp-configuration-label");
+  id.readOnly = Boolean(existing);
+  label.readOnly = Boolean(existing);
+  id.value = existing?.id || "";
+  label.value = existing?.label || "";
+}
+
+function updateMcpTransportFields() {
+  const http = $("#mcp-transport-type").value === "streamable_http";
+  $("#mcp-http-fields").classList.toggle("hidden", !http);
+  $("#mcp-stdio-fields").classList.toggle("hidden", http);
+  $("#mcp-http-endpoint").required = http;
+  $("#mcp-stdio-executable").required = !http;
+  $("#mcp-binding-label").textContent = http ? "HTTP headers" : "Process environment";
+}
+
+function addMcpBinding() {
+  const row = document.createElement("div");
+  row.className = "binding-row";
+  row.innerHTML = `<input class="binding-name" aria-label="Binding name" placeholder="Name" required>
+    <select class="binding-source" aria-label="Binding source">
+      <option value="environment_variable">Environment variable</option>
+      <option value="literal">Literal value</option>
+    </select>
+    <input class="binding-value" aria-label="Binding value" placeholder="VARIABLE_NAME" required>
+    <button class="icon-button" type="button" aria-label="Remove binding">×</button>`;
+  const source = row.querySelector(".binding-source");
+  const value = row.querySelector(".binding-value");
+  const update = () => {
+    const literal = source.value === "literal";
+    value.type = literal ? "password" : "text";
+    value.placeholder = literal ? "Stored plaintext value" : "VARIABLE_NAME";
+  };
+  source.addEventListener("change", update);
+  row.querySelector("button").addEventListener("click", () => row.remove());
+  update();
+  $("#mcp-binding-list").append(row);
+}
+
+function mcpBindings() {
+  return [...$("#mcp-binding-list").querySelectorAll(".binding-row")].map((row) => ({
+    name: row.querySelector(".binding-name").value.trim(),
+    value: {
+      type: row.querySelector(".binding-source").value,
+      value: row.querySelector(".binding-value").value,
+    },
+  }));
+}
+
+async function addMcpServer() {
+  const button = $("#mcp-add-button");
+  button.disabled = true;
+  button.textContent = "Adding…";
+  try {
+    const configurationId = $("#mcp-configuration-id").value.trim();
+    const transportType = $("#mcp-transport-type").value;
+    const bindings = mcpBindings();
+    let transport;
+    if (transportType === "streamable_http") {
+      transport = {
+        type: transportType,
+        endpoint: $("#mcp-http-endpoint").value.trim(),
+        headers: bindings,
+      };
+    } else {
+      let args;
+      try { args = JSON.parse($("#mcp-stdio-arguments").value || "[]"); }
+      catch (_) { throw new Error("Stdio arguments must be a JSON array of strings."); }
+      if (!Array.isArray(args) || args.some((value) => typeof value !== "string")) {
+        throw new Error("Stdio arguments must be a JSON array of strings.");
+      }
+      transport = {
+        type: transportType,
+        executable: $("#mcp-stdio-executable").value.trim(),
+        arguments: args,
+        working_directory: $("#mcp-stdio-working-directory").value.trim() || null,
+        environment: bindings,
+      };
+    }
+    await api("/api/mcp/servers", {
+      method: "POST",
+      body: JSON.stringify({
+        configuration_id: configurationId,
+        configuration_label: $("#mcp-configuration-label").value.trim(),
+        server: {
+          id: $("#mcp-server-id").value.trim(),
+          timeout_milliseconds: Number($("#mcp-server-timeout").value),
+          transport,
+        },
+      }),
+    });
+    await loadMcpConfigurations();
+    $("#mcp-add-configuration").value = configurationId;
+    updateMcpConfigurationFields();
+    $("#mcp-server-id").value = "";
+    $("#mcp-http-endpoint").value = "";
+    $("#mcp-stdio-executable").value = "";
+    $("#mcp-stdio-arguments").value = "[]";
+    $("#mcp-stdio-working-directory").value = "";
+    $("#mcp-binding-list").innerHTML = "";
+    toast("MCP server added. It will be discovered when a specialist activates.");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Add server";
+  }
+}
+
+async function removeMcpServer(configurationId, serverId) {
+  if (!confirm(`Remove MCP server “${serverId}” from “${configurationId}”?`)) return;
+  try {
+    await api(`/api/mcp/configurations/${encodeURIComponent(configurationId)}/servers/${encodeURIComponent(serverId)}`, { method: "DELETE" });
+    await loadMcpConfigurations();
+    toast("MCP server removed.");
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 async function loadSessions(selectFirst = false) {
@@ -341,6 +521,14 @@ function updateTeamPreview() {
 function bindEvents() {
   $("#new-session-button").addEventListener("click", openNewSession);
   $("#empty-new-button").addEventListener("click", openNewSession);
+  $("#mcp-manage-button").addEventListener("click", () => {
+    renderMcpManager();
+    mcpDialog.showModal();
+  });
+  $("#mcp-dialog-close").addEventListener("click", () => mcpDialog.close());
+  $("#mcp-add-configuration").addEventListener("change", updateMcpConfigurationFields);
+  $("#mcp-transport-type").addEventListener("change", updateMcpTransportFields);
+  $("#mcp-add-binding").addEventListener("click", addMcpBinding);
   $("#team-size").addEventListener("change", updateTeamPreview);
   $("#mcp-configuration-select").addEventListener("change", updateTeamPreview);
   $("#target-agent").addEventListener("change", (event) => {
@@ -353,6 +541,10 @@ function bindEvents() {
     if (event.submitter?.value === "cancel") return;
     event.preventDefault();
     createSession();
+  });
+  mcpForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    addMcpServer();
   });
   messageForm.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -373,6 +565,7 @@ function bindEvents() {
 async function init() {
   bindEvents();
   updateTeamPreview();
+  updateMcpTransportFields();
   try {
     await Promise.all([connect(), loadModels(), loadMcpConfigurations()]);
     await loadSessions(true);

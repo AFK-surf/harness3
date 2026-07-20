@@ -361,7 +361,7 @@ pub fn decoder() -> decode.Decoder(Configuration) {
   decode.success(Configuration(id, label, enabled, servers, manifest))
 }
 
-fn server_decoder() -> decode.Decoder(Server) {
+pub fn server_decoder() -> decode.Decoder(Server) {
   use id <- decode.field("id", decode.string)
   use timeout <- decode.optional_field(
     "timeout_milliseconds",

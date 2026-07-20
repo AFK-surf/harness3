@@ -190,8 +190,25 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     )
 
   let assert Ok(Nil) = service.stop_session(second, metadata.id)
+  let seeded_ui_server =
+    mcp_configuration.Server(
+      id: "ui-added",
+      transport: mcp_configuration.StreamableHttp(
+        "https://ui.example.test/mcp",
+        [],
+      ),
+      timeout_milliseconds: 5000,
+    )
+  let assert Ok(_) =
+    service.add_mcp_server(second, "research", "Research MCP", seeded_ui_server)
   service.stop(first)
   service.stop(second)
+
+  let assert Ok(after_seed_restart) = service.start()
+  let assert [after_seed_configuration] =
+    service.mcp_configurations(after_seed_restart)
+  assert list.contains(after_seed_configuration.servers, seeded_ui_server)
+  service.stop(after_seed_restart)
 
   envoy.unset("HARNESS3_MCP_CONFIG_PATH")
   envoy.set("HARNESS3_DATA_DIR", root <> "/data-without-mcp")
@@ -210,7 +227,58 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   assert tool_names(researcher_without_mcp) == ["MessageAgent"]
   let assert Ok(Nil) =
     service.stop_session(without_mcp, without_mcp_metadata.id)
+  let managed_server =
+    mcp_configuration.Server(
+      id: "web-added",
+      transport: mcp_configuration.StreamableHttp(
+        "https://mcp.example.test/mcp",
+        [
+          mcp_configuration.Binding(
+            "authorization",
+            mcp_configuration.EnvironmentVariable("WEB_MCP_TOKEN"),
+          ),
+        ],
+      ),
+      timeout_milliseconds: 12_000,
+    )
+  let assert Ok(added) =
+    service.add_mcp_server(
+      without_mcp,
+      "web-managed",
+      "Web managed MCP",
+      managed_server,
+    )
+  assert added.servers == [managed_server]
+  let assert [live_added] = service.mcp_configurations(without_mcp)
+  assert live_added.servers == [managed_server]
+  let assert Error(duplicate_error) =
+    service.add_mcp_server(
+      without_mcp,
+      "web-managed",
+      "Web managed MCP",
+      managed_server,
+    )
+  assert string.contains(duplicate_error, "already exists")
   service.stop(without_mcp)
+
+  let assert Ok(after_add_restart) = service.start()
+  let assert [persisted_web_configuration] =
+    service.mcp_configurations(after_add_restart)
+  assert persisted_web_configuration.id == "web-managed"
+  assert persisted_web_configuration.servers == [managed_server]
+  let assert Ok(after_remove) =
+    service.remove_mcp_server(after_add_restart, "web-managed", "web-added")
+  assert after_remove.servers == []
+  let assert [live_removed] = service.mcp_configurations(after_add_restart)
+  assert live_removed.servers == []
+  service.stop(after_add_restart)
+
+  let assert Ok(after_remove_restart) = service.start()
+  let assert [empty_web_configuration] =
+    service.mcp_configurations(after_remove_restart)
+  assert empty_web_configuration.id == "web-managed"
+  assert empty_web_configuration.servers == []
+  service.stop(after_remove_restart)
 
   let unavailable_path = root <> "/unavailable-mcp.json"
   let assert Ok(Nil) =

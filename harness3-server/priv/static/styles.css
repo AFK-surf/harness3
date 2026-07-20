@@ -82,6 +82,9 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
 .new-session:hover { border-color: #526a42; transform: translateY(-1px); }
 .new-session > span { color: var(--lime); font-size: 19px; line-height: 1; }
 .new-session kbd { margin-left: auto; }
+.manage-mcp { display: flex; align-items: center; gap: 9px; width: 100%; margin-top: 7px; padding: 9px 12px; border: 1px solid transparent; border-radius: 9px; color: var(--muted); background: transparent; text-align: left; }
+.manage-mcp:hover { color: var(--text); border-color: var(--line); background: var(--panel-2); }
+.manage-mcp > span:first-child { color: var(--amber); font-size: 17px; }
 
 kbd { padding: 2px 5px; border: 1px solid #363d3a; border-radius: 4px; color: var(--faint); background: #121513; font-family: inherit; font-size: 10px; }
 
@@ -239,16 +242,49 @@ dialog::backdrop { background: rgba(3,5,6,.76); backdrop-filter: blur(8px); }
 .dialog-heading { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 22px; }
 .dialog-heading h2 { margin: 7px 0 0; font-family: Georgia, serif; font-size: 29px; font-weight: 400; letter-spacing: -.035em; }
 .icon-button { width: 30px; height: 30px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: transparent; font-size: 20px; line-height: 1; }
+.icon-button:hover { color: var(--text); border-color: #3a4248; background: var(--panel-2); }
+.icon-button.danger:hover { color: var(--red); border-color: #5a3432; background: #211414; }
 .field { display: block; margin-bottom: 15px; }
 .field > span { display: block; margin-bottom: 7px; color: var(--muted); font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: .08em; }
 .field > span small { color: var(--faint); font-weight: 400; text-transform: none; letter-spacing: 0; }
 .field textarea, .field input, .field select { width: 100%; padding: 11px; border: 1px solid var(--line); border-radius: 8px; outline: 0; color: var(--text); background: #0d1012; }
 .field textarea { resize: vertical; line-height: 1.55; }
 .field textarea:focus, .field input:focus, .field select:focus { border-color: #4a5c3d; }
+.field input[readonly] { color: var(--muted); background: #111416; cursor: default; }
 .field-grid { display: grid; grid-template-columns: 1.5fr 1fr; gap: 12px; }
 .team-preview { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 21px; }
 .team-preview span { padding: 6px 8px; border: 1px solid #2e372a; border-radius: 7px; color: #aeb8b0; background: #151b13; font-size: 9px; text-transform: capitalize; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 18px; border-top: 1px solid var(--line-soft); }
+.ghost.small { padding: 6px 8px; font-size: 10px; }
+
+.mcp-dialog { width: min(980px, calc(100% - 28px)); }
+.mcp-dialog .dialog-card { max-height: min(820px, calc(100vh - 42px)); overflow-y: auto; }
+.mcp-manager-layout { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap: 24px; }
+.mcp-installed-panel { min-width: 0; padding-right: 22px; border-right: 1px solid var(--line-soft); }
+.mcp-section-heading { display: flex; align-items: flex-start; justify-content: space-between; min-height: 42px; margin-bottom: 12px; }
+.mcp-section-heading p { margin: 6px 0 0; color: var(--faint); font-size: 10px; line-height: 1.5; }
+.mcp-server-list { display: flex; flex-direction: column; gap: 10px; max-height: 590px; overflow-y: auto; }
+.mcp-empty { padding: 25px 14px; border: 1px dashed #30373a; border-radius: 10px; color: var(--faint); text-align: center; font-size: 11px; }
+.mcp-configuration-card { overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: #0f1214; }
+.mcp-configuration-title { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 9px 11px; border-bottom: 1px solid var(--line-soft); background: #14181a; }
+.mcp-configuration-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.mcp-configuration-title span { color: var(--faint); font: 9px "SFMono-Regular", Consolas, monospace; }
+.mcp-server-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 11px; }
+.mcp-server-row + .mcp-server-row { border-top: 1px solid var(--line-soft); }
+.mcp-server-row > div { min-width: 0; }
+.mcp-server-row strong, .mcp-server-row small, .mcp-server-row code { display: block; }
+.mcp-server-row strong { font-size: 11px; }
+.mcp-server-row small { margin-top: 4px; color: var(--faint); font-size: 9px; }
+.mcp-server-row code { margin-top: 7px; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.mcp-server-row .icon-button { flex: 0 0 auto; width: 26px; height: 26px; font-size: 16px; }
+.compact-grid { grid-template-columns: 1fr 1fr; }
+.binding-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 5px 0 8px; color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
+.binding-list { display: flex; flex-direction: column; gap: 7px; }
+.binding-row { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1fr) minmax(0, 1fr) 30px; gap: 6px; }
+.binding-row input, .binding-row select { min-width: 0; width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 7px; outline: 0; color: var(--text); background: #0d1012; font-size: 10px; }
+.binding-row input:focus, .binding-row select:focus { border-color: #4a5c3d; }
+.binding-row .icon-button { width: 30px; height: 30px; font-size: 16px; }
+.field-note { margin: 9px 0 15px; color: var(--faint); font-size: 9px; line-height: 1.5; }
 
 .toast { position: fixed; right: 22px; bottom: 22px; z-index: 20; max-width: 390px; padding: 11px 14px; border: 1px solid #48573d; border-radius: 9px; color: var(--text); background: #192015; box-shadow: 0 14px 45px rgba(0,0,0,.4); font-size: 11px; transform: translateY(20px); opacity: 0; pointer-events: none; transition: .2s; }
 .toast.visible { transform: translateY(0); opacity: 1; }
@@ -270,6 +306,8 @@ dialog::backdrop { background: rgba(3,5,6,.76); backdrop-filter: blur(8px); }
   .brand { padding: 0; }
   .brand small, .sidebar > .sidebar-label, .session-list, .sidebar-footer, .new-session kbd { display: none; }
   .new-session { width: auto; margin-left: auto; }
+  .manage-mcp { width: auto; margin: 0 0 0 5px; }
+  .manage-mcp .mcp-button-label { display: none; }
   .main, .workspace { min-height: calc(100vh - 66px); }
   .workspace-header { padding: 17px; }
   .workspace-body { display: flex; flex-direction: column; }
@@ -287,5 +325,9 @@ dialog::backdrop { background: rgba(3,5,6,.76); backdrop-filter: blur(8px); }
   .session-meta > span:last-child, .ghost.danger { display: none; }
   .team-list { grid-template-columns: 1fr; }
   .field-grid { grid-template-columns: 1fr; gap: 0; }
+  .mcp-manager-layout { grid-template-columns: 1fr; }
+  .mcp-installed-panel { padding: 0 0 20px; border-right: 0; border-bottom: 1px solid var(--line-soft); }
+  .binding-row { grid-template-columns: 1fr 1fr 30px; }
+  .binding-row .binding-value { grid-column: 1 / -1; grid-row: 2; }
   .dialog-card { padding: 21px; }
 }

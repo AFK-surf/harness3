@@ -31,10 +31,17 @@ not the secret values.
 
 ## MCP configurations
 
-Set `HARNESS3_MCP_CONFIG_PATH` to an absolute JSON file path to install global
-MCP configurations. On startup, the server validates and stores the
-configuration without contacting any external server. If the variable is
-omitted on a later start, the persisted catalog is reused.
+Use the **MCP servers** button in the web UI sidebar to add or remove global MCP
+servers. The manager supports Streamable HTTP and stdio transports, multiple
+servers per named configuration, environment-variable or literal bindings, and
+absolute stdio paths. Changes are validated and written to the durable catalog
+without contacting the external server; discovery waits until an MCP specialist
+activates.
+
+As an optional bootstrap, set `HARNESS3_MCP_CONFIG_PATH` to an absolute JSON
+file path. The file seeds the durable catalog only when no catalog exists yet,
+so subsequent web UI changes survive restarts. Startup never contacts an
+external MCP server.
 
 ```json
 {
@@ -131,6 +138,8 @@ authentication and isolation.
 - `GET /api/health`
 - `GET /api/models`
 - `GET /api/mcp/configurations`
+- `POST /api/mcp/servers`
+- `DELETE /api/mcp/configurations/:configuration_id/servers/:server_id`
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `GET /api/sessions/:id`

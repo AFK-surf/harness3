@@ -176,8 +176,11 @@ not produce event N+1 until `consume` of event N has returned (backpressure cont
   reachable servers, their typed schemas, and any server failures; `mcp.call` invokes
   one identifier returned by `mcp.list` with an argument object.
 - The server loads optional global configuration from an absolute
-  `HARNESS3_MCP_CONFIG_PATH`, validates and persists configuration without contacting
-  external services, and discards persisted manifests at startup. A configured team
+  `HARNESS3_MCP_CONFIG_PATH` as a first-run seed, validates and persists configuration
+  without contacting external services, and discards persisted manifests at startup.
+  Its web API and UI can add or remove servers with CAS-backed durable updates; those
+  updates invalidate live connections and discovery state for the affected
+  configuration. Management responses omit binding values. A configured team
   assigns the researcher `mcp.list`, `mcp.call`, and `MessageAgent`, but no filesystem
   or shell capability. Coding agents receive Read/Write/Exec plus `MessageAgent`, but no
   MCP tools. The lead may message all subagents; every subagent's `MessageAgent`

@@ -338,13 +338,10 @@ fn start_mcp(backend: Storage) -> Result(mcp.Runtime, String) {
     Error(error) ->
       Error("could not load MCP catalog: " <> string.inspect(error))
   })
-  use configured <- result.try(case path {
-    None ->
-      case existing {
-        Some(session) -> Ok(mcp_catalog.catalog(session))
-        None -> Ok(mcp_catalog.new())
-      }
-    Some(path) -> {
+  use configured <- result.try(case existing, path {
+    Some(session), _ -> Ok(mcp_catalog.catalog(session))
+    None, None -> Ok(mcp_catalog.new())
+    None, Some(path) -> {
       use configurations <- result.try(config.load_mcp_configurations(path))
       configurations
       |> list.try_fold(mcp_catalog.new(), fn(catalog, configuration) {
@@ -363,6 +360,121 @@ fn start_mcp(backend: Storage) -> Result(mcp.Runtime, String) {
       Error(error)
     }
     Ok(Nil) -> Ok(runtime)
+  }
+}
+
+pub fn add_mcp_server(
+  service: Service,
+  configuration_id: String,
+  configuration_label: String,
+  server: mcp_configuration.Server,
+) -> Result(mcp_configuration.Configuration, String) {
+  use configuration <- result.try(commit_mcp_change(
+    service.storage,
+    fn(catalog) {
+      let existing = mcp_catalog.lookup(catalog, configuration_id)
+      use current <- result.try(case existing {
+        Ok(configuration) -> Ok(configuration)
+        Error(mcp_catalog.UnknownConfiguration(_)) ->
+          Ok(mcp_configuration.Configuration(
+            id: configuration_id,
+            label: configuration_label,
+            enabled: True,
+            servers: [],
+            manifest: None,
+          ))
+        Error(error) -> Error(string.inspect(error))
+      })
+      use _ <- result.try(
+        case list.any(current.servers, fn(item) { item.id == server.id }) {
+          True ->
+            Error(
+              "MCP server already exists in configuration `"
+              <> configuration_id
+              <> "`: "
+              <> server.id,
+            )
+          False -> Ok(Nil)
+        },
+      )
+      let updated =
+        mcp_configuration.Configuration(
+          ..current,
+          label: configuration_label,
+          servers: list.append(current.servers, [server]),
+          manifest: None,
+        )
+      mcp_catalog.put_configuration(catalog, updated)
+      |> result.map(fn(next) { #(next, updated) })
+      |> result.map_error(fn(error) { string.inspect(error) })
+    },
+    3,
+  ))
+  use _ <- result.try(mcp.put_configuration(service.mcp_runtime, configuration))
+  Ok(configuration)
+}
+
+pub fn remove_mcp_server(
+  service: Service,
+  configuration_id: String,
+  server_id: String,
+) -> Result(mcp_configuration.Configuration, String) {
+  use configuration <- result.try(commit_mcp_change(
+    service.storage,
+    fn(catalog) {
+      use current <- result.try(
+        mcp_catalog.lookup(catalog, configuration_id)
+        |> result.map_error(fn(error) { string.inspect(error) }),
+      )
+      use _ <- result.try(
+        case list.any(current.servers, fn(server) { server.id == server_id }) {
+          True -> Ok(Nil)
+          False ->
+            Error(
+              "unknown MCP server in configuration `"
+              <> configuration_id
+              <> "`: "
+              <> server_id,
+            )
+        },
+      )
+      let updated =
+        mcp_configuration.Configuration(
+          ..current,
+          servers: list.filter(current.servers, fn(server) {
+            server.id != server_id
+          }),
+          manifest: None,
+        )
+      mcp_catalog.put_configuration(catalog, updated)
+      |> result.map(fn(next) { #(next, updated) })
+      |> result.map_error(fn(error) { string.inspect(error) })
+    },
+    3,
+  ))
+  use _ <- result.try(mcp.put_configuration(service.mcp_runtime, configuration))
+  Ok(configuration)
+}
+
+fn commit_mcp_change(
+  backend: Storage,
+  change: fn(mcp_catalog.Catalog) ->
+    Result(#(mcp_catalog.Catalog, mcp_configuration.Configuration), String),
+  attempts: Int,
+) -> Result(mcp_configuration.Configuration, String) {
+  use session <- result.try(
+    mcp_catalog.resume(backend, mcp_catalog_key)
+    |> result.map_error(fn(error) {
+      "could not load MCP catalog: " <> string.inspect(error)
+    }),
+  )
+  use #(next, configuration) <- result.try(change(mcp_catalog.catalog(session)))
+  case mcp_catalog.commit(session, next) {
+    Ok(_) -> Ok(configuration)
+    Error(mcp_catalog.ConcurrentUpdate) if attempts > 1 ->
+      commit_mcp_change(backend, change, attempts - 1)
+    Error(error) ->
+      Error("could not persist MCP catalog: " <> string.inspect(error))
   }
 }
 
@@ -424,7 +536,9 @@ fn select_mcp_configuration(
     None, True ->
       case
         mcp_configurations(service)
-        |> list.filter(fn(configuration) { configuration.enabled })
+        |> list.filter(fn(configuration) {
+          configuration.enabled && !list.is_empty(configuration.servers)
+        })
       {
         [] -> Ok(None)
         [configuration, ..] -> Ok(Some(configuration.id))

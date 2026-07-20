@@ -22,6 +22,9 @@
           <span aria-hidden="true">＋</span> New task
           <kbd>N</kbd>
         </button>
+        <button class="manage-mcp" id="mcp-manage-button" type="button">
+          <span aria-hidden="true">⌁</span><span class="mcp-button-label">MCP servers</span>
+        </button>
 
         <div class="sidebar-label">Recent sessions</div>
         <nav class="session-list" id="session-list" aria-label="Coding sessions"></nav>
@@ -155,6 +158,104 @@
           <button class="primary" id="create-button" value="default" type="submit">Create session</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog class="mcp-dialog" id="mcp-server-dialog">
+      <div class="dialog-card">
+        <div class="dialog-topline"></div>
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">Global configuration</p>
+            <h2>Manage MCP servers</h2>
+          </div>
+          <button class="icon-button" id="mcp-dialog-close" aria-label="Close dialog" type="button">×</button>
+        </div>
+
+        <div class="mcp-manager-layout">
+          <section class="mcp-installed-panel">
+            <div class="mcp-section-heading">
+              <div>
+                <span class="sidebar-label">Installed</span>
+                <p>Servers are discovered when an MCP specialist activates.</p>
+              </div>
+            </div>
+            <div class="mcp-server-list" id="mcp-server-list"></div>
+          </section>
+
+          <form class="mcp-add-form" id="mcp-server-form">
+            <div class="mcp-section-heading">
+              <div>
+                <span class="sidebar-label">Add server</span>
+                <p>Settings are stored globally and survive restarts.</p>
+              </div>
+            </div>
+
+            <label class="field">
+              <span>Configuration</span>
+              <select id="mcp-add-configuration"></select>
+            </label>
+            <div class="field-grid compact-grid">
+              <label class="field">
+                <span>Configuration ID</span>
+                <input id="mcp-configuration-id" pattern="[A-Za-z0-9_-]+" placeholder="research" required>
+              </label>
+              <label class="field">
+                <span>Configuration label</span>
+                <input id="mcp-configuration-label" placeholder="Research services" required>
+              </label>
+            </div>
+            <div class="field-grid compact-grid">
+              <label class="field">
+                <span>Server ID</span>
+                <input id="mcp-server-id" pattern="[A-Za-z0-9_-]+" placeholder="knowledge" required>
+              </label>
+              <label class="field">
+                <span>Timeout <small>milliseconds</small></span>
+                <input id="mcp-server-timeout" type="number" min="1" max="300000" value="60000" required>
+              </label>
+            </div>
+            <label class="field">
+              <span>Transport</span>
+              <select id="mcp-transport-type">
+                <option value="streamable_http">Streamable HTTP</option>
+                <option value="stdio">Stdio process</option>
+              </select>
+            </label>
+
+            <div id="mcp-http-fields">
+              <label class="field">
+                <span>Endpoint <small>absolute HTTP(S) URL</small></span>
+                <input id="mcp-http-endpoint" type="url" placeholder="https://mcp.example.com/mcp">
+              </label>
+            </div>
+            <div class="hidden" id="mcp-stdio-fields">
+              <label class="field">
+                <span>Executable <small>absolute path</small></span>
+                <input id="mcp-stdio-executable" placeholder="/usr/bin/node">
+              </label>
+              <label class="field">
+                <span>Arguments <small>JSON string array</small></span>
+                <input id="mcp-stdio-arguments" value="[]" placeholder='["/absolute/server.js"]'>
+              </label>
+              <label class="field">
+                <span>Working directory <small>optional absolute path</small></span>
+                <input id="mcp-stdio-working-directory" placeholder="/absolute/path">
+              </label>
+            </div>
+
+            <div class="binding-heading">
+              <span id="mcp-binding-label">HTTP headers</span>
+              <button class="ghost small" id="mcp-add-binding" type="button">＋ Add binding</button>
+            </div>
+            <div class="binding-list" id="mcp-binding-list"></div>
+            <p class="field-note">Use an environment-variable binding for secrets when possible. Literal values are stored in plaintext and are never returned by the API.</p>
+
+            <div class="dialog-actions">
+              <button class="primary" id="mcp-add-button" type="submit">Add server</button>
+            </div>
+          </form>
+        </div>
+      </div>
     </dialog>
 
     <div class="toast" id="toast" role="status"></div>

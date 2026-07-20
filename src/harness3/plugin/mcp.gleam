@@ -1,5 +1,6 @@
 import harness3/plugin
 import harness3/plugin/mcp/catalog
+import harness3/plugin/mcp/configuration
 import harness3/plugin/mcp/plugin as mcp_plugin
 import harness3/plugin/mcp/runtime
 
@@ -37,6 +38,13 @@ pub fn plugin(mcp_runtime: Runtime, snapshot: Snapshot) -> plugin.Plugin {
 
 pub fn catalog(mcp_runtime: Runtime) -> catalog.Catalog {
   runtime.catalog(mcp_runtime)
+}
+
+pub fn put_configuration(
+  mcp_runtime: Runtime,
+  configuration: configuration.Configuration,
+) -> Result(Nil, String) {
+  runtime.put_configuration(mcp_runtime, configuration)
 }
 
 pub fn stop(mcp_runtime: Runtime) -> Nil {

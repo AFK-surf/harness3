@@ -224,6 +224,11 @@ pub fn runtime_discovers_and_broker_invokes_available_tools_test() {
           |> json.to_string,
       ),
     )
+  let invalidated = configuration.Configuration(..discovered, manifest: None)
+  let assert Ok(Nil) = runtime.put_configuration(mcp_runtime, invalidated)
+  let assert Ok(runtime.Snapshot(configuration: after_update, failures: [], ..)) =
+    runtime.snapshot(mcp_runtime, "research")
+  assert after_update.manifest == None
   runtime.stop(mcp_runtime)
 }
 

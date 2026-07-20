@@ -78,6 +78,11 @@ fn handle(
           ),
         ]),
       )
+    http.Post, ["api", "mcp", "servers"] ->
+      add_mcp_server(service, request.body)
+    http.Delete,
+      ["api", "mcp", "configurations", configuration_id, "servers", server_id]
+    -> remove_mcp_server(service, configuration_id, server_id)
     http.Get, ["api", "sessions"] ->
       outcome(service.list_sessions(service), fn(sessions) {
         json.object([#("sessions", json.array(sessions, session_json))])
@@ -117,6 +122,34 @@ fn send_message(
   case service.send_message(service, id, message.agent_id, message.message) {
     Ok(Nil) -> json_response(202, json.object([#("ok", json.bool(True))]))
     Error(error) -> error_response(400, error)
+  }
+}
+
+fn add_mcp_server(service: Service, body: BitArray) -> Response(ResponseData) {
+  use input <- body_decoded(body, add_mcp_server_decoder())
+  case
+    service.add_mcp_server(
+      service,
+      input.configuration_id,
+      input.configuration_label,
+      input.server,
+    )
+  {
+    Ok(configuration) ->
+      json_response(201, mcp_configuration_json(configuration))
+    Error(error) -> error_response(400, error)
+  }
+}
+
+fn remove_mcp_server(
+  service: Service,
+  configuration_id: String,
+  server_id: String,
+) -> Response(ResponseData) {
+  case service.remove_mcp_server(service, configuration_id, server_id) {
+    Ok(configuration) ->
+      json_response(200, mcp_configuration_json(configuration))
+    Error(error) -> error_response(404, error)
   }
 }
 
@@ -456,9 +489,58 @@ fn mcp_configuration_json(
     #("label", json.string(configuration.label)),
     #("enabled", json.bool(configuration.enabled)),
     #("server_count", json.int(list.length(configuration.servers))),
+    #("servers", json.array(configuration.servers, mcp_server_json)),
     #("tool_count", json.int(tool_count)),
     #("refreshed_at_seconds", option_int(refreshed_at)),
   ])
+}
+
+fn mcp_server_json(server: mcp_configuration.Server) -> json.Json {
+  let transport = case server.transport {
+    mcp_configuration.StreamableHttp(endpoint, headers) ->
+      json.object([
+        #("type", json.string("streamable_http")),
+        #("endpoint", json.string(endpoint)),
+        #("binding_count", json.int(list.length(headers))),
+      ])
+    mcp_configuration.Stdio(
+      executable,
+      arguments,
+      working_directory,
+      environment,
+    ) ->
+      json.object([
+        #("type", json.string("stdio")),
+        #("executable", json.string(executable)),
+        #("argument_count", json.int(list.length(arguments))),
+        #("working_directory", json.nullable(working_directory, json.string)),
+        #("binding_count", json.int(list.length(environment))),
+      ])
+  }
+  json.object([
+    #("id", json.string(server.id)),
+    #("timeout_milliseconds", json.int(server.timeout_milliseconds)),
+    #("transport", transport),
+  ])
+}
+
+type AddMcpServerRequest {
+  AddMcpServerRequest(
+    configuration_id: String,
+    configuration_label: String,
+    server: mcp_configuration.Server,
+  )
+}
+
+fn add_mcp_server_decoder() -> decode.Decoder(AddMcpServerRequest) {
+  use configuration_id <- decode.field("configuration_id", decode.string)
+  use configuration_label <- decode.field("configuration_label", decode.string)
+  use server <- decode.field("server", mcp_configuration.server_decoder())
+  decode.success(AddMcpServerRequest(
+    configuration_id,
+    configuration_label,
+    server,
+  ))
 }
 
 type MessageRequest {

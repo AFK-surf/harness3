@@ -53,6 +53,10 @@ type State {
 
 type Message {
   GetCatalog(reply: Subject(catalog.Catalog))
+  PutConfiguration(
+    configuration: configuration.Configuration,
+    reply: Subject(Result(Nil, String)),
+  )
   GetSnapshot(
     configuration_id: String,
     reply: Subject(Result(Snapshot, String)),
@@ -96,6 +100,22 @@ pub fn start_with_connector(
 pub fn catalog(runtime: Runtime) -> catalog.Catalog {
   let Runtime(subject) = runtime
   process.call_forever(subject, GetCatalog)
+}
+
+/// Installs a validated configuration and invalidates any discovery state and
+/// live connections belonging to its ID.
+pub fn put_configuration(
+  runtime: Runtime,
+  configuration: configuration.Configuration,
+) -> Result(Nil, String) {
+  let Runtime(subject) = runtime
+  exception.rescue(fn() {
+    process.call(subject, 5000, fn(reply) {
+      PutConfiguration(configuration, reply)
+    })
+  })
+  |> result.map_error(fn(_) { "MCP runtime is unavailable" })
+  |> result.flatten
 }
 
 pub fn snapshot(
@@ -156,6 +176,31 @@ fn handle_message(
       process.send(reply, state.catalog)
       actor.continue(state)
     }
+    PutConfiguration(configuration, reply) ->
+      case catalog.put_configuration(state.catalog, configuration) {
+        Error(error) -> {
+          process.send(reply, Error(string.inspect(error)))
+          actor.continue(state)
+        }
+        Ok(next_catalog) -> {
+          let #(removed, retained) =
+            list.partition(state.connections, fn(entry) {
+              entry.configuration_id == configuration.id
+            })
+          list.each(removed, fn(entry) { client.close(entry.client) })
+          process.send(reply, Ok(Nil))
+          actor.continue(
+            State(
+              ..state,
+              catalog: next_catalog,
+              connections: retained,
+              failures: list.filter(state.failures, fn(entry) {
+                entry.0 != configuration.id
+              }),
+            ),
+          )
+        }
+      }
     GetSnapshot(configuration_id, reply) -> {
       process.send(reply, current_snapshot(state, configuration_id))
       actor.continue(state)
