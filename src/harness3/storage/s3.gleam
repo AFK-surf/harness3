@@ -14,9 +14,10 @@ import gleam/string
 import gleam/uri.{Uri}
 import harness3/storage.{
   type BodySource, type Error, type Metadata, type Object, type PutCondition,
-  type Storage, Backend, GcsGeneration, IfAbsent, IfUnchanged, InvalidCondition,
-  LocalVersion, Metadata, NotFound, Object, PreconditionFailed, S3Etag,
-  StreamAborted, Transport, Unconditional,
+  type Storage, type TransferOperation, Backend, Download, GcsGeneration,
+  IfAbsent, IfUnchanged, InvalidCondition, LocalVersion, Metadata, NotFound,
+  Object, PreconditionFailed, S3Etag, StreamAborted, TransferUrl, Transport,
+  Unconditional, Upload,
 }
 import harness3/storage/http_stream
 import harness3/storage/retry
@@ -63,6 +64,9 @@ pub fn new(config: Config) -> Storage {
       stream_put_(config, key, body, condition)
     },
   )
+  |> storage.with_transfer_urls(fn(key, operation, expires_in_seconds) {
+    transfer_url_(config, key, operation, expires_in_seconds)
+  })
 }
 
 type Endpoint {
@@ -123,6 +127,43 @@ fn wire_path(path: String) -> String {
 fn object_path(config: Config, key: String) -> String {
   let Config(bucket:, ..) = config
   "/" <> bucket <> "/" <> key
+}
+
+fn transfer_url_(
+  config: Config,
+  key: String,
+  operation: TransferOperation,
+  expires_in_seconds: Int,
+) -> Result(storage.TransferUrl, Error) {
+  use _ <- result.try(
+    case expires_in_seconds >= 1 && expires_in_seconds <= 604_800 {
+      True -> Ok(Nil)
+      False ->
+        Error(Backend(0, "S3 presigned URL expiry must be 1-604800 seconds"))
+    },
+  )
+  use Endpoint(scheme, host, port) <- result.try(endpoint(config))
+  let method = case operation {
+    Upload -> http.Put
+    Download -> http.Get
+  }
+  let signed =
+    Request(
+      method,
+      [],
+      <<>>,
+      scheme,
+      host,
+      port,
+      object_path(config, key),
+      None,
+    )
+    |> s3_sign.presign(signer(config), _, expires_in_seconds)
+  let signed = Request(..signed, path: wire_path(signed.path))
+  Ok(TransferUrl(
+    signed |> request.to_uri |> uri.to_string,
+    Some(expires_in_seconds),
+  ))
 }
 
 fn send(

@@ -8,7 +8,9 @@ import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 import harness3/storage
+import harness3/storage/gcs
 import harness3/storage/local
 import harness3/storage/s3
 
@@ -85,6 +87,29 @@ pub fn s3_backend_test() {
   }
 }
 
+pub fn gcs_backend_test() {
+  case
+    env("TEST_GCS_ENDPOINT"),
+    env("TEST_GCS_BUCKET"),
+    env("TEST_GCS_ACCESS_KEY_ID"),
+    env("TEST_GCS_SECRET_ACCESS_KEY")
+  {
+    Some(endpoint), Some(bucket), Some(access_key_id), Some(secret_access_key)
+    -> {
+      let backend =
+        gcs.new(gcs.Config(
+          bucket:,
+          access_key_id:,
+          secret_access_key:,
+          endpoint:,
+        ))
+      let key = "harness3-test/" <> int.to_string(unique_integer()) <> "/item"
+      exercise_backend(backend, key)
+    }
+    _, _, _, _ -> Nil
+  }
+}
+
 fn env(name: String) -> Option(String) {
   case decode.run(getenv(charlist.from_string(name)), decode.string) {
     Ok(value) -> Some(value)
@@ -105,6 +130,10 @@ fn exercise_backend(backend: storage.Storage, key: String) {
   let assert Ok(storage.Object(metadata:, body:)) = storage.get(backend, key)
   assert body == <<"first":utf8>>
   assert metadata.version == first_version
+
+  let assert Ok(storage.TransferUrl(url:, ..)) =
+    storage.transfer_url(backend, key, storage.Download, 300)
+  assert string.length(url) > 0
 
   let assert Ok(head) = storage.head(backend, key)
   assert head == metadata

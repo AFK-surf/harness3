@@ -55,6 +55,18 @@ pub type PutCondition {
   IfUnchanged(version: VersionToken)
 }
 
+/// The operation authorized by a backend-native transfer URL.
+pub type TransferOperation {
+  Upload
+  Download
+}
+
+/// A URL for transferring one object directly. Local filesystem URLs do not
+/// expire; cloud backends report the lifetime used when signing the URL.
+pub type TransferUrl {
+  TransferUrl(url: String, expires_in_seconds: Option(Int))
+}
+
 pub type Error {
   NotFound(key: String)
   PreconditionFailed(key: String)
@@ -77,6 +89,8 @@ pub opaque type Storage {
       Result(Metadata, Error),
     stream_put_object: fn(String, BodySource, PutCondition) ->
       Result(Metadata, Error),
+    transfer_url: fn(String, TransferOperation, Int) ->
+      Result(TransferUrl, Error),
   )
 }
 
@@ -99,7 +113,18 @@ pub fn from_functions(
     delete_object,
     stream_get_object,
     stream_put_object,
+    fn(_, _, _) {
+      Error(Backend(0, "storage backend does not support transfer URLs"))
+    },
   )
+}
+
+/// Adds backend-native transfer URL support to a storage implementation.
+pub fn with_transfer_urls(
+  storage: Storage,
+  generate: fn(String, TransferOperation, Int) -> Result(TransferUrl, Error),
+) -> Storage {
+  Storage(..storage, transfer_url: generate)
 }
 
 pub fn get(storage: Storage, key: String) -> Result(Object, Error) {
@@ -153,4 +178,14 @@ pub fn put_stream(
 ) -> Result(Metadata, Error) {
   let Storage(stream_put_object:, ..) = storage
   stream_put_object(key, body, condition)
+}
+
+pub fn transfer_url(
+  storage: Storage,
+  key: String,
+  operation: TransferOperation,
+  expires_in_seconds: Int,
+) -> Result(TransferUrl, Error) {
+  let Storage(transfer_url:, ..) = storage
+  transfer_url(key, operation, expires_in_seconds)
 }

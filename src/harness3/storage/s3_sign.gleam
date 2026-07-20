@@ -103,6 +103,92 @@ pub fn sign(
   Request(..request, headers: [#("authorization", authorization), ..headers])
 }
 
+/// Signs a request using SigV4 query authentication. The returned request can
+/// be converted directly to a presigned URL and uses `UNSIGNED-PAYLOAD`, as
+/// required when the body of a future upload is not yet known.
+pub fn presign(
+  signer: Signer,
+  request: Request(body),
+  expires_in_seconds: Int,
+) -> Request(body) {
+  let Signer(
+    date_time:,
+    access_key_id:,
+    secret_access_key:,
+    region:,
+    service:,
+    session_token:,
+  ) = signer
+  let current_time = case date_time {
+    Some(value) -> value
+    None -> now()
+  }
+  let #(#(year, month, day), #(hour, minute, second)) = current_time
+  let date =
+    string.pad_start(int.to_string(year), 4, "0")
+    <> string.pad_start(int.to_string(month), 2, "0")
+    <> string.pad_start(int.to_string(day), 2, "0")
+  let date_time_text =
+    date
+    <> "T"
+    <> string.pad_start(int.to_string(hour), 2, "0")
+    <> string.pad_start(int.to_string(minute), 2, "0")
+    <> string.pad_start(int.to_string(second), 2, "0")
+    <> "Z"
+  let scope = date <> "/" <> region <> "/" <> service <> "/aws4_request"
+  let host = case request.port {
+    None -> request.host
+    Some(port) -> request.host <> ":" <> int.to_string(port)
+  }
+  let existing_query = case request.query {
+    Some(value) -> uri.parse_query(value) |> result.unwrap([])
+    None -> []
+  }
+  let query = [
+    #("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+    #("X-Amz-Credential", access_key_id <> "/" <> scope),
+    #("X-Amz-Date", date_time_text),
+    #("X-Amz-Expires", int.to_string(expires_in_seconds)),
+    #("X-Amz-SignedHeaders", "host"),
+    ..existing_query
+  ]
+  let query = case session_token {
+    Some(token) -> [#("X-Amz-Security-Token", token), ..query]
+    None -> query
+  }
+  let canonical_query = encode_query(query)
+  let canonical_request =
+    string.uppercase(http.method_to_string(request.method))
+    <> "\n"
+    <> canonical_path(request.path)
+    <> "\n"
+    <> canonical_query
+    <> "\nhost:"
+    <> host
+    <> "\n\nhost\nUNSIGNED-PAYLOAD"
+  let to_sign =
+    "AWS4-HMAC-SHA256\n"
+    <> date_time_text
+    <> "\n"
+    <> scope
+    <> "\n"
+    <> sha256_hex(bit_array.from_string(canonical_request))
+  let key =
+    <<"AWS4":utf8, secret_access_key:utf8>>
+    |> crypto.hmac(<<date:utf8>>, crypto.Sha256, _)
+    |> crypto.hmac(<<region:utf8>>, crypto.Sha256, _)
+    |> crypto.hmac(<<service:utf8>>, crypto.Sha256, _)
+    |> crypto.hmac(<<"aws4_request":utf8>>, crypto.Sha256, _)
+  let signature =
+    crypto.hmac(bit_array.from_string(to_sign), crypto.Sha256, key)
+    |> bit_array.base16_encode
+    |> string.lowercase
+  Request(
+    ..request,
+    query: Some(canonical_query <> "&X-Amz-Signature=" <> signature),
+  )
+}
+
 fn add_session_token(headers, token) {
   case token {
     None -> headers
@@ -132,9 +218,11 @@ fn canonical_query(query: Option(String)) -> String {
   // nor uri.percent_encode (passes through sub-delims like `!$'()*+`)
   // matches what the service computes for such values. Callers that ever set
   // a query must also build the wire query with this same encoding.
+  query |> uri.parse_query |> result.unwrap([]) |> encode_query
+}
+
+fn encode_query(query: List(#(String, String))) -> String {
   query
-  |> uri.parse_query
-  |> result.unwrap([])
   |> list.map(fn(pair) { #(sigv4_encode(pair.0), sigv4_encode(pair.1)) })
   |> list.sort(fn(a, b) { string.compare(a.0, b.0) })
   |> list.map(fn(pair) { pair.0 <> "=" <> pair.1 })

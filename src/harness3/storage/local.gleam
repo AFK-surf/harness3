@@ -10,11 +10,12 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
+import gleam/uri
 import harness3/storage.{
   type Error, type Metadata, type Object, type PutCondition, type Storage,
-  Backend, GcsGeneration, IfAbsent, IfUnchanged, InvalidCondition, InvalidKey,
-  LocalVersion, Metadata, NotFound, Object, PreconditionFailed, S3Etag,
-  StreamAborted, Unconditional,
+  type TransferOperation, Backend, GcsGeneration, IfAbsent, IfUnchanged,
+  InvalidCondition, InvalidKey, LocalVersion, Metadata, NotFound, Object,
+  PreconditionFailed, S3Etag, StreamAborted, TransferUrl, Unconditional,
 }
 import simplifile
 
@@ -38,6 +39,9 @@ pub fn new(config: Config) -> Storage {
       stream_put_(config, key, body, condition)
     },
   )
+  |> storage.with_transfer_urls(fn(key, operation, expires_in_seconds) {
+    transfer_url_(config, key, operation, expires_in_seconds)
+  })
 }
 
 type WriteOption {
@@ -297,6 +301,21 @@ fn path_for(config: Config, key: String) -> Result(String, Error) {
     True -> Error(InvalidKey(key))
     False -> Ok(join_path(root(config), key))
   }
+}
+
+fn transfer_url_(
+  config: Config,
+  key: String,
+  _operation: TransferOperation,
+  _expires_in_seconds: Int,
+) -> Result(storage.TransferUrl, Error) {
+  use path <- result.try(path_for(config, key))
+  let encoded_path =
+    path
+    |> string.split("/")
+    |> list.map(uri.percent_encode)
+    |> string.join("/")
+  Ok(TransferUrl("file://" <> encoded_path, None))
 }
 
 fn mtime_seconds(path: String) -> Int {

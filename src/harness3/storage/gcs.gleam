@@ -1,34 +1,51 @@
 import exception
 import gleam/bit_array
-import gleam/dynamic/decode
+import gleam/crypto
 import gleam/http
-import gleam/http/request.{type Request}
+import gleam/http/request.{type Request, Request}
 import gleam/http/response.{type Response, Response}
 import gleam/httpc
 import gleam/int
-import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
-import gleam/uri
+import gleam/uri.{Uri}
 import harness3/storage.{
   type BodySource, type Error, type Metadata, type Object, type PutCondition,
-  type Storage, Backend, GcsGeneration, IfAbsent, IfUnchanged, InvalidCondition,
-  LocalVersion, Metadata, NotFound, Object, PreconditionFailed, S3Etag,
-  StreamAborted, Transport, Unconditional,
+  type Storage, type TransferOperation, Backend, Download, GcsGeneration,
+  IfAbsent, IfUnchanged, InvalidCondition, LocalVersion, Metadata, NotFound,
+  Object, PreconditionFailed, S3Etag, StreamAborted, TransferUrl, Transport,
+  Unconditional, Upload,
 }
+import harness3/storage/gcs_sign
+import harness3/storage/gcs_xml
 import harness3/storage/http_stream
 import harness3/storage/retry
 import harness3/storage/timestamp
 
 pub type Config {
-  Config(bucket: String, access_token: String, endpoint: String)
+  Config(
+    bucket: String,
+    access_key_id: String,
+    secret_access_key: String,
+    endpoint: String,
+  )
 }
 
-/// Creates a configuration for the GCS JSON API using an OAuth access token.
-pub fn config(bucket: String, access_token: String) -> Config {
-  Config(bucket, access_token, "https://storage.googleapis.com")
+/// Creates a configuration for the GCS XML API using an interoperable HMAC
+/// access ID and secret.
+pub fn config(
+  bucket: String,
+  access_key_id: String,
+  secret_access_key: String,
+) -> Config {
+  Config(
+    bucket,
+    access_key_id,
+    secret_access_key,
+    "https://storage.googleapis.com",
+  )
 }
 
 pub fn new(config: Config) -> Storage {
@@ -43,99 +60,95 @@ pub fn new(config: Config) -> Storage {
       stream_put_(config, key, body, condition)
     },
   )
+  |> storage.with_transfer_urls(fn(key, operation, expires_in_seconds) {
+    transfer_url_(config, key, operation, expires_in_seconds)
+  })
 }
 
-type GcsObject {
-  GcsObject(name: String, size: String, updated: String, generation: String)
+type Endpoint {
+  Endpoint(http.Scheme, String, Option(Int))
 }
 
-type GcsPage {
-  GcsPage(items: List(GcsObject), next_page_token: Option(String))
-}
-
-fn object_decoder() -> decode.Decoder(GcsObject) {
-  use name <- decode.field("name", decode.string)
-  use size <- decode.field("size", decode.string)
-  use updated <- decode.field("updated", decode.string)
-  use generation <- decode.field("generation", decode.string)
-  decode.success(GcsObject(name, size, updated, generation))
-}
-
-fn page_decoder() -> decode.Decoder(GcsPage) {
-  use items <- decode.optional_field(
-    "items",
-    [],
-    decode.list(of: object_decoder()),
-  )
-  use next_page_token <- decode.optional_field(
-    "nextPageToken",
-    None,
-    decode.optional(decode.string),
-  )
-  decode.success(GcsPage(items, next_page_token))
-}
-
-fn base_url(config: Config) -> String {
-  let Config(endpoint:, ..) = config
-  case string.ends_with(endpoint, "/") {
-    True -> string.drop_end(endpoint, 1)
-    False -> endpoint
+fn endpoint(config: Config) -> Result(Endpoint, Error) {
+  let Config(endpoint: endpoint_url, ..) = config
+  case uri.parse(endpoint_url) {
+    Ok(Uri(scheme: Some(scheme), host: Some(host), port:, path:, ..))
+      if path == "" || path == "/"
+    ->
+      case http.scheme_from_string(scheme) {
+        Ok(scheme) -> Ok(Endpoint(scheme, host, port))
+        Error(_) -> Error(Backend(0, "GCS endpoint must use http or https"))
+      }
+    _ -> Error(Backend(0, "invalid GCS endpoint"))
   }
 }
 
-fn object_url(config: Config, key: String) -> String {
-  let Config(bucket:, ..) = config
-  base_url(config)
-  <> "/storage/v1/b/"
-  <> uri.percent_encode(bucket)
-  <> "/o/"
-  <> uri.percent_encode(key)
+fn signer(config: Config) -> gcs_sign.Signer {
+  let Config(access_key_id:, secret_access_key:, ..) = config
+  gcs_sign.signer(access_key_id, secret_access_key)
 }
 
-fn list_url(config: Config) -> String {
+fn object_path(config: Config, key: String) -> String {
   let Config(bucket:, ..) = config
-  base_url(config) <> "/storage/v1/b/" <> uri.percent_encode(bucket) <> "/o"
+  "/" <> bucket <> "/" <> key
 }
 
-fn upload_url(config: Config) -> String {
+fn bucket_path(config: Config) -> String {
   let Config(bucket:, ..) = config
-  base_url(config)
-  <> "/upload/storage/v1/b/"
-  <> uri.percent_encode(bucket)
-  <> "/o"
+  "/" <> bucket
+}
+
+fn wire_path(path: String) -> String {
+  gcs_sign.encode_path(path)
+}
+
+fn query_string(query: List(#(String, String))) -> Option(String) {
+  case query {
+    [] -> None
+    query -> Some(gcs_sign.encode_query(query))
+  }
+}
+
+fn request_(
+  config: Config,
+  method: http.Method,
+  path: String,
+  query: List(#(String, String)),
+  headers: List(#(String, String)),
+  body: BitArray,
+) -> Result(Request(BitArray), Error) {
+  use Endpoint(scheme, host, port) <- result.try(endpoint(config))
+  let payload_hash =
+    crypto.hash(crypto.Sha256, body)
+    |> bit_array.base16_encode
+    |> string.lowercase
+  let signed =
+    Request(
+      method,
+      [#("content-type", "application/octet-stream"), ..headers],
+      body,
+      scheme,
+      host,
+      port,
+      path,
+      query_string(query),
+    )
+    |> gcs_sign.sign(signer(config), _, payload_hash)
+  Ok(Request(..signed, path: wire_path(path)))
 }
 
 fn send(
-  config: Config,
-  method: http.Method,
-  url: String,
-  query: List(#(String, String)),
-  body: BitArray,
+  make_request: fn() -> Result(Request(BitArray), Error),
 ) -> Result(Response(BitArray), Error) {
-  retry.http(fn() { send_once(config, method, url, query, body) })
+  retry.http(fn() {
+    use request <- result.try(make_request())
+    httpc.send_bits(request)
+    |> result.map_error(fn(error) { Transport(string.inspect(error)) })
+  })
 }
 
-fn send_once(
-  config: Config,
-  method: http.Method,
-  url: String,
-  query: List(#(String, String)),
-  body: BitArray,
-) -> Result(Response(BitArray), Error) {
-  let Config(access_token:, ..) = config
-  use req <- result.try(
-    request.to(url)
-    |> result.map_error(fn(_) { Backend(0, "invalid GCS endpoint") }),
-  )
-  let req =
-    req
-    |> request.set_method(method)
-    |> request.set_query(query)
-    |> request.set_header("authorization", "Bearer " <> access_token)
-    |> request.set_header("content-type", "application/octet-stream")
-    |> request.set_body(body)
-  httpc.send_bits(req)
-  |> result.map_error(fn(error) { Transport(string.inspect(error)) })
+fn response_header(response: Response(body), name: String) -> String {
+  response.headers |> list.key_find(name) |> result.unwrap("")
 }
 
 fn body_message(body: BitArray) -> String {
@@ -150,78 +163,60 @@ fn status_error(response: Response(BitArray), key: String) -> Error {
   }
 }
 
-fn decoded_metadata(object: GcsObject) -> Result(Metadata, Error) {
-  let GcsObject(name:, size:, updated:, generation:) = object
-  case int.parse(size) {
-    Ok(size) ->
-      Ok(Metadata(
-        name,
-        size,
-        timestamp.rfc3339_seconds(updated),
-        GcsGeneration(generation),
-      ))
-    Error(_) -> Error(Backend(200, "GCS returned a non-integer object size"))
-  }
-}
-
-fn decode_object(body: BitArray) -> Result(Metadata, Error) {
-  use object <- result.try(
-    json.parse_bits(body, object_decoder())
-    |> result.map_error(fn(error) { Backend(200, string.inspect(error)) }),
+fn response_metadata(
+  response: Response(body),
+  key: String,
+  fallback_size: Int,
+) -> Metadata {
+  Metadata(
+    key:,
+    size: response_header(response, "content-length")
+      |> int.parse
+      |> result.unwrap(fallback_size),
+    modified_at_seconds: timestamp.http_date_seconds(response_header(
+      response,
+      "last-modified",
+    )),
+    version: GcsGeneration(response_header(response, "x-goog-generation")),
   )
-  decoded_metadata(object)
 }
 
 fn get_(config: Config, key: String) -> Result(Object, Error) {
   use response <- result.try(
-    send(config, http.Get, object_url(config, key), [#("alt", "media")], <<>>),
+    send(fn() {
+      request_(config, http.Get, object_path(config, key), [], [], <<>>)
+    }),
   )
   case response.status {
     200 ->
-      // Metadata comes from the media response itself so the version token is
-      // atomically bound to this body; a follow-up metadata request could
-      // observe a newer generation and let a later IfUnchanged CAS overwrite
-      // a concurrent write. With `modified_at_seconds` normalized to epoch
-      // seconds, these headers agree with the JSON resource used by `head`
-      // and `list`.
       Ok(Object(
-        Metadata(
-          key:,
-          size: bit_array.byte_size(response.body),
-          modified_at_seconds: timestamp.http_date_seconds(response_header(
-            response,
-            "last-modified",
-          )),
-          version: GcsGeneration(response_header(response, "x-goog-generation")),
-        ),
+        response_metadata(response, key, bit_array.byte_size(response.body)),
         response.body,
       ))
     _ -> Error(status_error(response, key))
   }
 }
 
-fn response_header(response: Response(body), name: String) -> String {
-  response.headers |> list.key_find(name) |> result.unwrap("")
-}
-
 fn head_(config: Config, key: String) -> Result(Metadata, Error) {
   use response <- result.try(
-    send(config, http.Get, object_url(config, key), [], <<>>),
+    send(fn() {
+      request_(config, http.Head, object_path(config, key), [], [], <<>>)
+    }),
   )
   case response.status {
-    200 -> decode_object(response.body)
+    200 -> Ok(response_metadata(response, key, 0))
     _ -> Error(status_error(response, key))
   }
 }
 
-fn condition_query(
+fn condition_headers(
   condition: PutCondition,
 ) -> Result(List(#(String, String)), Error) {
   case condition {
     Unconditional -> Ok([])
-    IfAbsent -> Ok([#("ifGenerationMatch", "0")])
+    IfAbsent -> Ok([#("x-goog-if-generation-match", "0")])
     IfUnchanged(GcsGeneration(generation)) ->
-      Ok([#("ifGenerationMatch", generation)])
+      Ok([#("x-goog-if-generation-match", generation)])
     IfUnchanged(S3Etag(_)) -> Error(InvalidCondition("gcs", "s3"))
     IfUnchanged(LocalVersion(_, _)) -> Error(InvalidCondition("gcs", "local"))
   }
@@ -233,17 +228,14 @@ fn put_(
   body: BitArray,
   condition: PutCondition,
 ) -> Result(Metadata, Error) {
-  use condition <- result.try(condition_query(condition))
-  let query = [#("uploadType", "media"), #("name", key), ..condition]
-  use response <- result.try(send(
-    config,
-    http.Post,
-    upload_url(config),
-    query,
-    body,
-  ))
+  use headers <- result.try(condition_headers(condition))
+  use response <- result.try(
+    send(fn() {
+      request_(config, http.Put, object_path(config, key), [], headers, body)
+    }),
+  )
   case response.status {
-    200 -> decode_object(response.body)
+    200 -> Ok(response_metadata(response, key, bit_array.byte_size(body)))
     _ -> Error(status_error(response, key))
   }
 }
@@ -255,28 +247,43 @@ fn list_(config: Config, prefix: String) -> Result(List(Metadata), Error) {
 fn list_pages(
   config: Config,
   prefix: String,
-  page_token: Option(String),
+  start_after: Option(String),
   accumulator: List(Metadata),
 ) -> Result(List(Metadata), Error) {
-  let query = add_optional_query([#("prefix", prefix)], "pageToken", page_token)
+  let query =
+    [#("list-type", "2"), #("prefix", prefix)]
+    |> add_optional_query("start-after", start_after)
   use response <- result.try(
-    send(config, http.Get, list_url(config), query, <<>>),
+    send(fn() {
+      request_(config, http.Get, bucket_path(config), query, [], <<>>)
+    }),
   )
-  case response.status {
-    200 -> {
-      use page <- result.try(
-        json.parse_bits(response.body, page_decoder())
-        |> result.map_error(fn(error) { Backend(200, string.inspect(error)) }),
-      )
-      let GcsPage(items:, next_page_token:) = page
-      use metadata <- result.try(list.try_map(items, decoded_metadata))
-      let accumulator = list.append(accumulator, metadata)
-      case next_page_token {
-        Some(token) -> list_pages(config, prefix, Some(token), accumulator)
-        None -> Ok(accumulator)
-      }
-    }
+  use page <- result.try(case response.status {
+    200 ->
+      gcs_xml.decode_page(response.body)
+      |> result.map_error(fn(error) { Backend(200, error) })
     _ -> Error(status_error(response, prefix))
+  })
+  let gcs_xml.Page(is_truncated:, objects:) = page
+  let objects = list.reverse(objects)
+  let metadata =
+    list.map(objects, fn(object) {
+      let gcs_xml.ListedObject(key:, generation:, last_modified:, size:) =
+        object
+      Metadata(
+        key,
+        size,
+        timestamp.rfc3339_seconds(last_modified),
+        GcsGeneration(generation),
+      )
+    })
+  let accumulator = list.append(accumulator, metadata)
+  case is_truncated, list.last(objects) {
+    True, Ok(gcs_xml.ListedObject(key:, ..)) ->
+      list_pages(config, prefix, Some(key), accumulator)
+    True, Error(_) ->
+      Error(Backend(200, "truncated GCS listing had no continuation key"))
+    False, _ -> Ok(accumulator)
   }
 }
 
@@ -293,7 +300,9 @@ fn add_optional_query(
 
 fn delete_(config: Config, key: String) -> Result(Nil, Error) {
   use response <- result.try(
-    send(config, http.Delete, object_url(config, key), [], <<>>),
+    send(fn() {
+      request_(config, http.Delete, object_path(config, key), [], [], <<>>)
+    }),
   )
   case response.status {
     204 | 404 -> Ok(Nil)
@@ -304,24 +313,28 @@ fn delete_(config: Config, key: String) -> Result(Nil, Error) {
 fn streaming_request(
   config: Config,
   method: http.Method,
-  url: String,
-  query: List(#(String, String)),
+  path: String,
+  headers: List(#(String, String)),
   size: Int,
 ) -> Result(Request(Nil), Error) {
-  let Config(access_token:, ..) = config
-  use request <- result.try(
-    request.to(url)
-    |> result.map_error(fn(_) { Backend(0, "invalid GCS endpoint") }),
-  )
-  Ok(
-    request
-    |> request.set_method(method)
-    |> request.set_query(query)
-    |> request.set_header("authorization", "Bearer " <> access_token)
-    |> request.set_header("content-type", "application/octet-stream")
-    |> request.set_header("content-length", int.to_string(size))
-    |> request.set_body(Nil),
-  )
+  use Endpoint(scheme, host, port) <- result.try(endpoint(config))
+  let signed =
+    Request(
+      method,
+      [
+        #("content-length", int.to_string(size)),
+        #("content-type", "application/octet-stream"),
+        ..headers
+      ],
+      Nil,
+      scheme,
+      host,
+      port,
+      path,
+      None,
+    )
+    |> gcs_sign.sign(signer(config), _, "UNSIGNED-PAYLOAD")
+  Ok(Request(..signed, path: wire_path(path)))
 }
 
 fn stream_get_(
@@ -331,13 +344,7 @@ fn stream_get_(
 ) -> Result(Metadata, Error) {
   use response <- result.try(
     http_stream.open_download(fn() {
-      streaming_request(
-        config,
-        http.Get,
-        object_url(config, key),
-        [#("alt", "media")],
-        0,
-      )
+      streaming_request(config, http.Get, object_path(config, key), [], 0)
     }),
   )
   let http_stream.StreamingResponse(connection:, ..) = response
@@ -346,17 +353,7 @@ fn stream_get_(
   case status {
     200 -> {
       use _ <- result.try(http_stream.consume(response, consume))
-      Ok(Metadata(
-        key:,
-        size: http_stream.header(headers, "content-length")
-          |> int.parse
-          |> result.unwrap(0),
-        modified_at_seconds: timestamp.http_date_seconds(http_stream.header(
-          headers,
-          "last-modified",
-        )),
-        version: GcsGeneration(http_stream.header(headers, "x-goog-generation")),
-      ))
+      Ok(metadata_from_headers(headers, key, 0))
     }
     _ -> {
       use body <- result.try(http_stream.collect(response))
@@ -375,20 +372,25 @@ fn stream_put_(
   case size < 0 {
     True -> Error(StreamAborted("stream size cannot be negative"))
     False -> {
-      use condition <- result.try(condition_query(condition))
-      let query = [#("uploadType", "media"), #("name", key), ..condition]
+      use headers <- result.try(condition_headers(condition))
       use connection <- result.try(
         http_stream.connect_retry(fn() {
-          streaming_request(config, http.Post, upload_url(config), query, size)
+          streaming_request(
+            config,
+            http.Put,
+            object_path(config, key),
+            headers,
+            size,
+          )
         }),
       )
       use <- exception.defer(fn() { http_stream.close(connection) })
       use _ <- result.try(send_source(connection, body, size, 0))
       use response <- result.try(http_stream.finish(connection))
-      let http_stream.StreamingResponse(status:, ..) = response
+      let http_stream.StreamingResponse(status:, headers:, ..) = response
       use response_body <- result.try(http_stream.collect(response))
       case status {
-        200 -> decode_object(response_body)
+        200 -> Ok(metadata_from_headers(headers, key, size))
         _ -> Error(status_error(Response(status, [], response_body), key))
       }
     }
@@ -425,4 +427,59 @@ fn send_source(
       }
     }
   }
+}
+
+fn metadata_from_headers(
+  headers: List(#(String, String)),
+  key: String,
+  fallback_size: Int,
+) -> Metadata {
+  Metadata(
+    key:,
+    size: http_stream.header(headers, "content-length")
+      |> int.parse
+      |> result.unwrap(fallback_size),
+    modified_at_seconds: timestamp.http_date_seconds(http_stream.header(
+      headers,
+      "last-modified",
+    )),
+    version: GcsGeneration(http_stream.header(headers, "x-goog-generation")),
+  )
+}
+
+fn transfer_url_(
+  config: Config,
+  key: String,
+  operation: TransferOperation,
+  expires_in_seconds: Int,
+) -> Result(storage.TransferUrl, Error) {
+  use _ <- result.try(
+    case expires_in_seconds >= 1 && expires_in_seconds <= 604_800 {
+      True -> Ok(Nil)
+      False ->
+        Error(Backend(0, "GCS signed URL expiry must be 1-604800 seconds"))
+    },
+  )
+  use Endpoint(scheme, host, port) <- result.try(endpoint(config))
+  let method = case operation {
+    Upload -> http.Put
+    Download -> http.Get
+  }
+  let signed =
+    Request(
+      method,
+      [],
+      <<>>,
+      scheme,
+      host,
+      port,
+      object_path(config, key),
+      None,
+    )
+    |> gcs_sign.presign(signer(config), _, expires_in_seconds)
+  let signed = Request(..signed, path: wire_path(signed.path))
+  Ok(TransferUrl(
+    signed |> request.to_uri |> uri.to_string,
+    Some(expires_in_seconds),
+  ))
 }
