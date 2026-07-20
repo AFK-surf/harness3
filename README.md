@@ -1,8 +1,8 @@
 # harness3
 harness/3 - a tiny distributed multi-agent harness
 
-The runnable coding-agent service and multi-agent web UI live in
-[`harness3-server`](./harness3-server/README.md).
+The runnable coding-agent service and its React/TypeScript multi-agent web UI
+live in [`harness3-server`](./harness3-server/README.md).
 
 The reusable MCP plugin lives under `src/harness3/plugin/mcp/`. It provides a
 validated configuration format, CAS-backed catalog, MCP 2025-11-25 protocol

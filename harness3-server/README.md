@@ -5,10 +5,14 @@ configuration as Pi, exposes a JSON API, and serves a multi-agent web UI.
 
 ## Run
 
-Pi models are loaded from `~/.pi/agent/models.json` by default. From this
-directory:
+Pi models are loaded from `~/.pi/agent/models.json` by default. Build the web
+UI, then run the server from this directory:
 
 ```sh
+cd web
+npm ci
+npm run build
+cd ..
 gleam run
 ```
 
@@ -183,6 +187,30 @@ handover compaction. It is available after that agent has session messages,
 shows pending and retry states, and first sends the idempotent cluster wake RPC
 before sending the host-routed compaction RPC. An inactive team is therefore
 woken automatically, while an already-active team is left running in place.
+
+## Web UI development
+
+The UI source is a lightweight React and TypeScript application under `web/`,
+built with Vite. It has no separate production runtime: `npm run build` writes
+fixed `app.js`, `styles.css`, and `index.html` assets to `priv/static/` for the
+Gleam server to serve. These generated files are intentionally ignored; build
+or packaging workflows must generate them before compiling or releasing the
+server. Node.js is not needed after the assets have been built.
+
+Vite requires Node.js 20.19 or newer. For local development:
+
+```sh
+cd web
+npm ci
+npm run dev
+```
+
+The development server proxies `/api` to harness3-server on
+`http://127.0.0.1:8080`. Type-check and generate the production assets with:
+
+```sh
+npm run build
+```
 
 ## Test
 

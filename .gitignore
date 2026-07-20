@@ -3,3 +3,4 @@
 build/
 erl_crash.dump
 .claude/settings.local.json
+/harness3-server/priv/static/

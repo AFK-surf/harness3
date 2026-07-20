@@ -23,7 +23,7 @@
 
 * { box-sizing: border-box; }
 
-html, body { margin: 0; min-height: 100%; background: var(--bg); }
+html, body, #root { margin: 0; min-height: 100%; background: var(--bg); }
 
 body {
   min-width: 320px;

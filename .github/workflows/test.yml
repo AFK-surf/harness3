@@ -21,3 +21,18 @@ jobs:
       - run: gleam deps download
       - run: gleam test
       - run: gleam format --check src test
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: harness3-server/web/package-lock.json
+      - run: npm ci
+        working-directory: harness3-server/web
+      - run: npm run build
+        working-directory: harness3-server/web
+      - run: gleam deps download
+        working-directory: harness3-server
+      - run: gleam test
+        working-directory: harness3-server
+      - run: gleam format --check src test
+        working-directory: harness3-server
