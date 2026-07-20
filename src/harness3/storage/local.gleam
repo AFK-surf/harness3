@@ -94,6 +94,17 @@ fn file_delete(path: String) -> FileStatus
 @external(erlang, "filelib", "ensure_dir")
 fn ensure_dir(path: String) -> FileStatus
 
+// `file:change_time` fails with enoent on a missing file — unlike a touch,
+// it can never (re)create one. The heartbeat depends on that property.
+@external(erlang, "file", "change_time")
+fn change_mtime(
+  path: String,
+  mtime: #(#(Int, Int, Int), #(Int, Int, Int)),
+) -> FileStatus
+
+@external(erlang, "erlang", "localtime")
+fn localtime() -> #(#(Int, Int, Int), #(Int, Int, Int))
+
 // `filelib:is_regular`, not `filelib:is_file`: the latter is true for
 // directories, so with keys `docs/x` and `docs` the directory created for the
 // former would read as an existing object named `docs` — false `IfAbsent`
@@ -267,19 +278,20 @@ fn heartbeat_loop(
       release_owned_lock(path, token)
     }
     Error(_) -> {
-      // Touch only a lock that still carries this holder's token. A blind
-      // touch inside a breaker's rename-aside window recreates the path as
-      // an *empty* file: the breaker's hard-link restore then refuses to
-      // clobber it, orphaning the token — every commit of the legitimate
-      // holder fails verification and an ownerless lock blocks all waiters
-      // until it goes stale. A missing or foreign lock means this holder has
-      // (at least momentarily) lost it; verification at the commit sites
-      // decides the outcome, not the heartbeat.
+      // Refresh the mtime only of a lock still carrying this holder's
+      // token, and via `file:change_time`, which fails on a missing file
+      // instead of creating one. A touch that recreates the path inside a
+      // breaker's rename-aside window would leave an empty, ownerless lock
+      // that blocks all waiters until it goes stale; with change_time the
+      // worst outcome of losing the read-refresh race is refreshing a
+      // successor's lock, which is harmless. A missing or foreign lock means
+      // this holder has (at least momentarily) lost it; verification at the
+      // commit sites decides the outcome, not the heartbeat.
       case file_read(path) {
         Ok(content) ->
           case content == bit_array.from_string(token) {
             True -> {
-              let _ = simplifile.touch(at: path)
+              let _ = change_mtime(path, localtime())
               Nil
             }
             False -> Nil
@@ -459,12 +471,19 @@ fn generation_for(
   config: Config,
   key: String,
   mtime: Int,
+  token: String,
 ) -> Result(Int, Error) {
   let #(stored_mtime, stored_generation) = read_generation(config, key)
   case stored_mtime == mtime && stored_generation > 0 {
     True -> Ok(stored_generation)
     False -> {
+      // Minting is a destructive write even when reached from a read (`get`,
+      // `head`, `list` refresh mismatched records, e.g. a crash sentinel): a
+      // stalled holder writing after losing the lock would roll the per-key
+      // counter back below what the new holder minted, resurrecting a
+      // retired version token.
       let generation = stored_generation + 1
+      use _ <- result.try(verify_lock(config, token))
       use _ <- result.try(write_generation(config, key, mtime, generation))
       Ok(generation)
     }
@@ -475,12 +494,13 @@ fn metadata_locked(
   config: Config,
   key: String,
   path: String,
+  token: String,
 ) -> Result(Metadata, Error) {
   case is_file(path) {
     False -> Error(NotFound(key))
     True -> {
       let mtime = mtime_seconds(path)
-      use generation <- result.try(generation_for(config, key, mtime))
+      use generation <- result.try(generation_for(config, key, mtime, token))
       Ok(Metadata(
         key:,
         size: file_size(path),
@@ -504,8 +524,8 @@ fn status_result(status: FileStatus) -> Result(Nil, Error) {
 
 fn get_(config: Config, key: String) -> Result(Object, Error) {
   use path <- result.try(path_for(config, key))
-  with_lock(config, fn(_token) {
-    use metadata <- result.try(metadata_locked(config, key, path))
+  with_lock(config, fn(token) {
+    use metadata <- result.try(metadata_locked(config, key, path, token))
     file_read(path)
     |> result.map(fn(body) { Object(metadata, body) })
     |> result.map_error(dynamic_error)
@@ -514,7 +534,7 @@ fn get_(config: Config, key: String) -> Result(Object, Error) {
 
 fn head_(config: Config, key: String) -> Result(Metadata, Error) {
   use path <- result.try(path_for(config, key))
-  with_lock(config, fn(_token) { metadata_locked(config, key, path) })
+  with_lock(config, fn(token) { metadata_locked(config, key, path, token) })
 }
 
 fn check_condition(
@@ -522,6 +542,7 @@ fn check_condition(
   condition: PutCondition,
   key: String,
   path: String,
+  token: String,
 ) -> Result(Nil, Error) {
   case condition {
     Unconditional -> Ok(Nil)
@@ -531,7 +552,7 @@ fn check_condition(
         False -> Ok(Nil)
       }
     IfUnchanged(LocalVersion(expected_mtime, expected_generation)) ->
-      case metadata_locked(config, key, path) {
+      case metadata_locked(config, key, path, token) {
         Ok(Metadata(version: LocalVersion(actual_mtime, actual_generation), ..))
           if expected_mtime == actual_mtime
           && expected_generation == actual_generation
@@ -552,7 +573,7 @@ fn put_(
 ) -> Result(Metadata, Error) {
   use path <- result.try(path_for(config, key))
   with_lock(config, fn(token) {
-    use _ <- result.try(check_condition(config, condition, key, path))
+    use _ <- result.try(check_condition(config, condition, key, path, token))
     let #(_, stored_generation) = read_generation(config, key)
     let generation = stored_generation + 1
     // The generation record is itself a destructive commit: writing it after
@@ -586,6 +607,9 @@ fn put_(
       }
       Ok(Nil) -> {
         let mtime = mtime_seconds(path)
+        // The final metadata write is destructive too: after a lost lock it
+        // would replace the new holder's record, so it gets its own verify.
+        use _ <- result.try(verify_lock(config, token))
         use _ <- result.try(write_generation(config, key, mtime, generation))
         Ok(Metadata(
           key:,
@@ -604,7 +628,7 @@ fn list_(config: Config, prefix: String) -> Result(List(Metadata), Error) {
     "/" -> "/"
     _ -> base <> "/"
   }
-  with_lock(config, fn(_token) {
+  with_lock(config, fn(token) {
     let paths = case is_dir(base) {
       False -> []
       True ->
@@ -630,7 +654,7 @@ fn list_(config: Config, prefix: String) -> Result(List(Metadata), Error) {
       paths
       |> list.try_map(fn(path) {
         let key = string.drop_start(path, string.length(base_prefix))
-        metadata_locked(config, key, path)
+        metadata_locked(config, key, path, token)
       }),
     )
     Ok(
@@ -680,8 +704,8 @@ fn stream_get_(
 ) -> Result(Metadata, Error) {
   use path <- result.try(path_for(config, key))
   use opened <- result.try(
-    with_lock(config, fn(_token) {
-      use metadata <- result.try(metadata_locked(config, key, path))
+    with_lock(config, fn(token) {
+      use metadata <- result.try(metadata_locked(config, key, path, token))
       use file <- result.try(
         file_open(path, [Read, Raw, Binary]) |> result.map_error(dynamic_error),
       )
@@ -750,7 +774,13 @@ fn stream_put_(
         Ok(Nil) -> {
           let committed =
             with_lock(config, fn(token) {
-              use _ <- result.try(check_condition(config, condition, key, path))
+              use _ <- result.try(check_condition(
+                config,
+                condition,
+                key,
+                path,
+                token,
+              ))
               let #(_, stored_generation) = read_generation(config, key)
               let generation = stored_generation + 1
               // As in `put_`: the generation write is destructive and must
@@ -766,6 +796,9 @@ fn stream_put_(
                 }
                 Ok(Nil) -> {
                   let mtime = mtime_seconds(path)
+                  // As in `put_`: the final metadata write gets its own
+                  // verify.
+                  use _ <- result.try(verify_lock(config, token))
                   use _ <- result.try(write_generation(
                     config,
                     key,
