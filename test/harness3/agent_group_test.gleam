@@ -1160,6 +1160,67 @@ pub fn resume_registered_deduplicates_and_loads_dormant_profiles_test() {
   remove_directory(root)
 }
 
+pub fn resume_registered_tolerates_missing_terminal_profiles_test() {
+  let root = temporary_root("resume-missing-profile-test")
+  let backend = local.new(local.config(root))
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let installed =
+    agent_profile.AgentProfile(
+      "missing-test-installed",
+      registry,
+      completing_transport("revived"),
+      None,
+      None,
+      observe,
+    )
+  let revivable =
+    agent.State(
+      ..agent.state("a", "model"),
+      profile_id: "missing-test-installed",
+      status: agent.Completed,
+    )
+  let orphaned =
+    agent.State(
+      ..agent.state("b", "model"),
+      profile_id: "missing-test-gone",
+      status: agent.Completed,
+    )
+  let config =
+    agent_group.Config(
+      backend,
+      "groups/missing-profile",
+      [installed],
+      10,
+      60_000,
+    )
+  let assert Ok(_) =
+    agent_group.create(
+      config,
+      agent_group.new("missing-profile", "catalog", [revivable, orphaned]),
+    )
+
+  // A terminal agent whose profile is not installed must not block resuming.
+  let assert Ok(loaded) =
+    agent_group.resume_registered(backend, "groups/missing-profile", 10)
+  let assert Ok(group) = agent_group.wake(loaded)
+
+  // Messaging the orphaned agent fails only when actually attempted…
+  let assert Error(agent_group.MissingProfile("missing-test-gone")) =
+    agent_group.send_message(group, "b", "hello")
+  // …while the dormant agent with an installed profile can still be revived.
+  let assert Ok(Nil) = agent_group.send_message(group, "a", "wake up")
+  process.sleep(100)
+  let assert Ok(snapshot) = agent_group.snapshot(group)
+  let assert Ok(revived) =
+    list.find(snapshot.agents, fn(state) { state.id == "a" })
+  assert revived.status == agent.Completed && revived.round == 1
+  let assert Ok(Nil) = agent_group.stop(group)
+  remove_directory(root)
+}
+
 pub fn ambiguous_running_index_write_is_confirmed_test() {
   let root = temporary_root("ambiguous-index-test")
   let backend = local.new(local.config(root)) |> ambiguous_index_storage

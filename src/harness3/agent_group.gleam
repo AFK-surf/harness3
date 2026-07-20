@@ -194,14 +194,32 @@ pub fn resume_registered(
     |> result.map_error(StorageFailed),
   )
   use group <- result.try(decode_group_body(object.body))
-  let profile_ids =
+  let ready_ids =
     group.agents
+    |> list.filter(fn(state) { state.status == agent.Ready })
     |> list.map(fn(state) { state.profile_id })
     |> list.unique
-  use profiles <- result.try(
-    agent_profile.profiles(profile_ids)
+  use ready_profiles <- result.try(
+    agent_profile.profiles(ready_ids)
     |> result.map_error(fn(error) { ProfileUnavailable(string.inspect(error)) }),
   )
+  // Profiles for dormant agents are picked up when installed so that messages
+  // can revive them, but a terminal agent whose profile is no longer
+  // installed must not block resuming (and recovering) the whole group.
+  // Messaging such an agent fails with MissingProfile only when attempted.
+  let dormant_profiles =
+    group.agents
+    |> list.filter(fn(state) { state.status != agent.Ready })
+    |> list.map(fn(state) { state.profile_id })
+    |> list.unique
+    |> list.filter(fn(id) { !list.contains(ready_ids, id) })
+    |> list.filter_map(fn(id) {
+      case agent_profile.profiles([id]) {
+        Ok([profile]) -> Ok(profile)
+        _ -> Error(Nil)
+      }
+    })
+  let profiles = list.append(ready_profiles, dormant_profiles)
   let config =
     Config(
       storage,
@@ -335,11 +353,15 @@ fn start_coordinator(
   // index before it reads membership. A new claim must therefore become
   // visible in this exact order:
   //
-  //   local registry -> acknowledged membership refresh -> running index
+  //   local registry -> attempted membership refresh -> running index
   //
   // Never move write_running_index above this refresh. Doing so creates a
   // window where recovery sees an indexed group but cannot see its live owner,
-  // and may incorrectly dispatch a second claimant.
+  // and may dispatch a second claimant. The refresh is synchronous but
+  // best-effort: it returns even when its storage write fails, so this
+  // ordering only minimizes spurious dispatches — the group lease is what
+  // actually fences out a second claimant, and the periodic refresher closes
+  // the membership gap within one interval.
   refresh_membership()
   case
     write_running_index(

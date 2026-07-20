@@ -32,7 +32,15 @@ pub type VersionToken {
 
 /// Metadata common to every storage backend.
 pub type Metadata {
-  Metadata(key: String, size: Int, modified_at: String, version: VersionToken)
+  Metadata(
+    key: String,
+    size: Int,
+    /// Last modification time in Unix epoch seconds. Informational only —
+    /// concurrency control uses `version`. 0 means the backend response
+    /// omitted the timestamp or it could not be parsed.
+    modified_at_seconds: Int,
+    version: VersionToken,
+  )
 }
 
 /// An object body and the metadata observed when it was read.

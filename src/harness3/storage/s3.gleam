@@ -21,6 +21,7 @@ import harness3/storage.{
 import harness3/storage/http_stream
 import harness3/storage/retry
 import harness3/storage/s3_sign
+import harness3/storage/timestamp
 
 pub type Config {
   Config(
@@ -170,7 +171,10 @@ fn response_metadata(
   Metadata(
     key:,
     size:,
-    modified_at: response_header(response, "last-modified"),
+    modified_at_seconds: timestamp.http_date_seconds(response_header(
+      response,
+      "last-modified",
+    )),
     version: S3Etag(response_header(response, "etag")),
   )
 }
@@ -246,7 +250,10 @@ fn put_(
       Ok(Metadata(
         key:,
         size: bit_array.byte_size(body),
-        modified_at: response_header(response, "date"),
+        modified_at_seconds: timestamp.http_date_seconds(response_header(
+          response,
+          "date",
+        )),
         version: S3Etag(response_header(response, "etag")),
       ))
     404 ->
@@ -285,7 +292,12 @@ fn list_pages(
         contents
         |> list.map(fn(object) {
           let list_objects.Object(key:, last_modified:, etag:, size:) = object
-          Metadata(key, size, last_modified, S3Etag(etag))
+          Metadata(
+            key,
+            size,
+            timestamp.rfc3339_seconds(last_modified),
+            S3Etag(etag),
+          )
         })
       let accumulator = list.append(accumulator, metadata)
       case is_truncated, list.last(contents) {
@@ -404,7 +416,10 @@ fn stream_put_(
           Ok(Metadata(
             key:,
             size:,
-            modified_at: http_stream.header(headers, "date"),
+            modified_at_seconds: timestamp.http_date_seconds(http_stream.header(
+              headers,
+              "date",
+            )),
             version: S3Etag(http_stream.header(headers, "etag")),
           ))
         404 ->
@@ -460,7 +475,10 @@ fn metadata_from_headers(
     size: http_stream.header(headers, "content-length")
       |> int.parse
       |> result.unwrap(fallback_size),
-    modified_at: http_stream.header(headers, "last-modified"),
+    modified_at_seconds: timestamp.http_date_seconds(http_stream.header(
+      headers,
+      "last-modified",
+    )),
     version: S3Etag(http_stream.header(headers, "etag")),
   )
 }

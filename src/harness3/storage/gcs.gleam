@@ -20,6 +20,7 @@ import harness3/storage.{
 }
 import harness3/storage/http_stream
 import harness3/storage/retry
+import harness3/storage/timestamp
 
 pub type Config {
   Config(bucket: String, access_token: String, endpoint: String)
@@ -152,7 +153,13 @@ fn status_error(response: Response(BitArray), key: String) -> Error {
 fn decoded_metadata(object: GcsObject) -> Result(Metadata, Error) {
   let GcsObject(name:, size:, updated:, generation:) = object
   case int.parse(size) {
-    Ok(size) -> Ok(Metadata(name, size, updated, GcsGeneration(generation)))
+    Ok(size) ->
+      Ok(Metadata(
+        name,
+        size,
+        timestamp.rfc3339_seconds(updated),
+        GcsGeneration(generation),
+      ))
     Error(_) -> Error(Backend(200, "GCS returned a non-integer object size"))
   }
 }
@@ -170,15 +177,31 @@ fn get_(config: Config, key: String) -> Result(Object, Error) {
     send(config, http.Get, object_url(config, key), [#("alt", "media")], <<>>),
   )
   case response.status {
-    200 -> {
-      // Media downloads expose HTTP-style metadata while `head` decodes the
-      // canonical JSON resource. Use the latter for a backend-wide stable
-      // Metadata representation.
-      use metadata <- result.try(head_(config, key))
-      Ok(Object(metadata, response.body))
-    }
+    200 ->
+      // Metadata comes from the media response itself so the version token is
+      // atomically bound to this body; a follow-up metadata request could
+      // observe a newer generation and let a later IfUnchanged CAS overwrite
+      // a concurrent write. With `modified_at_seconds` normalized to epoch
+      // seconds, these headers agree with the JSON resource used by `head`
+      // and `list`.
+      Ok(Object(
+        Metadata(
+          key:,
+          size: bit_array.byte_size(response.body),
+          modified_at_seconds: timestamp.http_date_seconds(response_header(
+            response,
+            "last-modified",
+          )),
+          version: GcsGeneration(response_header(response, "x-goog-generation")),
+        ),
+        response.body,
+      ))
     _ -> Error(status_error(response, key))
   }
+}
+
+fn response_header(response: Response(body), name: String) -> String {
+  response.headers |> list.key_find(name) |> result.unwrap("")
 }
 
 fn head_(config: Config, key: String) -> Result(Metadata, Error) {
@@ -328,7 +351,10 @@ fn stream_get_(
         size: http_stream.header(headers, "content-length")
           |> int.parse
           |> result.unwrap(0),
-        modified_at: http_stream.header(headers, "last-modified"),
+        modified_at_seconds: timestamp.http_date_seconds(http_stream.header(
+          headers,
+          "last-modified",
+        )),
         version: GcsGeneration(http_stream.header(headers, "x-goog-generation")),
       ))
     }

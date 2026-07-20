@@ -141,8 +141,9 @@ type TimeUnit {
 @external(erlang, "erlang", "system_time")
 fn system_time(unit: TimeUnit) -> Int
 
-type LockHeartbeat {
-  StopHeartbeat
+type HeartbeatEvent {
+  HeartbeatStop(reply: process.Subject(Nil))
+  HolderExited
 }
 
 fn lock_path(config: Config) -> String {
@@ -158,7 +159,7 @@ fn acquire_lock(path: String, attempts: Int) -> Result(Nil, Error) {
         "Eexist", True -> {
           case stale_lock(path) {
             True -> {
-              let _ = file_delete(path)
+              break_stale_lock(path)
               acquire_lock(path, attempts - 1)
             }
             False -> {
@@ -181,12 +182,68 @@ fn stale_lock(path: String) -> Bool {
   }
 }
 
-fn keep_lock_alive(path: String, stop: process.Subject(LockHeartbeat)) -> Nil {
-  case process.receive(stop, within: lock_heartbeat_ms) {
-    Ok(StopHeartbeat) -> Nil
+/// Breaks a stale lock by atomically renaming it aside before deleting it.
+/// Deleting in place would race with other waiters: between our staleness
+/// check and the delete, another waiter could break the same stale lock and
+/// create a fresh one, which our delete would then destroy. The rename
+/// captures one specific lock file — only one breaker can win it — and the
+/// staleness verdict is re-checked on the captured file before it is
+/// discarded.
+fn break_stale_lock(path: String) -> Nil {
+  let suffix =
+    crypto.strong_random_bytes(9) |> bit_array.base64_url_encode(False)
+  let victim = path <> ".break." <> suffix
+  case simplifile.rename(at: path, to: victim) {
+    // Someone else already broke or released it; go back to polling.
+    Error(_) -> Nil
+    Ok(Nil) ->
+      case stale_lock(victim) {
+        True -> {
+          let _ = simplifile.delete(victim)
+          Nil
+        }
+        False -> {
+          // The lock was refreshed between the staleness check and the
+          // rename, so we displaced a live holder. Restore the original file
+          // (hard link back is atomic and refuses to clobber a newer lock);
+          // the live holder's heartbeat re-creates it if this loses the race.
+          let _ = simplifile.create_link(to: victim, from: path)
+          let _ = simplifile.delete(victim)
+          Nil
+        }
+      }
+  }
+}
+
+fn keep_lock_alive(
+  path: String,
+  stop: process.Subject(process.Subject(Nil)),
+  holder: process.Monitor,
+) -> Nil {
+  let selector =
+    process.new_selector()
+    |> process.select_map(stop, HeartbeatStop)
+    |> process.select_specific_monitor(holder, fn(_) { HolderExited })
+  heartbeat_loop(path, selector)
+}
+
+fn heartbeat_loop(
+  path: String,
+  selector: process.Selector(HeartbeatEvent),
+) -> Nil {
+  case process.selector_receive(selector, lock_heartbeat_ms) {
+    Ok(HeartbeatStop(reply)) -> process.send(reply, Nil)
+    Ok(HolderExited) -> {
+      // The holder died without running its cleanup (for example it was
+      // brutally killed mid-transaction). Release the lock on its behalf;
+      // interrupted writes already invalidated their version tokens via the
+      // sentinel-mtime protocol, so letting the next waiter in is safe.
+      let _ = file_delete(path)
+      Nil
+    }
     Error(_) -> {
       let _ = simplifile.touch(at: path)
-      keep_lock_alive(path, stop)
+      heartbeat_loop(path, selector)
     }
   }
 }
@@ -197,17 +254,23 @@ fn with_lock(
 ) -> Result(a, Error) {
   let path = lock_path(config)
   use _ <- result.try(acquire_lock(path, lock_attempts))
+  let holder = process.self()
   let heartbeat_ready = process.new_subject()
   let _ =
     process.spawn_unlinked(fn() {
       let stop = process.new_subject()
+      let monitor = process.monitor(holder)
       process.send(heartbeat_ready, stop)
-      keep_lock_alive(path, stop)
+      keep_lock_alive(path, stop, monitor)
     })
   let assert Ok(heartbeat) = process.receive(heartbeat_ready, within: 5000)
   exception.defer(
     fn() {
-      process.send(heartbeat, StopHeartbeat)
+      // Stop the heartbeat synchronously so a concurrent touch cannot
+      // re-create the lock file after it is deleted here.
+      let ack = process.new_subject()
+      process.send(heartbeat, ack)
+      let _ = process.receive(ack, within: 5000)
       let _ = file_delete(path)
       Nil
     },
@@ -322,7 +385,7 @@ fn metadata_locked(
       Ok(Metadata(
         key:,
         size: file_size(path),
-        modified_at: int.to_string(mtime),
+        modified_at_seconds: mtime,
         version: LocalVersion(mtime, generation),
       ))
     }
@@ -423,7 +486,7 @@ fn put_(
         Ok(Metadata(
           key:,
           size: bit_array.byte_size(body),
-          modified_at: int.to_string(mtime),
+          modified_at_seconds: mtime,
           version: LocalVersion(mtime, generation),
         ))
       }
@@ -599,7 +662,7 @@ fn stream_put_(
                   Ok(Metadata(
                     key:,
                     size:,
-                    modified_at: int.to_string(mtime),
+                    modified_at_seconds: mtime,
                     version: LocalVersion(mtime, generation),
                   ))
                 }

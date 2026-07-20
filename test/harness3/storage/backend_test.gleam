@@ -28,6 +28,33 @@ pub fn local_backend_test() {
   remove_directory(root)
 }
 
+@external(erlang, "file", "write_file")
+fn write_file(path: Charlist, content: Charlist) -> Dynamic
+
+@external(erlang, "file", "change_time")
+fn change_time(
+  path: Charlist,
+  mtime: #(#(Int, Int, Int), #(Int, Int, Int)),
+) -> Dynamic
+
+pub fn local_backend_breaks_stale_lock_test() {
+  let root = "/tmp/harness3-stale-lock-test-" <> int.to_string(unique_integer())
+  let backend = local.new(local.config(root))
+  // Establish the root, then plant an abandoned lock with an ancient mtime,
+  // as left behind by a crashed process whose heartbeat died with it.
+  let assert Ok(_) =
+    storage.put(backend, "seed", <<"x":utf8>>, storage.IfAbsent)
+  let lock = root <> "/.harness3.lock"
+  let _ = write_file(charlist.from_string(lock), charlist.from_string(""))
+  let _ = change_time(charlist.from_string(lock), #(#(2000, 1, 1), #(0, 0, 0)))
+  // Operations must break the stale lock and proceed instead of timing out.
+  let assert Ok(_) =
+    storage.put(backend, "after-stale", <<"y":utf8>>, storage.IfAbsent)
+  let assert Ok(object) = storage.get(backend, "after-stale")
+  assert object.body == <<"y":utf8>>
+  remove_directory(root)
+}
+
 pub fn s3_backend_test() {
   case
     env("TEST_S3_ENDPOINT"),
@@ -81,6 +108,9 @@ fn exercise_backend(backend: storage.Storage, key: String) {
 
   let assert Ok(head) = storage.head(backend, key)
   assert head == metadata
+  // Normalized to Unix epoch seconds on every backend; 0 would mean the
+  // backend's timestamp failed to parse.
+  assert metadata.modified_at_seconds > 0
 
   let assert Ok(listed) = storage.list(backend, prefix)
   let assert Ok(listed_metadata) =
