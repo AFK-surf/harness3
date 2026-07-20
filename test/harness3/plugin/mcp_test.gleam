@@ -124,7 +124,7 @@ pub fn catalog_is_durable_and_uses_compare_and_swap_test() {
   let assert Ok(Nil) = simplifile.delete(root)
 }
 
-pub fn runtime_discovers_and_plugin_invokes_all_tools_test() {
+pub fn runtime_discovers_and_broker_invokes_available_tools_test() {
   let without_manifest =
     configuration.Configuration(
       ..configured(persisted_manifest()),
@@ -177,8 +177,7 @@ pub fn runtime_discovers_and_plugin_invokes_all_tools_test() {
       fn() { 1234 },
       connector,
     )
-  let assert Ok(Nil) = runtime.refresh(mcp_runtime, "research")
-  let assert Ok(snapshot) = runtime.snapshot(mcp_runtime, "research")
+  let assert Ok(snapshot) = runtime.discover(mcp_runtime, "research")
   let runtime.Snapshot(configuration: discovered, ..) = snapshot
   let assert Some(manifest) = discovered.manifest
   let assert [tool] = manifest.tools
@@ -186,14 +185,26 @@ pub fn runtime_discovers_and_plugin_invokes_all_tools_test() {
   assert tool.exposed_name
     == configuration.exposed_tool_name("search", "search_web")
 
-  let assert Ok(value) = mcp_plugin.new(mcp_runtime, snapshot)
+  let value = mcp_plugin.new(mcp_runtime, snapshot)
   let assert Ok(registry) = harness_plugin.registry([value])
   let assert Ok(plugin_runtime) =
     harness_plugin.activate(registry, harness_plugin.empty_states())
   let tools = harness_plugin.tools(plugin_runtime)
-  assert list.length(tools) == 1
-  let assert [llm.Tool(name:, ..)] = tools
-  assert name == tool.exposed_name
+  let assert [llm.Tool(name: list_name, ..), llm.Tool(name: call_name, ..)] =
+    tools
+  assert list_name == "mcp.list"
+  assert call_name == "mcp.call"
+  let assert Ok(#(
+    _,
+    harness_plugin.ToolOutput(content: [llm.Text(listing)], is_error: False),
+  )) =
+    harness_plugin.invoke_tool(
+      plugin_runtime,
+      list_name,
+      harness_plugin.ToolInvocation("list", "{}"),
+    )
+  assert string.contains(listing, tool.exposed_name)
+  assert string.contains(listing, "search_web")
   let assert Ok(#(
     _,
     harness_plugin.ToolOutput(
@@ -203,9 +214,91 @@ pub fn runtime_discovers_and_plugin_invokes_all_tools_test() {
   )) =
     harness_plugin.invoke_tool(
       plugin_runtime,
-      name,
-      harness_plugin.ToolInvocation("call", "{\"query\":\"MCP\"}"),
+      call_name,
+      harness_plugin.ToolInvocation(
+        "call",
+        json.object([
+          #("tool", json.string(tool.exposed_name)),
+          #("arguments", json.object([#("query", json.string("MCP"))])),
+        ])
+          |> json.to_string,
+      ),
     )
+  runtime.stop(mcp_runtime)
+}
+
+pub fn discovery_excludes_failed_servers_without_failing_test() {
+  let configured =
+    configuration.Configuration(
+      id: "mixed",
+      label: "Partially available",
+      enabled: True,
+      servers: [
+        configuration.Server(
+          id: "down",
+          transport: configuration.StreamableHttp(
+            "https://down.example.test/mcp",
+            [],
+          ),
+          timeout_milliseconds: 1000,
+        ),
+        configuration.Server(
+          id: "up",
+          transport: configuration.StreamableHttp(
+            "https://up.example.test/mcp",
+            [],
+          ),
+          timeout_milliseconds: 1000,
+        ),
+      ],
+      manifest: None,
+    )
+  let assert Ok(value) = catalog.put_configuration(catalog.new(), configured)
+  let connector = fn(server: configuration.Server, _resolve_environment) {
+    case server.id {
+      "down" -> Error("connection refused")
+      _ ->
+        Ok(
+          client.connection(
+            fn(method, _params, _timeout) {
+              case method {
+                "initialize" ->
+                  Ok(
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fake\",\"version\":\"1\"}}}",
+                  )
+                "tools/list" ->
+                  Ok(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"available\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]}}",
+                  )
+                _ -> Error("unexpected method")
+              }
+            },
+            fn(method, _) {
+              case method {
+                "notifications/initialized" -> Ok(Nil)
+                _ -> Error("unexpected notification")
+              }
+            },
+            fn() { Nil },
+          ),
+        )
+    }
+  }
+  let assert Ok(mcp_runtime) =
+    runtime.start_with_connector(
+      value,
+      fn(_) { Error(Nil) },
+      fn() { 1234 },
+      connector,
+    )
+  let assert Ok(snapshot) = runtime.discover(mcp_runtime, "mixed")
+  let runtime.Snapshot(configuration:, failures:, ..) = snapshot
+  let assert Some(manifest) = configuration.manifest
+  let assert [available] = manifest.tools
+  assert available.server_id == "up"
+  let assert [runtime.ServerFailure(server_id:, reason:)] = failures
+  assert server_id == "down"
+  assert reason == "connection refused"
   runtime.stop(mcp_runtime)
 }
 
@@ -254,8 +347,7 @@ pub fn composio_streamable_http_smoke_test() {
       let assert Ok(value) =
         catalog.put_configuration(catalog.new(), configuration)
       let assert Ok(mcp_runtime) = runtime.start(value, envoy.get, fn() { 0 })
-      let assert Ok(Nil) = runtime.refresh(mcp_runtime, "composio-smoke")
-      let assert Ok(snapshot) = runtime.snapshot(mcp_runtime, "composio-smoke")
+      let assert Ok(snapshot) = runtime.discover(mcp_runtime, "composio-smoke")
       let runtime.Snapshot(configuration:, ..) = snapshot
       let assert Some(manifest) = configuration.manifest
       assert !list.is_empty(manifest.tools)

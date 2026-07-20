@@ -9,9 +9,6 @@ pub type Runtime =
 pub type Snapshot =
   runtime.Snapshot
 
-pub type PluginError =
-  mcp_plugin.Error
-
 pub fn start(
   catalog: catalog.Catalog,
   resolve_environment: fn(String) -> Result(String, Nil),
@@ -20,11 +17,11 @@ pub fn start(
   runtime.start(catalog, resolve_environment, now_seconds)
 }
 
-pub fn refresh(
+pub fn discover(
   mcp_runtime: Runtime,
   configuration_id: String,
-) -> Result(Nil, String) {
-  runtime.refresh(mcp_runtime, configuration_id)
+) -> Result(Snapshot, String) {
+  runtime.discover(mcp_runtime, configuration_id)
 }
 
 pub fn snapshot(
@@ -34,10 +31,7 @@ pub fn snapshot(
   runtime.snapshot(mcp_runtime, configuration_id)
 }
 
-pub fn plugin(
-  mcp_runtime: Runtime,
-  snapshot: Snapshot,
-) -> Result(plugin.Plugin, PluginError) {
+pub fn plugin(mcp_runtime: Runtime, snapshot: Snapshot) -> plugin.Plugin {
   mcp_plugin.new(mcp_runtime, snapshot)
 }
 

@@ -32,10 +32,9 @@ not the secret values.
 ## MCP configurations
 
 Set `HARNESS3_MCP_CONFIG_PATH` to an absolute JSON file path to install global
-MCP configurations. On startup, the server validates the file, connects to all
-enabled servers, negotiates MCP 2025-11-25, discovers every tool, and stores the
-configuration plus discovered manifest in the durable MCP catalog. If the
-variable is omitted on a later start, the persisted catalog is reused.
+MCP configurations. On startup, the server validates and stores the
+configuration without contacting any external server. If the variable is
+omitted on a later start, the persisted catalog is reused.
 
 ```json
 {
@@ -72,18 +71,22 @@ Stdio servers use `"type": "stdio"` with an absolute `executable`, optional
 `arguments`, an optional absolute `working_directory`, and `environment`
 bindings in the same format as HTTP headers. Prefer
 `environment_variable` bindings for secrets: literal values are persisted as
-written. Supplied manifests are ignored and replaced with live discovery.
+written. Supplied and previously discovered manifests are discarded at startup.
 
 When a configured team has at least two agents, its researcher can be assigned
-one configuration and receives all of that configuration's MCP tools. It keeps
-durable teammate messaging but has no workspace, file-write, or shell tools.
+one configuration. When that agent activates, each configured server is
+discovered independently. Unavailable servers are excluded, so server startup
+and agent availability do not depend on external services. The model receives
+only `mcp.list`, which reports reachable tools and failures, and `mcp.call`,
+which invokes an identifier returned by `mcp.list`. The researcher keeps durable
+teammate messaging but has no workspace, file-write, or shell tools.
 Without MCP, the researcher remains least-privilege and receives only
 `MessageAgent`; it never falls back to local filesystem or shell tools. The
 lead, implementer, and reviewer retain the coding tools and do not receive MCP
-access. Session metadata stores the configuration ID, while the global catalog
-owns the actual server settings and tool manifest. The lead can message every subagent;
-subagents can message only the lead, so there is no direct subagent-to-subagent
-communication path.
+access. Session metadata and plugin state store the configuration ID, while the
+global catalog owns the actual server settings. The lead can message every
+subagent; subagents can message only the lead, so there is no direct
+subagent-to-subagent communication path.
 
 Models must provide Pi's `contextWindow` field. Each agent automatically
 compacts its model-facing context after a normal request reaches 80% of that
@@ -146,7 +149,7 @@ Create request example:
 ```
 
 `mcp_configuration_id` is optional. If omitted or `null` for a team of at least
-two, the first enabled discovered configuration is selected. A lead-only team,
+two, the first enabled configuration is selected. A lead-only team,
 or a server with no installed configuration, has no MCP specialist; an included
 researcher is message-only in that case.
 

@@ -163,23 +163,27 @@ not produce event N+1 until `consume` of event N has returned (backpressure cont
   must be absolute; HTTP endpoints must be absolute HTTP(S) URLs.
 - The runtime supports MCP 2025-11-25 over newline-delimited stdio and Streamable HTTP.
   It initializes each server, sends `notifications/initialized`, follows paginated
-  `tools/list` responses (bounded at 100 pages), and atomically replaces a
-  configuration's complete discovered manifest only after every server succeeds.
-  Failed refreshes close newly opened connections and retain the prior manifest and
-  connections. Tool calls are never retried because they may have side effects.
+  `tools/list` responses (bounded at 100 pages), and performs best-effort discovery
+  when the plugin activates. Each successful server contributes its tools to the new
+  manifest; failed servers are recorded and excluded without failing activation.
+  Replaced and failed connections are closed. Tool calls are never retried because
+  they may have side effects.
 - `Tool.input_schema` and `Tool.output_schema` are typed `json.Json` values produced by
-  object-only decoders. Catalog persistence and LLM tool definitions reuse those values
-  directly; there is no string-to-JSON cast. Server/tool names are deterministically
-  namespaced and hash-suffixed to satisfy the plugin registry's global uniqueness rule.
+  object-only decoders. Catalog persistence and `mcp.list` reuse those values directly;
+  there is no string-to-JSON cast. Server/tool names are deterministically namespaced
+  and hash-suffixed into stable broker identifiers.
+- The model sees exactly two static broker tools: `mcp.list` returns the tools from
+  reachable servers, their typed schemas, and any server failures; `mcp.call` invokes
+  one identifier returned by `mcp.list` with an argument object.
 - The server loads optional global configuration from an absolute
-  `HARNESS3_MCP_CONFIG_PATH`, performs live discovery, and persists only the refreshed
-  catalog. A configured team assigns the researcher every tool in one MCP
-  configuration plus `MessageAgent`, but no filesystem or shell capability. Coding
-  agents receive Read/Write/Exec plus `MessageAgent`, but no MCP tools. The lead may
-  message all subagents; every subagent's `MessageAgent` allow-list contains only the
-  lead, preventing direct peer-to-peer subagent communication. Without an MCP
-  configuration, the researcher remains a separate message-only profile and is not
-  granted local filesystem or shell tools.
+  `HARNESS3_MCP_CONFIG_PATH`, validates and persists configuration without contacting
+  external services, and discards persisted manifests at startup. A configured team
+  assigns the researcher `mcp.list`, `mcp.call`, and `MessageAgent`, but no filesystem
+  or shell capability. Coding agents receive Read/Write/Exec plus `MessageAgent`, but no
+  MCP tools. The lead may message all subagents; every subagent's `MessageAgent`
+  allow-list contains only the lead, preventing direct peer-to-peer subagent
+  communication. Without an MCP configuration, the researcher remains a separate
+  message-only profile and is not granted local filesystem or shell tools.
 
 ## 5. Model catalog
 
@@ -474,6 +478,6 @@ unregistration only removes the exact (id, pid) pair.
 7. Tool names are globally unique per registry; dependencies are acyclic and must be
    declared to be callable.
 8. The persisted conversation never contains the synthesized system prompt.
-9. An MCP manifest becomes visible only after all configured servers initialize and
-   enumerate successfully; every exposed schema remains typed JSON across discovery,
-   persistence, plugin installation, and tool invocation.
+9. MCP discovery occurs at agent activation; failed servers are excluded without
+   affecting server or agent availability. Every discovered schema remains typed JSON
+   across discovery, persistence, broker listing, and tool invocation.

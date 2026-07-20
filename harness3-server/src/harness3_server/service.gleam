@@ -338,7 +338,7 @@ fn start_mcp(backend: Storage) -> Result(mcp.Runtime, String) {
     Error(error) ->
       Error("could not load MCP catalog: " <> string.inspect(error))
   })
-  use desired <- result.try(case path {
+  use configured <- result.try(case path {
     None ->
       case existing {
         Some(session) -> Ok(mcp_catalog.catalog(session))
@@ -353,36 +353,31 @@ fn start_mcp(backend: Storage) -> Result(mcp.Runtime, String) {
       |> result.map_error(fn(error) { string.inspect(error) })
     }
   })
+  use desired <- result.try(without_mcp_manifests(configured))
   use runtime <- result.try(
     mcp.start(desired, config.environment, fn() { system_time(Second) }),
   )
-  let refreshed =
-    desired
-    |> mcp_catalog.configurations
-    |> list.filter(fn(configuration) { configuration.enabled })
-    |> list.try_each(fn(configuration) {
-      mcp.refresh(runtime, configuration.id)
-      |> result.map_error(fn(error) {
-        "could not refresh MCP configuration `"
-        <> configuration.id
-        <> "`: "
-        <> error
-      })
-    })
-  case refreshed {
+  case persist_mcp_catalog(backend, existing, desired) {
     Error(error) -> {
       mcp.stop(runtime)
       Error(error)
     }
-    Ok(Nil) ->
-      case persist_mcp_catalog(backend, existing, mcp.catalog(runtime)) {
-        Ok(Nil) -> Ok(runtime)
-        Error(error) -> {
-          mcp.stop(runtime)
-          Error(error)
-        }
-      }
+    Ok(Nil) -> Ok(runtime)
   }
+}
+
+fn without_mcp_manifests(
+  configured: mcp_catalog.Catalog,
+) -> Result(mcp_catalog.Catalog, String) {
+  configured
+  |> mcp_catalog.configurations
+  |> list.try_fold(mcp_catalog.new(), fn(catalog, configuration) {
+    mcp_catalog.put_configuration(
+      catalog,
+      mcp_configuration.Configuration(..configuration, manifest: None),
+    )
+  })
+  |> result.map_error(fn(error) { string.inspect(error) })
 }
 
 fn persist_mcp_catalog(
@@ -429,9 +424,7 @@ fn select_mcp_configuration(
     None, True ->
       case
         mcp_configurations(service)
-        |> list.filter(fn(configuration) {
-          configuration.enabled && configuration.manifest != None
-        })
+        |> list.filter(fn(configuration) { configuration.enabled })
       {
         [] -> Ok(None)
         [configuration, ..] -> Ok(Some(configuration.id))
@@ -566,10 +559,7 @@ fn group_config(
             service.mcp_runtime,
             configuration_id,
           ))
-          use specialist <- result.try(
-            mcp.plugin(service.mcp_runtime, snapshot)
-            |> result.map_error(fn(error) { string.inspect(error) }),
-          )
+          let specialist = mcp.plugin(service.mcp_runtime, snapshot)
           Ok([collaboration, specialist])
         }
       })
@@ -607,7 +597,7 @@ fn capability_instructions(kind: AgentKind) -> String {
     McpSpecialist(configuration_id) ->
       "You are the MCP specialist for global configuration `"
       <> configuration_id
-      <> "`. You have every tool exposed by that configuration, but no direct filesystem or shell access."
+      <> "`. You have only MessageAgent (to report to the lead), mcp.list (to inspect tools from currently reachable external servers), and mcp.call (to invoke a listed tool). You have no direct filesystem or shell access."
   }
 }
 
@@ -637,9 +627,9 @@ fn team(size: Int, mcp_configuration_id: Option(String)) -> List(AgentSpec) {
   let #(researcher_kind, researcher_role) = case mcp_configuration_id {
     Some(id) -> #(
       McpSpecialist(id),
-      "MCP research specialist. Has access to every tool in global MCP configuration `"
+      "MCP research specialist for global configuration `"
         <> id
-        <> "`, has no filesystem or shell access, and can message only the lead agent.",
+        <> "`. Has MessageAgent access only to the lead plus mcp.list and mcp.call access to tools discovered from currently reachable external servers; has no filesystem or shell access.",
     )
     None -> #(
       ResearchAgent,

@@ -3,7 +3,8 @@ import gleam/bit_array
 import gleam/crypto
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{None}
+import gleam/string
 import harness3/agent
 import harness3/agent_group
 import harness3/agent_profile
@@ -42,6 +43,32 @@ fn mcp_config_json() -> String {
           transport: mcp_configuration.Stdio(
             "/bin/sh",
             ["-c", mcp_server_script()],
+            None,
+            [],
+          ),
+          timeout_milliseconds: 1000,
+        ),
+      ],
+      manifest: None,
+    )
+  json.object([
+    #("configurations", json.array([configuration], mcp_configuration.encode)),
+  ])
+  |> json.to_string
+}
+
+fn unavailable_mcp_config_json() -> String {
+  let configuration =
+    mcp_configuration.Configuration(
+      id: "offline",
+      label: "Unavailable MCP",
+      enabled: True,
+      servers: [
+        mcp_configuration.Server(
+          id: "missing",
+          transport: mcp_configuration.Stdio(
+            "/path/that/does/not/exist/harness3-mcp",
+            [],
             None,
             [],
           ),
@@ -100,8 +127,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   assert service.workspace_root(second) == workspace
   let assert [mcp_configuration] = service.mcp_configurations(second)
   assert mcp_configuration.id == "research"
-  let assert Some(manifest) = mcp_configuration.manifest
-  assert list.length(manifest.tools) == 1
+  assert mcp_configuration.manifest == None
   assert service.resolve_workspace("nested")
     == Error("workspace path must be absolute")
   let outside = root <> "-outside"
@@ -137,10 +163,22 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   assert list.contains(lead_tools, "MessageAgent")
   assert !list.contains(lead_tools, exposed)
   assert list.contains(researcher_tools, "MessageAgent")
-  assert list.contains(researcher_tools, exposed)
+  assert list.contains(researcher_tools, "mcp.list")
+  assert list.contains(researcher_tools, "mcp.call")
+  assert !list.contains(researcher_tools, exposed)
   assert !list.contains(researcher_tools, "Read")
   let assert Ok(researcher_runtime) =
     plugin.activate(researcher_profile.registry, plugin.empty_states())
+  let assert Ok(#(
+    _,
+    plugin.ToolOutput(content: [llm.Text(listing)], is_error: False),
+  )) =
+    plugin.invoke_tool(
+      researcher_runtime,
+      "mcp.list",
+      plugin.ToolInvocation("list-tools", "{}"),
+    )
+  assert string.contains(listing, exposed)
   let assert Ok(#(_, plugin.ToolOutput(is_error: True, ..))) =
     plugin.invoke_tool(
       researcher_runtime,
@@ -174,6 +212,52 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     service.stop_session(without_mcp, without_mcp_metadata.id)
   service.stop(without_mcp)
 
+  let unavailable_path = root <> "/unavailable-mcp.json"
+  let assert Ok(Nil) =
+    simplifile.write(
+      to: unavailable_path,
+      contents: unavailable_mcp_config_json(),
+    )
+  envoy.set("HARNESS3_MCP_CONFIG_PATH", unavailable_path)
+  envoy.set("HARNESS3_DATA_DIR", root <> "/data-with-offline-mcp")
+  let assert Ok(with_offline_mcp) = service.start()
+  let assert Ok(service.Session(metadata: offline_metadata, ..)) =
+    service.create_session(
+      with_offline_mcp,
+      service.CreateInput("test/model-1", workspace, 2, None),
+    )
+  let assert [_, service.AgentSpec(kind: service.McpSpecialist("offline"), ..)] =
+    offline_metadata.agents
+  let assert Ok([offline_profile]) =
+    agent_profile.profiles([offline_metadata.id <> ":researcher"])
+  let assert Ok(offline_runtime) =
+    plugin.activate(offline_profile.registry, plugin.empty_states())
+  let offline_tools =
+    plugin.tools(offline_runtime)
+    |> list.map(fn(tool) {
+      let llm.Tool(name:, ..) = tool
+      name
+    })
+  assert list.contains(offline_tools, "MessageAgent")
+  assert list.contains(offline_tools, "mcp.list")
+  assert list.contains(offline_tools, "mcp.call")
+  assert !list.contains(offline_tools, "Read")
+  let assert Ok(#(
+    _,
+    plugin.ToolOutput(content: [llm.Text(offline_listing)], is_error: False),
+  )) =
+    plugin.invoke_tool(
+      offline_runtime,
+      "mcp.list",
+      plugin.ToolInvocation("list-offline-tools", "{}"),
+    )
+  assert string.contains(offline_listing, "\"tools\":[]")
+  assert string.contains(offline_listing, "\"server_id\":\"missing\"")
+  let assert Ok(Nil) =
+    service.stop_session(with_offline_mcp, offline_metadata.id)
+  service.stop(with_offline_mcp)
+
+  envoy.unset("HARNESS3_MCP_CONFIG_PATH")
   envoy.unset("HARNESS3_MODELS_PATH")
   envoy.unset("HARNESS3_DATA_DIR")
   envoy.unset("HARNESS3_WORKSPACE_ROOT")
