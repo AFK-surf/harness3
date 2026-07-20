@@ -7,6 +7,7 @@ import gleam/option.{None}
 import gleam/string
 import harness3/agent
 import harness3/agent_group
+import harness3/agent_group_registry
 import harness3/agent_profile
 import harness3/llm
 import harness3/model_catalog
@@ -164,9 +165,13 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     service.AgentSpec(kind: service.McpSpecialist("research"), ..),
     service.AgentSpec(kind: service.CodingAgent, ..),
   ] = metadata.agents
+  // Manual compaction always wakes through the RPC first. The request still
+  // fails validation because a newly created agent has no history, but its
+  // group is active by the time the compaction RPC runs.
   let assert Error(compaction_error) =
     service.request_compaction(second, metadata.id, "lead")
-  assert compaction_error == "agent group is not awake"
+  assert string.contains(compaction_error, "no messages to compact")
+  assert list.contains(agent_group_registry.alive_ids(), metadata.id)
   let assert Error(unknown_compaction_agent) =
     service.request_compaction(second, metadata.id, "missing")
   assert string.contains(unknown_compaction_agent, "unknown agent")

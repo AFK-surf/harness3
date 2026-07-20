@@ -6,7 +6,6 @@ import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{None}
-import gleam/string
 import harness3/agent
 import harness3/agent_group
 import harness3/agent_group_registry
@@ -28,7 +27,7 @@ fn temporary_root() -> String {
   "/tmp/harness3-agent-group-rpc-test-" <> suffix
 }
 
-pub fn compaction_rpc_forwards_to_awake_host_and_rejects_sleeping_group_test() {
+pub fn wake_rpc_is_idempotent_and_precedes_routed_compaction_test() {
   let root = temporary_root()
   let backend = local.new(local.config(root))
   use <- exception.defer(fn() {
@@ -101,6 +100,21 @@ pub fn compaction_rpc_forwards_to_awake_host_and_rejects_sleeping_group_test() {
     storage.list(backend, agent_group.running_index_prefix())
   assert list.length(index) == 1
 
+  // Waking an already-active group is idempotent: the leader observes its
+  // live owner and returns without reclaiming or moving it.
+  let assert Ok("ok") =
+    core.call(
+      entry_ip,
+      entry_port,
+      core.token(entry),
+      agent_group_rpc.wake_method_name(),
+      agent_group_rpc.wake_request("rpc-group", "groups/rpc"),
+      decode.string,
+    )
+  let assert Ok(index) =
+    storage.list(backend, agent_group.running_index_prefix())
+  assert list.length(index) == 1
+
   // The request enters through a different node and is forwarded to the
   // registry entry on the group owner without waking or moving the group.
   let assert Ok(1) =
@@ -126,7 +140,21 @@ pub fn compaction_rpc_forwards_to_awake_host_and_rejects_sleeping_group_test() {
   let assert Ok(index) =
     storage.list(backend, agent_group.running_index_prefix())
   assert list.is_empty(index)
-  let assert Error(core.RemoteResponse(500, not_awake)) =
+
+  // The same wake-first sequence revives an inactive group before the routed
+  // compaction request. The original generation remains pending, so the
+  // duplicate request returns it rather than creating another generation.
+  let assert Ok("ok") =
+    core.call(
+      entry_ip,
+      entry_port,
+      core.token(entry),
+      agent_group_rpc.wake_method_name(),
+      agent_group_rpc.wake_request("rpc-group", "groups/rpc"),
+      decode.string,
+    )
+  let assert Ok(_compaction_blocked) = process.receive(started, within: 2000)
+  let assert Ok(1) =
     core.call(
       entry_ip,
       entry_port,
@@ -135,7 +163,15 @@ pub fn compaction_rpc_forwards_to_awake_host_and_rejects_sleeping_group_test() {
       agent_group_rpc.compaction_request("rpc-group", "agent"),
       decode.int,
     )
-  assert string.contains(string.inspect(not_awake), "not_awake")
+  let assert Ok("ok") =
+    core.call(
+      entry_ip,
+      entry_port,
+      core.token(entry),
+      agent_group_rpc.force_stop_method_name(),
+      "rpc-group",
+      decode.string,
+    )
   let assert Ok(snapshot) = agent_group.load(config)
   assert snapshot.execution == agent_group.Idle
   let assert [preserved] = snapshot.agents

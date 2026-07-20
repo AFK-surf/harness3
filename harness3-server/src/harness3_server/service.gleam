@@ -14,6 +14,8 @@ import harness3/agent
 import harness3/agent_group
 import harness3/agent_group_registry
 import harness3/agent_profile
+import harness3/cluster/agent_group_rpc
+import harness3/cluster/core
 import harness3/model_catalog
 import harness3/plugin
 import harness3/plugin/cloud_storage
@@ -85,11 +87,9 @@ pub opaque type Service {
     models: List(ModelConfig),
     workspace_root: String,
     mcp_runtime: mcp.Runtime,
+    cluster: core.Cluster,
     model_transport: agent.ModelTransport,
     max_output_tokens: Int,
-    // Stable owner token for group claims, so every wake from this server
-    // identifies the same node instead of minting a random owner per wake.
-    owner: String,
   )
 }
 
@@ -99,21 +99,36 @@ pub fn start() -> Result(Service, String) {
   use root <- result.try(resolve_workspace_root())
   use _ <- result.try(install_catalog(storage, models))
   use mcp_runtime <- result.try(start_mcp(storage))
-  Ok(Service(
-    storage:,
-    models:,
-    workspace_root: root,
-    mcp_runtime:,
-    model_transport: transport.buffered_http(config.environment_int(
-      "HARNESS3_MODEL_TIMEOUT_MS",
-      300_000,
-    )),
-    max_output_tokens: config.environment_int(
-      "HARNESS3_MAX_OUTPUT_TOKENS",
-      8192,
-    ),
-    owner: new_id(),
-  ))
+  let cluster =
+    core.config(
+      storage,
+      config.environment_or("HARNESS3_CLUSTER_BIND", "127.0.0.1"),
+      config.environment_int("HARNESS3_CLUSTER_PORT", 0),
+    )
+    |> core.with_rpc_plugin(agent_group_rpc.plugin(storage, lease_seconds))
+    |> core.start
+  case cluster {
+    Error(error) -> {
+      mcp.stop(mcp_runtime)
+      Error("could not start cluster RPC node: " <> string.inspect(error))
+    }
+    Ok(cluster) ->
+      Ok(Service(
+        storage:,
+        models:,
+        workspace_root: root,
+        mcp_runtime:,
+        cluster:,
+        model_transport: transport.buffered_http(config.environment_int(
+          "HARNESS3_MODEL_TIMEOUT_MS",
+          300_000,
+        )),
+        max_output_tokens: config.environment_int(
+          "HARNESS3_MAX_OUTPUT_TOKENS",
+          8192,
+        ),
+      ))
+  }
 }
 
 pub fn models(service: Service) -> List(ModelConfig) {
@@ -133,6 +148,7 @@ pub fn mcp_configurations(
 }
 
 pub fn stop(service: Service) -> Nil {
+  core.stop(service.cluster)
   mcp.stop(service.mcp_runtime)
 }
 
@@ -246,7 +262,11 @@ pub fn send_message(
       )
       // Detached: this runs in a transient web-request handler; a direct
       // wake would link the whole group process tree to it.
-      case agent_group.wake_detached(loaded, service.owner, fn() { Nil }) {
+      case
+        agent_group.wake_detached(loaded, core.token(service.cluster), fn() {
+          core.refresh(service.cluster)
+        })
+      {
         Ok(group) ->
           agent_group.send_message(group, agent_id, message)
           |> result.map_error(fn(error) { string.inspect(error) })
@@ -265,7 +285,8 @@ pub fn send_message(
   }
 }
 
-/// Durably requests compaction for one agent without waking a dormant group.
+/// Wakes the group through the cluster RPC, then durably requests compaction
+/// through the host-routed compaction RPC.
 pub fn request_compaction(
   service: Service,
   id: String,
@@ -273,12 +294,42 @@ pub fn request_compaction(
 ) -> Result(Int, String) {
   use metadata <- result.try(load_metadata(service, id))
   use _ <- result.try(validate_agent(metadata, agent_id))
-  case agent_group_registry.request_compaction(id, agent_id) {
-    Ok(generation) -> Ok(generation)
-    Error(agent_group_registry.NotFound(_)) -> Error("agent group is not awake")
-    Error(agent_group_registry.CompactionFailed(reason)) -> Error(reason)
-    Error(error) -> Error(string.inspect(error))
-  }
+  // Install this session's profiles before the wake RPC may choose this node.
+  // Resuming is read-only and leaves the group dormant.
+  use group_config <- result.try(group_config(service, metadata))
+  use _ <- result.try(
+    agent_group.resume(group_config)
+    |> result.map_error(fn(error) {
+      "could not prepare session for compaction: " <> string.inspect(error)
+    }),
+  )
+  use _ <- result.try(
+    cluster_call(
+      service,
+      agent_group_rpc.wake_method_name(),
+      agent_group_rpc.wake_request(id, group_key(id)),
+      decode.string,
+    )
+    |> result.map_error(fn(error) { "could not wake session: " <> error }),
+  )
+  cluster_call(
+    service,
+    agent_group_rpc.compaction_method_name(),
+    agent_group_rpc.compaction_request(id, agent_id),
+    decode.int,
+  )
+  |> result.map_error(fn(error) { "could not request compaction: " <> error })
+}
+
+fn cluster_call(
+  service: Service,
+  method: String,
+  request: request,
+  decoder: decode.Decoder(response),
+) -> Result(response, String) {
+  let #(ip, port) = core.node(service.cluster)
+  core.call(ip, port, core.token(service.cluster), method, request, decoder)
+  |> result.map_error(fn(error) { string.inspect(error) })
 }
 
 fn deliver_registered(

@@ -127,6 +127,8 @@ gleam run
 | `HARNESS3_MCP_CONFIG_PATH` | unset (reuse the persisted catalog) |
 | `HARNESS3_BIND` | `127.0.0.1` |
 | `HARNESS3_PORT` | `8080` |
+| `HARNESS3_CLUSTER_BIND` | `127.0.0.1` |
+| `HARNESS3_CLUSTER_PORT` | `0` (ephemeral) |
 | `HARNESS3_WORKSPACE_ROOT` | `..` (resolved and suggested in the UI) |
 | `HARNESS3_DATA_DIR` | `./.harness3-server-data` |
 | `HARNESS3_STORAGE` | `local` |
@@ -173,8 +175,9 @@ its target, and starts that agent's first round.
 
 The **Compact** button in the selected agent's thread toolbar manually queues a
 handover compaction. It is available after that agent has session messages,
-shows pending and retry states, and fails without waking the group if the team
-is not currently awake.
+shows pending and retry states, and first sends the idempotent cluster wake RPC
+before sending the host-routed compaction RPC. An inactive team is therefore
+woken automatically, while an already-active team is left running in place.
 
 ## Test
 
