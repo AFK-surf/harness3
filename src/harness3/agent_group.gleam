@@ -338,7 +338,15 @@ pub fn wake_as_with_membership_refresh(
   let catalog = model_catalog.catalog(catalog_session)
   use _ <- result.try(validate_models(group, catalog))
   use _ <- result.try(ensure_claimable(group.execution))
-  let claimed = claim(group, owner, config.lease_duration_seconds)
+  // Never derive the new epoch from the group object alone. A group written
+  // before the epoch was carried through `Idle`/`Completed` decodes with epoch
+  // 0, so its epochs would restart and could collide with an index entry a
+  // previously crashed coordinator left behind — reusing a running-index key
+  // and failing every wake for that owner. Surviving entries are the
+  // authority on how far the epoch has actually advanced.
+  let floor =
+    int.max(execution_epoch(group.execution), indexed_epoch(config, group))
+  let claimed = claim(group, owner, floor, config.lease_duration_seconds)
   let claimed_body =
     encode_group(claimed) |> json.to_string |> bit_array.from_string
   use metadata <- result.try(
@@ -1819,6 +1827,7 @@ fn ensure_claimable(execution: ExecutionState) -> Result(Nil, Error) {
 fn claim(
   group: AgentGroup,
   owner: String,
+  epoch_floor: Int,
   lease_duration_seconds: Int,
 ) -> AgentGroup {
   AgentGroup(
@@ -1827,11 +1836,34 @@ fn claim(
     agents: list.map(group.agents, inject_pending),
     execution: Claimed(
       owner,
-      execution_epoch(group.execution) + 1,
+      epoch_floor + 1,
       system_time(Second) + lease_duration_seconds,
       claim_nonce(),
     ),
   )
+}
+
+/// Highest epoch among this group's surviving running-index entries, or 0 when
+/// the prefix cannot be read. A read failure only means the claim may reuse an
+/// epoch, which the index write then rejects — the same outcome as before this
+/// check existed, so it must not fail the wake.
+fn indexed_epoch(config: Config, group: AgentGroup) -> Int {
+  let prefix = running_index_prefix() <> uri.percent_encode(group.id) <> "/"
+  case storage.list(config.storage, prefix) {
+    Error(_) -> 0
+    Ok(entries) ->
+      list.fold(entries, 0, fn(highest, item) {
+        case storage.get(config.storage, item.key) {
+          Error(_) -> highest
+          Ok(object) ->
+            case decode_running_index(item.key, object.body) {
+              Ok(entry) if entry.group_id == group.id ->
+                int.max(highest, entry.epoch)
+              _ -> highest
+            }
+        }
+      })
+  }
 }
 
 fn inject_pending(state: agent.State) -> agent.State {

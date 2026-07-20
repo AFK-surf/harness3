@@ -179,17 +179,24 @@ fn handle_message(
   }
 }
 
+/// Distinguishes an authoritative answer ("this configuration is gone or
+/// disabled") from a failure to reach the registry at all. Only the former may
+/// tear down an agent's live transports.
 fn configuration_of(
   runtime: Subject(Message),
   configuration_id: String,
-) -> Result(configuration.Configuration, String) {
-  exception.rescue(fn() {
-    process.call(runtime, 5000, fn(reply) {
-      GetConfiguration(configuration_id, reply)
+) -> Result(configuration.Configuration, connections.LoadError) {
+  case
+    exception.rescue(fn() {
+      process.call(runtime, 5000, fn(reply) {
+        GetConfiguration(configuration_id, reply)
+      })
     })
-  })
-  |> result.map_error(fn(_) { "MCP runtime is unavailable" })
-  |> result.flatten
+  {
+    Error(_) -> Error(connections.Unavailable("MCP runtime is unavailable"))
+    Ok(Error(reason)) -> Error(connections.Revoked(reason))
+    Ok(Ok(configuration)) -> Ok(configuration)
+  }
 }
 
 fn enabled_configuration(

@@ -148,9 +148,13 @@ not produce event N+1 until `consume` of event N has returned (backpressure cont
   the registry is carried through untouched, so a group can pass through a node with a
   smaller plugin set without losing state.
 - A plugin may also register a **release hook** (`on_release`), run by the agent's
-  plugin host before it stops, to release ephemeral resources. It must not block:
-  it is on the coordinator's path when an activated-but-unstarted agent is
-  discarded, and the host stop is bounded (5 s) before the host is killed.
+  plugin host before it stops, to release ephemeral resources. Hooks are isolated
+  from each other (a raising hook cannot skip the rest, nor make the host exit
+  abnormally) and must not block: they are on the coordinator's path when an
+  activated-but-unstarted agent is discarded, and the host stop is bounded (5 s),
+  after which the host is unlinked and killed. Unlinking first is essential —
+  `kill` exits with reason `killed`, which a non-trapping linked caller does not
+  survive.
 - Hooks are pure functions `state → (new_state, context, value)`. All state values must
   be valid JSON strings (validated after every hook).
 - `call_dependency` lets a hook synchronously invoke a *declared* dependency's callback,
@@ -345,7 +349,10 @@ whole group is one JSON object; every mutation is a CAS (`IfUnchanged`) that bum
 `revision` and (while owned) extends the lease. The epoch increments on every claim,
 is carried through `Idle`/`Completed` as well as `Claimed`, and is the fencing token
 in the running-index key — releasing a claim must not reset it, or a later claim
-could reuse a key a stale index entry still occupies. Every claim also carries a random nonce so
+could reuse a key a stale index entry still occupies. A claim takes its epoch from
+the greater of the group's own epoch and the highest surviving running-index entry,
+so a group written before the epoch was carried (or one whose entries outlived a
+crash) still advances past anything already published. Every claim also carries a random nonce so
 its body is unique per attempt — the ambiguous-CAS read-back confirmation must never
 match a concurrent same-owner claim from the same wall-clock second.
 

@@ -1,4 +1,5 @@
 import gleam/dict
+import gleam/erlang/process
 import gleam/json
 import gleam/option.{None}
 import harness3/llm
@@ -139,4 +140,29 @@ pub fn missing_plugin_state_survives_until_plugin_returns_test() {
   assert dict.get(restored_states, "temporarily_missing")
     == Ok("{\"count\":10}")
   assert dict.get(restored_states, "available") == Ok("{\"count\":3}")
+}
+
+pub fn a_raising_release_hook_does_not_stop_other_plugins_test() {
+  // Release hooks are caller-supplied. One that raises must not skip the
+  // cleanup of the plugins after it, and must not escape to the plugin host
+  // (an abnormal host exit propagates over its link and kills the coordinator
+  // or the agent worker).
+  let released = process.new_subject()
+  let raising =
+    plugin.new("raising", "null")
+    |> plugin.on_release(
+      plugin.release_hook(fn(_state, _context) {
+        panic as "release hooks must be isolated"
+      }),
+    )
+  let clean =
+    plugin.new("clean", "null")
+    |> plugin.on_release(
+      plugin.release_hook(fn(_state, _context) { process.send(released, Nil) }),
+    )
+  // `clean` releases after `raising`: hooks run in reverse activation order.
+  let assert Ok(registry) = plugin.registry([clean, raising])
+  let assert Ok(runtime) = plugin.activate(registry, plugin.empty_states())
+  plugin.release(runtime)
+  let assert Ok(Nil) = process.receive(released, within: 1000)
 }

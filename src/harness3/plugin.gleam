@@ -1,3 +1,4 @@
+import exception
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
@@ -174,7 +175,12 @@ pub fn release(runtime: Runtime) -> Nil {
       Ok(state) ->
         list.each(plugin.release_hooks, fn(hook) {
           let ReleaseHook(run:) = hook
-          run(state, plugin_context)
+          // Hooks are caller-supplied. A raising hook would make the plugin
+          // host exit abnormally — which, unlike its normal exit, propagates
+          // over the link and kills the coordinator or the agent worker — and
+          // would skip every remaining plugin's cleanup.
+          let _ = exception.rescue(fn() { run(state, plugin_context) })
+          Nil
         })
     }
   })

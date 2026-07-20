@@ -238,10 +238,16 @@ fn dispatch_round_robin(
     [], _ | _, [] -> Nil
     [candidate, ..rest], [node, ..remaining_nodes] -> {
       // A group that stopped cleanly after this scan's index snapshot was
-      // taken has already deleted its entry and released its claim;
-      // dispatching from the stale snapshot would resurrect it. Re-check the
-      // entry immediately before dispatching, and skip conservatively when
-      // the check itself fails.
+      // taken has already released its claim; dispatching from the stale
+      // snapshot would resurrect it. Re-check the entry immediately before
+      // dispatching, and skip conservatively when the check itself fails.
+      //
+      // Advisory, not airtight: shutdown releases the claim *before* deleting
+      // the index (see `agent_group.finish` — the opposite order can leave a
+      // claimed group with no entry, invisible here). So a group can be
+      // released while its entry still exists. Waking it then is harmless:
+      // it claims a fresh epoch, finds its agents terminal, and finishes,
+      // after which `clean_stale_entries` reaps the old entry.
       case storage.get(backend, candidate.index_key) {
         Ok(_) -> {
           case dispatch_candidate(dispatch, candidate, nodes) {

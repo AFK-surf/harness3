@@ -1052,15 +1052,23 @@ fn stop_plugin_host(host: PluginHost) -> Nil {
   process.send(subject, StopPlugins)
   // Bounded: the coordinator calls this (via `discard`) inside its own message
   // handler, and a host busy in a long tool call would otherwise starve the
-  // coordinator's lease renewal. Kill on timeout — the host's links then tear
-  // down anything it still owns.
+  // coordinator's lease renewal.
   let stopped =
     process.new_selector()
     |> process.select_specific_monitor(monitor, fn(_) { Nil })
     |> process.selector_receive(plugin_host_stop_milliseconds)
+  process.demonitor_process(monitor)
   case stopped {
     Ok(Nil) -> Nil
-    Error(Nil) -> process.kill(pid)
+    Error(Nil) -> {
+      // Unlink before killing. The host is spawn-linked to whoever activated
+      // it — the coordinator for an agent that was never started, otherwise
+      // the agent worker — and `kill` exits with reason `killed`, which a
+      // non-trapping linked process does not survive. Killing without
+      // unlinking would take the caller down too.
+      process.unlink(pid)
+      process.kill(pid)
+    }
   }
 }
 

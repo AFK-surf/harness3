@@ -32,6 +32,21 @@ pub type Listing {
   )
 }
 
+/// Why a configuration could not be loaded. `Revoked` is authoritative — the
+/// configuration is gone or disabled, so its servers must stop. `Unavailable`
+/// is a transient read failure, where tearing down live transports would kill
+/// OS child processes and discard HTTP sessions that are still perfectly good.
+pub type LoadError {
+  Revoked(reason: String)
+  Unavailable(reason: String)
+}
+
+pub fn load_error_reason(error: LoadError) -> String {
+  case error {
+    Revoked(reason) | Unavailable(reason) -> reason
+  }
+}
+
 pub type Connector =
   fn(configuration.Server, fn(String) -> Result(String, Nil)) ->
     Result(client.Connection, String)
@@ -42,7 +57,7 @@ pub type Connector =
 /// and forces reconnection on next use.
 pub type Spec {
   Spec(
-    load_configuration: fn() -> Result(configuration.Configuration, String),
+    load_configuration: fn() -> Result(configuration.Configuration, LoadError),
     connector: Connector,
     resolve_environment: fn(String) -> Result(String, Nil),
     now_seconds: fn() -> Int,
@@ -117,10 +132,11 @@ fn ensure_discovered(
   let Spec(load_configuration:, connector:, resolve_environment:, now_seconds:) =
     connections.spec
   case load_configuration() {
-    // The configuration was disabled, deleted, or is unreachable. Whatever the
-    // reason, these transports are no longer authorized by anything, so drop
-    // them rather than leaving servers running for the agent's lifetime.
-    Error(error) -> #(close(connections), Error(error))
+    // Revoked: nothing authorizes these servers any more, so stop them rather
+    // than leave them running for the agent's lifetime.
+    Error(Revoked(reason)) -> #(close(connections), Error(reason))
+    // Transient: keep the transports and fail just this call.
+    Error(Unavailable(reason)) -> #(connections, Error(reason))
     Ok(configuration) ->
       case is_fresh(connections, configuration) {
         True -> #(connections, Ok(Nil))
