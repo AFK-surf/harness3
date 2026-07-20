@@ -183,12 +183,14 @@ fn acquire_lock(path: String, attempts: Int) -> Result(String, Error) {
       // reopen could stamp over a successor's lock after a breaker removed
       // its own. A write through the descriptor lands on this holder's
       // (possibly already unlinked) inode instead, which is harmless.
-      use _ <- result.try(
+      let stamped =
         file_write_chunk(file, bit_array.from_string(token))
-        |> status_result,
-      )
-      use _ <- result.try(file_sync(file) |> status_result)
-      use _ <- result.try(file_close(file) |> status_result)
+        |> status_result
+        |> result.try(fn(_) { file_sync(file) |> status_result })
+      // Close unconditionally — a failed stamp must not leak the descriptor.
+      let closed = file_close(file) |> status_result
+      use _ <- result.try(stamped)
+      use _ <- result.try(closed)
       Ok(token)
     }
     Error(reason) ->
@@ -449,14 +451,25 @@ fn read_generation(config: Config, key: String) -> #(Int, Int) {
   }
 }
 
+/// Commits a per-key generation record. This is the destructive write that
+/// keeps version tokens unique, so it guards itself: the record is prepared
+/// on a random per-attempt temp path (a deterministic one is shared between
+/// holders — a stalled holder's late write could be renamed in under a new
+/// holder's verify) and the lock token is verified immediately before the
+/// committing rename, so a holder that lost the lock while preparing the
+/// record cannot roll the counter back over a new holder's mint.
 fn write_generation(
   config: Config,
   key: String,
   mtime: Int,
   generation: Int,
+  token: String,
 ) -> Result(Nil, Error) {
   let path = generation_path(config, key)
-  let temporary = path <> ".temporary"
+  let temporary =
+    path
+    <> ".temporary-"
+    <> bit_array.base64_url_encode(crypto.strong_random_bytes(12), False)
   use _ <- result.try(ensure_dir(path) |> status_result)
   use _ <- result.try(
     file_write(
@@ -468,7 +481,13 @@ fn write_generation(
     )
     |> status_result,
   )
-  file_rename(temporary, path) |> status_result
+  case verify_lock(config, token) {
+    Ok(Nil) -> file_rename(temporary, path) |> status_result
+    Error(error) -> {
+      let _ = file_delete(temporary)
+      Error(error)
+    }
+  }
 }
 
 fn generation_for(
@@ -481,14 +500,17 @@ fn generation_for(
   case stored_mtime == mtime && stored_generation > 0 {
     True -> Ok(stored_generation)
     False -> {
-      // Minting is a destructive write even when reached from a read (`get`,
-      // `head`, `list` refresh mismatched records, e.g. a crash sentinel): a
-      // stalled holder writing after losing the lock would roll the per-key
-      // counter back below what the new holder minted, resurrecting a
-      // retired version token.
+      // Minting happens even when reached from a read (`get`, `head`,
+      // `list` refresh mismatched records, e.g. a crash sentinel);
+      // `write_generation` verifies the lock token itself.
       let generation = stored_generation + 1
-      use _ <- result.try(verify_lock(config, token))
-      use _ <- result.try(write_generation(config, key, mtime, generation))
+      use _ <- result.try(write_generation(
+        config,
+        key,
+        mtime,
+        generation,
+        token,
+      ))
       Ok(generation)
     }
   }
@@ -580,14 +602,10 @@ fn put_(
     use _ <- result.try(check_condition(config, condition, key, path, token))
     let #(_, stored_generation) = read_generation(config, key)
     let generation = stored_generation + 1
-    // The generation record is itself a destructive commit: writing it after
-    // losing the lock would roll the per-key counter back below what a new
-    // holder has already minted, resurrecting a retired version token.
-    use _ <- result.try(verify_lock(config, token))
     // Persist an invalid mtime first. If the VM stops between replacement and
     // the final metadata write, a later reader will conservatively mint a new
     // generation instead of accepting a stale conditional token.
-    use _ <- result.try(write_generation(config, key, -2, generation))
+    use _ <- result.try(write_generation(config, key, -2, generation, token))
     use _ <- result.try(ensure_dir(path) |> status_result)
     // Random per-attempt temp path, like `stream_put_`. A deterministic
     // per-key path is shared between holders: a stalled holder's resumed
@@ -597,9 +615,13 @@ fn put_(
     use _ <- result.try(ensure_dir(temporary) |> status_result)
     use _ <- result.try(
       file_write(temporary, body, [Raw, Binary, Sync])
-      |> status_result,
+      |> status_result
+      |> result.try(fn(_) { verify_lock(config, token) })
+      |> result.map_error(fn(error) {
+        let _ = file_delete(temporary)
+        error
+      }),
     )
-    use _ <- result.try(verify_lock(config, token))
     case file_rename(temporary, path) |> status_result {
       Error(error) -> {
         let _ = file_delete(temporary)
@@ -607,10 +629,13 @@ fn put_(
       }
       Ok(Nil) -> {
         let mtime = mtime_seconds(path)
-        // The final metadata write is destructive too: after a lost lock it
-        // would replace the new holder's record, so it gets its own verify.
-        use _ <- result.try(verify_lock(config, token))
-        use _ <- result.try(write_generation(config, key, mtime, generation))
+        use _ <- result.try(write_generation(
+          config,
+          key,
+          mtime,
+          generation,
+          token,
+        ))
         Ok(Metadata(
           key:,
           size: bit_array.byte_size(body),
@@ -674,7 +699,6 @@ fn delete_(config: Config, key: String) -> Result(Nil, Error) {
     case is_file(path) {
       False -> Ok(Nil)
       True -> {
-        use _ <- result.try(verify_lock(config, token))
         // The bumped tombstone must always survive the delete. Garbage
         // collecting it when the object's mtime second has passed was tried
         // and is unsound: object mtimes are not monotonic (stream_put commits
@@ -688,6 +712,7 @@ fn delete_(config: Config, key: String) -> Result(Nil, Error) {
           key,
           -1,
           stored_generation + 1,
+          token,
         ))
         // The delete is its own destructive commit: without this verify, a
         // holder stalled through the tombstone write could remove an object
@@ -787,10 +812,13 @@ fn stream_put_(
               ))
               let #(_, stored_generation) = read_generation(config, key)
               let generation = stored_generation + 1
-              // As in `put_`: the generation write is destructive and must
-              // not happen after the lock was lost.
-              use _ <- result.try(verify_lock(config, token))
-              use _ <- result.try(write_generation(config, key, -2, generation))
+              use _ <- result.try(write_generation(
+                config,
+                key,
+                -2,
+                generation,
+                token,
+              ))
               use _ <- result.try(ensure_dir(path) |> status_result)
               use _ <- result.try(verify_lock(config, token))
               case file_rename(temporary, path) |> status_result {
@@ -800,14 +828,12 @@ fn stream_put_(
                 }
                 Ok(Nil) -> {
                   let mtime = mtime_seconds(path)
-                  // As in `put_`: the final metadata write gets its own
-                  // verify.
-                  use _ <- result.try(verify_lock(config, token))
                   use _ <- result.try(write_generation(
                     config,
                     key,
                     mtime,
                     generation,
+                    token,
                   ))
                   Ok(Metadata(
                     key:,
