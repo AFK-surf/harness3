@@ -280,7 +280,9 @@ fn message_tool(
                   Ok(tool_result(
                     state,
                     context,
-                    "Message delivered to `" <> target <> "`",
+                    "Message delivered to `"
+                      <> target
+                      <> "`. Any reply will be delivered automatically; there is no need to poll or wait.",
                     False,
                   ))
                 Error(error) ->

@@ -1,7 +1,10 @@
+import exception
 import gleam/bit_array
 import gleam/crypto
+import gleam/erlang/process
 import gleam/json
 import gleam/string
+import harness3/agent_group_registry
 import harness3/llm
 import harness3/plugin
 import harness3_server/coding_plugin
@@ -74,4 +77,51 @@ pub fn coding_tools_write_read_exec_and_reject_escape_test() {
   assert is_error
   assert string.contains(output_text(escaped), "path escapes")
   let assert Ok(Nil) = simplifile.delete(root)
+}
+
+pub fn message_agent_says_replies_arrive_without_polling_test() {
+  let group_id = temporary_root()
+  let delivered = process.new_subject()
+  let coordinator = process.spawn_unlinked(fn() { process.sleep_forever() })
+  agent_group_registry.register(
+    group_id,
+    coordinator,
+    fn() { Ok(Nil) },
+    fn(agent_id, message) {
+      process.send(delivered, #(agent_id, message))
+      Ok(Nil)
+    },
+    fn(_) { Ok(1) },
+  )
+  use <- exception.defer(fn() {
+    agent_group_registry.unregister(group_id, coordinator)
+    process.kill(coordinator)
+  })
+
+  let team =
+    coding_plugin.collaboration(
+      group_id,
+      "lead",
+      "Lead",
+      ["researcher"],
+      "Workspace access.",
+    )
+  let assert Ok(registry) = plugin.registry([team])
+  let assert Ok(runtime) = plugin.activate(registry, plugin.empty_states())
+  let assert Ok(#(
+    _,
+    plugin.ToolOutput(content: [llm.Text(message)], is_error: False),
+  )) =
+    plugin.invoke_tool(
+      runtime,
+      "MessageAgent",
+      invocation("message", [
+        #("agent_id", json.string("researcher")),
+        #("message", json.string("Investigate the failure")),
+      ]),
+    )
+  assert message
+    == "Message delivered to `researcher`. Any reply will be delivered automatically; there is no need to poll or wait."
+  let assert Ok(#("researcher", "Investigate the failure")) =
+    process.receive(delivered, within: 1000)
 }
