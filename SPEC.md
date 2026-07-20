@@ -254,7 +254,8 @@ event-consumer failures are permanent.
 ## 5. Model catalog
 
 A versioned JSON object: `revision` + a list of models (id, name, endpoint, type ∈
-{openai_chat_completions, openai_responses, anthropic_messages}, api-key credentials —
+{openai_chat_completions, openai_responses, anthropic_messages}, optional per-model
+`max_output_tokens` (applied to every request the model serves), api-key credentials —
 **stored in plaintext** in the object). `create` uses `IfAbsent`; `commit` bumps
 `revision` and CAS-writes with `IfUnchanged`, mapping precondition failure to
 `ConcurrentUpdate`. `provider(model)` instantiates the matching adapter. Groups store
@@ -628,8 +629,8 @@ Registration of an id overwrites; unregistration only removes the exact (id, pid
   `message_start` and `message_delta`; Chat streaming usage is requested via
   `stream_options.include_usage`; cache-write tokens exist only on Anthropic and
   OpenRouter-style extensions.
-- **Notable defaults.** Anthropic `max_tokens` defaults to **1024** when the profile
-  sets no `max_output_tokens` (truncation risk for agent turns); Anthropic requests set
+- **Notable defaults.** Anthropic `max_tokens` defaults to **1024** when the model's
+  catalog entry sets no `max_output_tokens` (truncation risk for agent turns); Anthropic requests set
   a top-level ephemeral `cache_control`; Responses requests always send `store: false`
   and `include: ["reasoning.encrypted_content"]`, and full history is resent each round
   (`previous_response_id` is not used); `reasoning_effort` maps to adaptive thinking +

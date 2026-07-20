@@ -44,6 +44,7 @@ pub fn wake_rpc_is_idempotent_and_precedes_routed_compaction_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -57,14 +58,9 @@ pub fn wake_rpc_is_idempotent_and_precedes_routed_compaction_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "profile",
-      registry,
-      transport,
-      None,
-      None,
-      fn(_) { Ok(Nil) },
-    )
+    agent_profile.AgentProfile("profile", registry, transport, None, fn(_) {
+      Ok(Nil)
+    })
   let state =
     agent.State(
       ..agent.state("agent", "model"),
@@ -244,6 +240,7 @@ pub fn stop_rpc_finalizes_a_crashed_owner_group_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -259,7 +256,6 @@ pub fn stop_rpc_finalizes_a_crashed_owner_group_test() {
       "crashed-profile",
       registry,
       transport,
-      None,
       None,
       fn(_) { Ok(Nil) },
     )
@@ -358,6 +354,7 @@ pub fn inject_rpc_forwards_to_awake_host_and_queues_tool_call_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -371,14 +368,9 @@ pub fn inject_rpc_forwards_to_awake_host_and_queues_tool_call_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "profile",
-      registry,
-      transport,
-      None,
-      None,
-      fn(_) { Ok(Nil) },
-    )
+    agent_profile.AgentProfile("profile", registry, transport, None, fn(_) {
+      Ok(Nil)
+    })
   let state =
     agent.State(
       ..agent.state("agent", "model"),

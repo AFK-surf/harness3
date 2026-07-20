@@ -3,6 +3,7 @@ import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/json
 import gleam/list
+import gleam/option.{type Option, None}
 import gleam/result
 import gleam/string
 import harness3/llm.{type Provider}
@@ -42,6 +43,10 @@ pub type Model {
     model_type: ModelType,
     credentials: Credentials,
     context_window_tokens: Int,
+    /// Per-model output-token cap sent with every request. `None` leaves the
+    /// provider default (note the Anthropic adapter then falls back to its
+    /// required-field minimum of 1024).
+    max_output_tokens: Option(Int),
   )
 }
 
@@ -237,7 +242,12 @@ fn validate_model(model: Model) -> Result(Nil, Error) {
     _, _, _, "", _ -> Error(InvalidCatalog("model credentials cannot be empty"))
     _, _, _, _, tokens if tokens <= 0 ->
       Error(InvalidCatalog("model context window must be positive"))
-    _, _, _, _, _ -> Ok(Nil)
+    _, _, _, _, _ ->
+      case model.max_output_tokens {
+        option.Some(tokens) if tokens <= 0 ->
+          Error(InvalidCatalog("model max output tokens must be positive"))
+        _ -> Ok(Nil)
+      }
   }
 }
 
@@ -297,6 +307,7 @@ fn encode_model(model: Model) -> json.Json {
     #("endpoint", json.string(model.endpoint)),
     #("type", json.string(model_type_name(model.model_type))),
     #("context_window_tokens", json.int(model.context_window_tokens)),
+    #("max_output_tokens", json.nullable(model.max_output_tokens, json.int)),
     #(
       "credentials",
       json.object([
@@ -361,6 +372,11 @@ fn model_decoder() -> decode.Decoder(Model) {
     0,
     decode.int,
   )
+  use max_output_tokens <- decode.optional_field(
+    "max_output_tokens",
+    None,
+    decode.optional(decode.int),
+  )
   decode.success(Model(
     id,
     name,
@@ -368,6 +384,7 @@ fn model_decoder() -> decode.Decoder(Model) {
     model_type,
     credentials,
     context_window_tokens,
+    max_output_tokens,
   ))
 }
 

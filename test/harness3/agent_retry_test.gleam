@@ -14,6 +14,7 @@ fn test_model() -> model_catalog.Model {
     model_type: model_catalog.OpenAIResponses,
     credentials: model_catalog.api_key("secret"),
     context_window_tokens: 100_000,
+    max_output_tokens: None,
   )
 }
 

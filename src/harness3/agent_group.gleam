@@ -781,7 +781,7 @@ fn prepare_agent(
       catalog_revision: model_catalog.revision(catalog),
       registry: profile.registry,
       transport: profile.transport,
-      max_output_tokens: profile.max_output_tokens,
+      max_output_tokens: model.max_output_tokens,
       reasoning_effort: profile.reasoning_effort,
       context_window_tokens: model.context_window_tokens,
     )

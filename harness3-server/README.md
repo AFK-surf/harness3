@@ -143,7 +143,12 @@ gleam run
 | `HARNESS3_DATA_DIR` | `./.harness3-server-data` |
 | `HARNESS3_STORAGE` | `local` |
 | `HARNESS3_MODEL_TIMEOUT_MS` | `300000` |
-| `HARNESS3_MAX_OUTPUT_TOKENS` | `8192` |
+
+The output-token cap is configured per model, not globally: each model's
+`maxTokens` from the Pi models file is carried into the harness model catalog
+and applied to every request that model serves. A model without `maxTokens`
+uses the provider default (the Anthropic API's required-field fallback is
+1024).
 
 `coding.exec` deliberately gives coding agents a shell inside the selected workspace.
 Keep the default loopback bind unless the surrounding environment provides

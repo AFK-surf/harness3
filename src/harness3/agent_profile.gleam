@@ -11,7 +11,6 @@ pub type AgentProfile {
     id: String,
     registry: plugin.Registry,
     transport: agent.ModelTransport,
-    max_output_tokens: Option(Int),
     reasoning_effort: Option(String),
     observe: fn(agent.Event) -> Result(Nil, agent.Error),
   )

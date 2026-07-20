@@ -3,6 +3,7 @@ import gleam/bit_array
 import gleam/crypto
 import gleam/dynamic.{type Dynamic}
 import gleam/list
+import gleam/option.{None}
 import gleam/string
 import harness3/llm
 import harness3/model_catalog
@@ -29,6 +30,7 @@ pub fn model_catalog_persistence_and_cas_test() {
       model_type: model_catalog.OpenAIResponses,
       credentials: model_catalog.api_key("secret"),
       context_window_tokens: 100_000,
+      max_output_tokens: None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(first) =
@@ -43,6 +45,7 @@ pub fn model_catalog_persistence_and_cas_test() {
       model_type: model_catalog.AnthropicMessages,
       credentials: model_catalog.api_key("another-secret"),
       context_window_tokens: 200_000,
+      max_output_tokens: None,
     )
   let assert Ok(updated) =
     model_catalog.put_model(model_catalog.catalog(first), second_model)
@@ -74,6 +77,7 @@ pub fn environment_credentials_persist_only_the_reference_test() {
       model_type: model_catalog.OpenAIResponses,
       credentials: model_catalog.environment_variable(variable),
       context_window_tokens: 100_000,
+      max_output_tokens: None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog/models", catalog)

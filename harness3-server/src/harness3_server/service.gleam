@@ -105,7 +105,6 @@ pub opaque type Service {
     mcp_runtime: mcp.Runtime,
     cluster: core.Cluster,
     model_transport: agent.ModelTransport,
-    max_output_tokens: Int,
   )
 }
 
@@ -139,10 +138,6 @@ pub fn start() -> Result(Service, String) {
           "HARNESS3_MODEL_TIMEOUT_MS",
           300_000,
         )),
-        max_output_tokens: config.environment_int(
-          "HARNESS3_MAX_OUTPUT_TOKENS",
-          8192,
-        ),
       ))
   }
 }
@@ -1073,7 +1068,6 @@ fn group_config(
           id: profile_id(metadata.id, spec.id),
           registry:,
           transport: service.model_transport,
-          max_output_tokens: Some(service.max_output_tokens),
           reasoning_effort: None,
           observe: fn(_) { Ok(Nil) },
         ),

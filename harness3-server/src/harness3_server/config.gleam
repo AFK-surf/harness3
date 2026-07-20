@@ -143,6 +143,7 @@ pub fn catalog_model(model: ModelConfig) -> model_catalog.Model {
     model_type: model.model_type,
     credentials: model_catalog.environment_variable(credential_variable),
     context_window_tokens: model.context_window_tokens,
+    max_output_tokens: model.max_output_tokens,
   )
 }
 

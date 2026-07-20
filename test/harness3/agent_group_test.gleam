@@ -226,6 +226,7 @@ pub fn parallel_agents_commit_through_group_test() {
       model_type: model_catalog.OpenAIResponses,
       credentials: model_catalog.api_key("secret"),
       context_window_tokens: 100_000,
+      max_output_tokens: None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(storage, "catalog", catalog)
@@ -236,7 +237,6 @@ pub fn parallel_agents_commit_through_group_test() {
       id: "a",
       registry:,
       transport: gated_transport(gate, "A finished"),
-      max_output_tokens: None,
       reasoning_effort: None,
       observe:,
     ),
@@ -244,7 +244,6 @@ pub fn parallel_agents_commit_through_group_test() {
       id: "b",
       registry:,
       transport: gated_transport(gate, "B finished"),
-      max_output_tokens: None,
       reasoning_effort: None,
       observe:,
     ),
@@ -298,6 +297,7 @@ pub fn linked_agent_crash_terminates_process_tree_test() {
       model_type: model_catalog.OpenAIResponses,
       credentials: model_catalog.api_key("secret"),
       context_window_tokens: 100_000,
+      max_output_tokens: None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(storage, "catalog", catalog)
@@ -313,7 +313,6 @@ pub fn linked_agent_crash_terminates_process_tree_test() {
           id: "crashing",
           registry:,
           transport: crashing_gated_transport(crashing_gate),
-          max_output_tokens: None,
           reasoning_effort: None,
           observe:,
         ),
@@ -321,7 +320,6 @@ pub fn linked_agent_crash_terminates_process_tree_test() {
           id: "sibling",
           registry:,
           transport: gated_transport(sibling_gate, "never completed"),
-          max_output_tokens: None,
           reasoning_effort: None,
           observe:,
         ),
@@ -428,6 +426,7 @@ pub fn full_agent_loop_with_mocked_llm_test() {
       model_type: model_catalog.OpenAIResponses,
       credentials: model_catalog.api_key("secret"),
       context_window_tokens: 100_000,
+      max_output_tokens: None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(storage, "catalog", catalog)
@@ -497,7 +496,6 @@ pub fn full_agent_loop_with_mocked_llm_test() {
           id: "agent",
           registry:,
           transport:,
-          max_output_tokens: None,
           reasoning_effort: None,
           observe:,
         ),
@@ -572,6 +570,7 @@ pub fn message_sent_to_active_agent_is_injected_after_current_call_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -601,14 +600,7 @@ pub fn message_sent_to_active_agent_is_injected_after_current_call_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config =
     agent_group.Config(backend, "groups/active-message", [profile], 10, 100)
   let assert Ok(loaded) =
@@ -651,6 +643,7 @@ pub fn message_sent_to_inactive_agent_persists_and_starts_it_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -661,7 +654,6 @@ pub fn message_sent_to_inactive_agent_persists_and_starts_it_test() {
       "agent",
       registry,
       gated_transport(gate, "message handled"),
-      None,
       None,
       observe,
     )
@@ -752,6 +744,7 @@ pub fn tool_call_injected_into_inactive_agent_persists_and_starts_it_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -762,7 +755,6 @@ pub fn tool_call_injected_into_inactive_agent_persists_and_starts_it_test() {
       "agent",
       registry,
       gated_transport(gate, "tool call handled"),
-      None,
       None,
       observe,
     )
@@ -832,6 +824,7 @@ pub fn tool_call_injected_after_assistant_tail_gets_user_hint_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -842,7 +835,6 @@ pub fn tool_call_injected_after_assistant_tail_gets_user_hint_test() {
       "agent",
       registry,
       gated_transport(gate, "handled"),
-      None,
       None,
       observe,
     )
@@ -901,6 +893,7 @@ pub fn tool_call_injected_after_user_tail_needs_no_hint_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -911,7 +904,6 @@ pub fn tool_call_injected_after_user_tail_needs_no_hint_test() {
       "agent",
       registry,
       gated_transport(gate, "handled"),
-      None,
       None,
       observe,
     )
@@ -966,6 +958,7 @@ pub fn tool_call_injected_into_active_agent_is_queued_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -1001,14 +994,7 @@ pub fn tool_call_injected_into_active_agent_is_queued_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config =
     agent_group.Config(backend, "groups/active-inject", [profile], 10, 100)
   let assert Ok(loaded) =
@@ -1092,6 +1078,7 @@ pub fn tool_call_injection_validates_its_shape_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -1102,7 +1089,6 @@ pub fn tool_call_injection_validates_its_shape_test() {
       "agent",
       registry,
       gated_transport(gate, "never reached"),
-      None,
       None,
       observe,
     )
@@ -1175,6 +1161,7 @@ pub fn second_tool_call_injection_is_queued_without_hint_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -1210,14 +1197,7 @@ pub fn second_tool_call_injection_is_queued_without_hint_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config =
     agent_group.Config(backend, "groups/second-injection", [profile], 10, 100)
   let assert Ok(loaded) =
@@ -1308,6 +1288,7 @@ pub fn queued_tool_call_pair_folds_into_history_on_wake_after_crash_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -1342,14 +1323,7 @@ pub fn queued_tool_call_pair_folds_into_history_on_wake_after_crash_test() {
       }
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   // One-second lease so the crashed claim expires quickly enough to re-wake.
   let config =
     agent_group.Config(backend, "groups/crash-fold", [profile], 1, 100)
@@ -1430,6 +1404,7 @@ pub fn plugin_callback_between_agents_test() {
       model_type: model_catalog.OpenAIResponses,
       credentials: model_catalog.api_key("secret"),
       context_window_tokens: 100_000,
+      max_output_tokens: None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(storage, "catalog", catalog)
@@ -1525,7 +1500,6 @@ pub fn plugin_callback_between_agents_test() {
           id: "caller",
           registry: caller_registry,
           transport: caller_transport,
-          max_output_tokens: None,
           reasoning_effort: None,
           observe:,
         ),
@@ -1533,7 +1507,6 @@ pub fn plugin_callback_between_agents_test() {
           id: "receiver",
           registry: receiver_registry,
           transport: receiver_transport,
-          max_output_tokens: None,
           reasoning_effort: None,
           observe:,
         ),
@@ -1583,6 +1556,7 @@ pub fn create_is_dormant_and_wake_registers_and_indexes_until_stop_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -1593,7 +1567,6 @@ pub fn create_is_dormant_and_wake_registers_and_indexes_until_stop_test() {
       "shared-profile",
       registry,
       gated_transport(gate, "done"),
-      None,
       None,
       observe,
     )
@@ -1648,6 +1621,7 @@ pub fn wake_loads_the_model_catalog_on_demand_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) =
     model_catalog.put_model(model_catalog.new(), old_model)
@@ -1664,14 +1638,7 @@ pub fn wake_loads_the_model_catalog_on_demand_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config = agent_group.Config(backend, "groups/catalog", [profile], 10, 100)
   let assert Ok(loaded) =
     agent_group.create(
@@ -1704,6 +1671,7 @@ pub fn concurrent_storage_update_terminates_and_unregisters_coordinator_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -1718,7 +1686,6 @@ pub fn concurrent_storage_update_terminates_and_unregisters_coordinator_test() {
           "agent",
           registry,
           gated_transport(gate, "will conflict"),
-          None,
           None,
           observe,
         ),
@@ -1764,6 +1731,7 @@ pub fn expired_lease_terminates_and_unregisters_coordinator_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -1778,7 +1746,6 @@ pub fn expired_lease_terminates_and_unregisters_coordinator_test() {
           "agent",
           registry,
           gated_transport(gate, "never committed"),
-          None,
           None,
           observe,
         ),
@@ -1814,6 +1781,7 @@ pub fn ambiguous_successful_cas_is_idempotent_and_fences_next_commit_test() {
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
       100_000,
+      None,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -1857,14 +1825,7 @@ pub fn ambiguous_successful_cas_is_idempotent_and_fences_next_commit_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config =
     agent_group.Config(backend, "groups/ambiguous", [profile], 10, 100)
   let assert Ok(loaded) =
@@ -1890,6 +1851,7 @@ fn test_model() -> model_catalog.Model {
     model_catalog.OpenAIResponses,
     model_catalog.api_key("secret"),
     100_000,
+    None,
   )
 }
 
@@ -1910,7 +1872,6 @@ pub fn wake_applied_update_replaces_roster_and_preserves_survivors_test() {
       registry,
       transport,
       None,
-      None,
       observe,
     )
   let removed_profile =
@@ -1919,7 +1880,6 @@ pub fn wake_applied_update_replaces_roster_and_preserves_survivors_test() {
       registry,
       transport,
       None,
-      None,
       observe,
     )
   let added_profile =
@@ -1927,7 +1887,6 @@ pub fn wake_applied_update_replaces_roster_and_preserves_survivors_test() {
       "added-profile",
       registry,
       transport,
-      None,
       None,
       observe,
     )
@@ -2065,7 +2024,6 @@ pub fn failed_wake_never_leaves_a_stranded_claim_test() {
       empty_registry,
       transport,
       None,
-      None,
       observe,
     )
   let dormant =
@@ -2101,7 +2059,6 @@ pub fn failed_wake_never_leaves_a_stranded_claim_test() {
       "boom-profile",
       failing_registry,
       transport,
-      None,
       None,
       observe,
     )
@@ -2208,14 +2165,7 @@ pub fn automatic_compaction_reuses_prefix_and_preserves_full_history_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config =
     agent_group.Config(backend, "groups/compact-auto", [profile], 10, 100)
   let initial =
@@ -2300,14 +2250,7 @@ pub fn automatic_compaction_waits_until_eighty_percent_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config =
     agent_group.Config(backend, "groups/compact-threshold", [profile], 10, 20)
   let assert Ok(loaded) =
@@ -2355,14 +2298,7 @@ pub fn manual_compaction_runs_for_dormant_agent_in_awake_group_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config =
     agent_group.Config(backend, "groups/compact-manual", [profile], 10, 100)
   let historic = llm.Message(llm.User, [llm.Text("historic request")])
@@ -2429,14 +2365,7 @@ pub fn malformed_compaction_keeps_full_history_and_records_error_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config =
     agent_group.Config(backend, "groups/compact-failed", [profile], 10, 20)
   let historic = llm.Message(llm.User, [llm.Text("must survive")])
@@ -2478,7 +2407,6 @@ pub fn resume_registered_deduplicates_and_loads_dormant_profiles_test() {
       "shared",
       registry,
       completing_transport("done"),
-      None,
       None,
       observe,
     )
@@ -2527,7 +2455,6 @@ pub fn resume_registered_tolerates_missing_terminal_profiles_test() {
       "missing-test-installed",
       registry,
       completing_transport("revived"),
-      None,
       None,
       observe,
     )
@@ -2589,7 +2516,6 @@ pub fn ambiguous_claim_write_is_confirmed_test() {
       registry,
       completing_transport("claimed anyway"),
       None,
-      None,
       observe,
     )
   let config =
@@ -2627,7 +2553,6 @@ pub fn concurrent_same_owner_wakes_admit_only_one_claim_test() {
       "agent",
       registry,
       gated_transport(gate, "single claimant"),
-      None,
       None,
       observe,
     )
@@ -2696,14 +2621,7 @@ pub fn failed_compaction_still_processes_messages_queued_during_it_test() {
       }
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config =
     agent_group.Config(
       backend,
@@ -2799,14 +2717,7 @@ pub fn compaction_rerequest_survives_stale_worker_error_test() {
       }
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config =
     agent_group.Config(
       backend,
@@ -2894,14 +2805,7 @@ pub fn automatic_compaction_counts_cached_context_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config =
     agent_group.Config(backend, "groups/cached-compaction", [profile], 10, 100)
   let assert Ok(loaded) =
@@ -2935,7 +2839,6 @@ pub fn ambiguous_running_index_write_is_confirmed_test() {
       "agent",
       registry,
       completing_transport("done"),
-      None,
       None,
       observe,
     )
@@ -2997,14 +2900,7 @@ pub fn paused_turn_resumes_and_usage_accumulates_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config = agent_group.Config(backend, "groups/paused", [profile], 10, 100)
   let assert Ok(loaded) =
     agent_group.create(
@@ -3035,14 +2931,7 @@ pub fn truncated_turn_fails_instead_of_completing_test() {
       Ok(Nil)
     })
   let profile =
-    agent_profile.AgentProfile(
-      "agent",
-      registry,
-      transport,
-      None,
-      None,
-      observe,
-    )
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
   let config =
     agent_group.Config(backend, "groups/truncated", [profile], 10, 100)
   let assert Ok(loaded) =
