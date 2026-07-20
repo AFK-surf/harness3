@@ -145,6 +145,10 @@ not produce event N+1 until `consume` of event N has returned (backpressure cont
   dependency order. **Dormant-state preservation:** persisted state for plugins *not* in
   the registry is carried through untouched, so a group can pass through a node with a
   smaller plugin set without losing state.
+- A plugin may also register a **release hook** (`on_release`), run by the agent's
+  plugin host before it stops, to release ephemeral resources. It must not block:
+  it is on the coordinator's path when an activated-but-unstarted agent is
+  discarded, and the host stop is bounded (5 s) before the host is killed.
 - Hooks are pure functions `state → (new_state, context, value)`. All state values must
   be valid JSON strings (validated after every hook).
 - `call_dependency` lets a hook synchronously invoke a *declared* dependency's callback,
@@ -303,7 +307,11 @@ not:
   (`plugin.resource` / `plugin.set_resource`) — a per-agent slot that, unlike plugin
   state, is never serialized and never leaves the agent. Servers are contacted from
   *inside that agent's plugin host* on first tool use, so the transport actors are
-  spawn-linked to the host and die with the agent. Connections are therefore never
+  spawn-linked to the host. A link alone is not sufficient: Erlang discards a
+  *normal* exit signal at a non-trapping process, so a gracefully finishing host
+  would leave its transports (and their OS children) running. The plugin's
+  **release hook** (`plugin.on_release`, run by the host before it stops) closes
+  them explicitly; the link covers only abnormal termination. Connections are therefore never
   shared: one agent's discovery cannot close a connection another agent is calling
   through. An intermediate owning actor would add a hop without adding isolation —
   it would be linked to the host too — and the host is already the single serialized
@@ -331,8 +339,10 @@ clears the session id so the next call re-initializes.
 `AgentGroup` = id, model_catalog_key, monotonically increasing `revision`, agent states,
 and `execution` ∈ `Idle | Claimed(owner, epoch, lease_expires_at) | Completed`. The
 whole group is one JSON object; every mutation is a CAS (`IfUnchanged`) that bumps
-`revision` and (while owned) extends the lease. Epoch increments on every claim and is
-the fencing token in the running-index key. Every claim also carries a random nonce so
+`revision` and (while owned) extends the lease. The epoch increments on every claim,
+is carried through `Idle`/`Completed` as well as `Claimed`, and is the fencing token
+in the running-index key — releasing a claim must not reset it, or a later claim
+could reuse a key a stale index entry still occupies. Every claim also carries a random nonce so
 its body is unique per attempt — the ambiguous-CAS read-back confirmation must never
 match a concurrent same-owner claim from the same wall-clock second.
 
@@ -360,8 +370,10 @@ match a concurrent same-owner claim from the same wall-clock second.
   server — so a transient request handler's abnormal exit cannot tear down the group.
   Failed group starts stop any plugin hosts they had already activated.
 - The coordinator stops when it has no children and no callback helpers *and* the
-  configured minimum lifetime has elapsed; it then deletes its index entry and releases
-  the group (execution → `Completed` if all agents terminal, else `Idle`). `stop()`
+  configured minimum lifetime has elapsed; it then releases the group and deletes its
+  index entry — in that order, since a deleted index plus a still-`Claimed` group is
+  invisible to recovery, whereas a stale index entry for a released group is merely a
+  spurious wake (execution → `Completed` if all agents terminal, else `Idle`). `stop()`
   kills children/helpers first, then finishes the same way.
 
 ### 7.3 Coordinator serialization and fencing

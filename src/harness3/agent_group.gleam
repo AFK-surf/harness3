@@ -21,13 +21,18 @@ import harness3/storage.{type Metadata, type Storage, type VersionToken}
 const default_minimum_lifetime_milliseconds = 10_000
 
 pub type ExecutionState {
-  Idle
+  /// `epoch` is carried through every state, not just `Claimed`: it is the
+  /// fencing token in the running-index key, so releasing a claim must not
+  /// reset it. A reused epoch can collide with a stale index entry left by an
+  /// abnormally terminated coordinator, which would durably claim the group
+  /// with no coordinator running.
+  Idle(epoch: Int)
   /// `nonce` is unique per claim attempt. Claim bodies must differ between
   /// two concurrent wakes even when they share an owner and a wall-clock
   /// second, otherwise the ambiguous-CAS read-back confirmation could accept
   /// a twin's claim as its own and run two coordinators for one group.
   Claimed(owner: String, epoch: Int, lease_expires_at: Int, nonce: String)
-  Completed
+  Completed(epoch: Int)
 }
 
 pub type AgentGroup {
@@ -56,7 +61,7 @@ pub fn new(
   model_catalog_key: String,
   agents: List(agent.State),
 ) -> AgentGroup {
-  AgentGroup(id, model_catalog_key, 0, agents, Idle)
+  AgentGroup(id, model_catalog_key, 0, agents, Idle(0))
 }
 
 pub type Config {
@@ -450,10 +455,40 @@ fn start_coordinator(
       process.unlink(started.pid)
       process.kill(started.pid)
       discard_prepared(prepared)
+      // The claim CAS already committed, so without a compensating write the
+      // group stays durably `Claimed` with no coordinator and no index entry:
+      // unwakeable until the lease expires and invisible to recovery.
+      release_unpublished_claim(config, group, metadata)
       Error(StorageFailed(error))
     }
     Ok(_) -> start_agents(config, prepared, handle, started.data)
   }
+}
+
+/// Best-effort undo of a claim whose running index could not be published.
+/// Uses the version returned by the claim write, so it cannot clobber another
+/// owner: if anyone else has written since, the CAS simply fails and the lease
+/// expiry path takes over.
+fn release_unpublished_claim(
+  config: Config,
+  group: AgentGroup,
+  metadata: Metadata,
+) -> Nil {
+  let released =
+    AgentGroup(
+      ..group,
+      revision: group.revision + 1,
+      execution: Idle(execution_epoch(group.execution)),
+    )
+  let body = encode_group(released) |> json.to_string |> bit_array.from_string
+  let _ =
+    storage.put(
+      config.storage,
+      config.object_key,
+      body,
+      storage.IfUnchanged(metadata.version),
+    )
+  Nil
 }
 
 fn start_agents(
@@ -1353,7 +1388,7 @@ fn renew(state: CoordinatorState) -> Result(CoordinatorState, Error) {
     False -> Error(LostGroupOwnership)
   })
   case state.group.execution {
-    Completed -> Ok(state)
+    Completed(_) -> Ok(state)
     Claimed(owner, epoch, expires_at, nonce) ->
       case owner == state.owner && expires_at > system_time(Second) {
         False -> Error(LostGroupOwnership)
@@ -1378,9 +1413,10 @@ fn renew(state: CoordinatorState) -> Result(CoordinatorState, Error) {
 }
 
 fn release(state: CoordinatorState) -> Result(CoordinatorState, Error) {
+  let epoch = execution_epoch(state.group.execution)
   let execution = case list.all(state.group.agents, agent_is_terminal) {
-    True -> Completed
-    False -> Idle
+    True -> Completed(epoch)
+    False -> Idle(epoch)
   }
   let group =
     AgentGroup(..state.group, revision: state.group.revision + 1, execution:)
@@ -1389,8 +1425,14 @@ fn release(state: CoordinatorState) -> Result(CoordinatorState, Error) {
 }
 
 fn finish(state: CoordinatorState) -> Result(CoordinatorState, Error) {
+  // Release first. Deleting the index before the claim is released risks a
+  // group that is durably `Claimed` with no index entry — invisible to
+  // recovery, and unwakeable until the lease expires. The opposite order at
+  // worst leaves a stale index entry for an already-released group, which
+  // recovery resolves by waking a claimable group.
+  use released <- result.try(release(state))
   use _ <- result.try(
-    storage.delete(state.storage, state.index_key)
+    storage.delete(released.storage, released.index_key)
     |> result.try_recover(fn(error) {
       case error {
         storage.NotFound(_) -> Ok(Nil)
@@ -1399,7 +1441,7 @@ fn finish(state: CoordinatorState) -> Result(CoordinatorState, Error) {
     })
     |> result.map_error(StorageFailed),
   )
-  release(state)
+  Ok(released)
 }
 
 /// Prefix containing durable records of running or crashed group claims.
@@ -1653,7 +1695,7 @@ fn inject_pending(state: agent.State) -> agent.State {
 fn execution_epoch(execution: ExecutionState) -> Int {
   case execution {
     Claimed(_, epoch, _, _) -> epoch
-    _ -> 0
+    Idle(epoch) | Completed(epoch) -> epoch
   }
 }
 
@@ -1698,8 +1740,16 @@ fn encode_group(group: AgentGroup) -> json.Json {
 
 fn encode_execution(execution: ExecutionState) -> json.Json {
   case execution {
-    Idle -> json.object([#("type", json.string("idle"))])
-    Completed -> json.object([#("type", json.string("completed"))])
+    Idle(epoch) ->
+      json.object([
+        #("type", json.string("idle")),
+        #("epoch", json.int(epoch)),
+      ])
+    Completed(epoch) ->
+      json.object([
+        #("type", json.string("completed")),
+        #("epoch", json.int(epoch)),
+      ])
     Claimed(owner, epoch, expires, nonce) ->
       json.object([
         #("type", json.string("claimed")),
@@ -1729,7 +1779,7 @@ fn group_decoder() -> decode.Decoder(AgentGroup) {
       ))
     _ ->
       decode.failure(
-        AgentGroup("", "", 0, [], Idle),
+        AgentGroup("", "", 0, [], Idle(0)),
         "unsupported agent-group schema",
       )
   }
@@ -1738,8 +1788,14 @@ fn group_decoder() -> decode.Decoder(AgentGroup) {
 fn execution_decoder() -> decode.Decoder(ExecutionState) {
   use kind <- decode.field("type", decode.string)
   case kind {
-    "idle" -> decode.success(Idle)
-    "completed" -> decode.success(Completed)
+    "idle" -> {
+      use epoch <- decode.optional_field("epoch", 0, decode.int)
+      decode.success(Idle(epoch))
+    }
+    "completed" -> {
+      use epoch <- decode.optional_field("epoch", 0, decode.int)
+      decode.success(Completed(epoch))
+    }
     "claimed" -> {
       use owner <- decode.field("owner", decode.string)
       use epoch <- decode.field("epoch", decode.int)
@@ -1747,6 +1803,6 @@ fn execution_decoder() -> decode.Decoder(ExecutionState) {
       use nonce <- decode.optional_field("nonce", "", decode.string)
       decode.success(Claimed(owner, epoch, expires, nonce))
     }
-    _ -> decode.failure(Idle, "unknown execution state")
+    _ -> decode.failure(Idle(0), "unknown execution state")
   }
 }

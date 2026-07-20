@@ -60,7 +60,7 @@ pub fn sign(
   let canonical_request =
     string.uppercase(http.method_to_string(request.method))
     <> "\n"
-    <> canonical_path(request.path)
+    <> encode_path(request.path)
     <> "\n"
     <> canonical_query(request.query)
     <> "\n"
@@ -160,7 +160,7 @@ pub fn presign(
   let canonical_request =
     string.uppercase(http.method_to_string(request.method))
     <> "\n"
-    <> canonical_path(request.path)
+    <> encode_path(request.path)
     <> "\n"
     <> canonical_query
     <> "\nhost:"
@@ -196,13 +196,17 @@ fn add_session_token(headers, token) {
   }
 }
 
-fn canonical_path(path: String) -> String {
+/// Percent-encodes a path for SigV4. `uri.percent_encode` is not usable here:
+/// it passes sub-delimiters (`! $ \' ( ) * +`) through unencoded, so the
+/// canonical request would disagree with what the service computes — and with
+/// the wire path, which must use this same encoding.
+pub fn encode_path(path: String) -> String {
   case path {
     "" -> "/"
     _ ->
       path
       |> string.split("/")
-      |> list.map(uri.percent_encode)
+      |> list.map(sigv4_encode)
       |> string.join("/")
   }
 }

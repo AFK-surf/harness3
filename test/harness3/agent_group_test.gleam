@@ -282,7 +282,7 @@ pub fn parallel_agents_commit_through_group_test() {
   assert list.all(snapshot.agents, fn(state) {
     state.status == agent.Completed && state.revision == 1
   })
-  let assert agent_group.Completed = snapshot.execution
+  let assert agent_group.Completed(_) = snapshot.execution
 
   remove_directory(root)
 }
@@ -877,7 +877,7 @@ pub fn create_is_dormant_and_wake_registers_and_indexes_until_stop_test() {
     )
   let assert Ok(loaded) =
     agent_group.create(config, agent_group.new("lifecycle", "catalog", [state]))
-  assert agent_group.loaded_state(loaded).execution == agent_group.Idle
+  assert agent_group.loaded_state(loaded).execution == agent_group.Idle(0)
   assert !list.contains(agent_group_registry.alive_ids(), "lifecycle")
   let assert Ok(index) =
     storage.list(backend, agent_group.running_index_prefix())
@@ -898,7 +898,10 @@ pub fn create_is_dormant_and_wake_registers_and_indexes_until_stop_test() {
     storage.list(backend, agent_group.running_index_prefix())
   assert list.is_empty(index)
   let assert Ok(snapshot) = agent_group.load(config)
-  assert snapshot.execution == agent_group.Idle
+  // The epoch survives release: resetting it would let a later claim reuse a
+  // running-index key that a stale entry still occupies.
+  let assert agent_group.Idle(released_epoch) = snapshot.execution
+  assert released_epoch == 1
   let assert [preserved] = snapshot.agents
   assert preserved.profile_id == "shared-profile"
   assert preserved.round == 0
@@ -1649,7 +1652,7 @@ pub fn ambiguous_claim_write_is_confirmed_test() {
   let assert [completed] = snapshot.agents
   assert completed.status == agent.Completed
   assert completed.round == 1
-  let assert agent_group.Completed = snapshot.execution
+  let assert agent_group.Completed(_) = snapshot.execution
   remove_directory(root)
 }
 

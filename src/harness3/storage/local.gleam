@@ -297,6 +297,10 @@ fn path_for(config: Config, key: String) -> Result(String, Error) {
     || list.any(segments, fn(segment) {
       segment == "" || segment == "." || segment == ".."
     })
+    // `.harness3*` is this backend's own namespace (generation tombstones and
+    // the lock file). A key reaching into it could overwrite another key's
+    // generation counter and defeat CAS fencing.
+    || string.starts_with(key, ".harness3")
   {
     True -> Error(InvalidKey(key))
     False -> Ok(join_path(root(config), key))

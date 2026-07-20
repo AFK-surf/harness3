@@ -375,17 +375,25 @@ type Chunk {
 fn usage_decoder() -> decode.Decoder(UsageData) {
   use input <- decode.field("prompt_tokens", decode.int)
   use output <- decode.field("completion_tokens", decode.int)
-  use details <- decode.optional_field("prompt_tokens_details", #(0, None), {
-    use cached <- decode.optional_field("cached_tokens", 0, decode.int)
-    // OpenRouter reports cache writes here; OpenAI omits the field.
-    use cache_write <- decode.optional_field(
-      "cache_write_tokens",
-      None,
-      decode.optional(decode.int),
-    )
-    decode.success(#(cached, cache_write))
-  })
-  decode.success(UsageData(input, output, details.0, details.1))
+  // `optional_field` uses its default only when the key is absent, so an
+  // explicit `null` here would fail the whole decode and lose the usage
+  // report; `optional` accepts it.
+  use details <- decode.optional_field(
+    "prompt_tokens_details",
+    None,
+    decode.optional({
+      use cached <- decode.optional_field("cached_tokens", 0, decode.int)
+      // OpenRouter reports cache writes here; OpenAI omits the field.
+      use cache_write <- decode.optional_field(
+        "cache_write_tokens",
+        None,
+        decode.optional(decode.int),
+      )
+      decode.success(#(cached, cache_write))
+    }),
+  )
+  let #(cached, cache_write) = option.unwrap(details, #(0, None))
+  decode.success(UsageData(input, output, cached, cache_write))
 }
 
 fn tool_delta_decoder() -> decode.Decoder(ToolDelta) {

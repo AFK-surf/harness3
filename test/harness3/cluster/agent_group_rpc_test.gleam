@@ -173,7 +173,8 @@ pub fn wake_rpc_is_idempotent_and_precedes_routed_compaction_test() {
       decode.string,
     )
   let assert Ok(snapshot) = agent_group.load(config)
-  assert snapshot.execution == agent_group.Idle
+  let assert agent_group.Idle(released_epoch) = snapshot.execution
+  assert released_epoch > 0
   let assert [preserved] = snapshot.agents
   assert preserved.round == 0
   assert preserved.status == agent.Ready

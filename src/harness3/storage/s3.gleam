@@ -2,6 +2,7 @@ import aws4_request
 import bucket/list_objects
 import exception
 import gleam/bit_array
+import gleam/crypto
 import gleam/http
 import gleam/http/request.{type Request, Request}
 import gleam/http/response.{type Response, Response}
@@ -108,20 +109,18 @@ fn request(
 ) -> Result(Request(BitArray), Error) {
   use endpoint <- result.try(endpoint(config))
   let Endpoint(scheme, host, port) = endpoint
+  let payload_hash =
+    crypto.hash(crypto.Sha256, body)
+    |> bit_array.base16_encode
+    |> string.lowercase
+  // Signed with the in-repo signer rather than `aws4_request`, whose canonical
+  // path uses `uri.percent_encode` and so disagrees with the service for keys
+  // containing sub-delimiters. Sign the raw key, then send the wire path
+  // encoded the same way the canonical request was.
   let signed =
     Request(method, headers, body, scheme, host, port, path, query)
-    |> aws4_request.sign_bits(signer(config), _)
-  // Sign the raw S3 key (the signer canonicalizes each path segment), then
-  // send the corresponding percent-encoded wire path. Sending the raw path
-  // makes reserved characters diverge from the signed canonical request.
-  Ok(Request(..signed, path: wire_path(path)))
-}
-
-fn wire_path(path: String) -> String {
-  path
-  |> string.split("/")
-  |> list.map(uri.percent_encode)
-  |> string.join("/")
+    |> s3_sign.sign(signer(config), _, payload_hash)
+  Ok(Request(..signed, path: s3_sign.encode_path(path)))
 }
 
 fn object_path(config: Config, key: String) -> String {
@@ -159,7 +158,7 @@ fn transfer_url_(
       None,
     )
     |> s3_sign.presign(signer(config), _, expires_in_seconds)
-  let signed = Request(..signed, path: wire_path(signed.path))
+  let signed = Request(..signed, path: s3_sign.encode_path(signed.path))
   Ok(TransferUrl(
     signed |> request.to_uri |> uri.to_string,
     Some(expires_in_seconds),
@@ -397,7 +396,7 @@ fn streaming_request(
       None,
     )
   let signed = s3_sign.sign(signer(config), request, "UNSIGNED-PAYLOAD")
-  Ok(Request(..signed, path: wire_path(path)))
+  Ok(Request(..signed, path: s3_sign.encode_path(path)))
 }
 
 fn stream_get_(
@@ -468,6 +467,11 @@ fn stream_put_(
             IfUnchanged(_) -> Error(PreconditionFailed(key))
             _ -> Error(NotFound(key))
           }
+        // 409 means the condition could not be evaluated because another write
+        // was in flight — not that this caller lost a CAS. The body cannot be
+        // replayed here, so report it as transient rather than fabricating a
+        // precondition failure the caller would treat as a fencing loss.
+        409 -> Error(Transport("S3 conditional request conflict"))
         _ -> Error(status_error(Response(status, [], response_body), key))
       }
     }

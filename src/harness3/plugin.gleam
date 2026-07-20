@@ -98,6 +98,18 @@ pub fn activation_hook(
   ActivationHook(run)
 }
 
+/// Best-effort cleanup for a plugin's ephemeral resources, run when the
+/// agent's plugin host stops. Cleanup must not block: a linked process is not
+/// taken down by its owner's *normal* exit, so anything the plugin owns has to
+/// be told to stop here, not left to the link.
+pub opaque type ReleaseHook {
+  ReleaseHook(run: fn(String, Context) -> Nil)
+}
+
+pub fn release_hook(run: fn(String, Context) -> Nil) -> ReleaseHook {
+  ReleaseHook(run)
+}
+
 pub opaque type Plugin {
   Plugin(
     name: String,
@@ -107,11 +119,12 @@ pub opaque type Plugin {
     tools: List(Tool),
     callback_hooks: List(CallbackHook),
     activation_hooks: List(ActivationHook),
+    release_hooks: List(ReleaseHook),
   )
 }
 
 pub fn new(name: String, initial_state: String) -> Plugin {
-  Plugin(name, [], initial_state, [], [], [], [])
+  Plugin(name, [], initial_state, [], [], [], [], [])
 }
 
 pub fn depends_on(plugin: Plugin, dependency: String) -> Plugin {
@@ -141,6 +154,30 @@ pub fn on_activate(plugin: Plugin, hook: ActivationHook) -> Plugin {
     ..plugin,
     activation_hooks: list.append(plugin.activation_hooks, [hook]),
   )
+}
+
+pub fn on_release(plugin: Plugin, hook: ReleaseHook) -> Plugin {
+  Plugin(..plugin, release_hooks: list.append(plugin.release_hooks, [hook]))
+}
+
+/// Runs every plugin's release hooks, in reverse activation order. Called by
+/// the agent's plugin host before it stops.
+pub fn release(runtime: Runtime) -> Nil {
+  let Runtime(context:) = runtime
+  let Context(registry: Registry(ordered:, ..), ..) = context
+  ordered
+  |> list.reverse
+  |> list.each(fn(plugin) {
+    let plugin_context = Context(..context, current: plugin.name)
+    case current_state(plugin_context) {
+      Error(_) -> Nil
+      Ok(state) ->
+        list.each(plugin.release_hooks, fn(hook) {
+          let ReleaseHook(run:) = hook
+          run(state, plugin_context)
+        })
+    }
+  })
 }
 
 pub fn name(plugin: Plugin) -> String {

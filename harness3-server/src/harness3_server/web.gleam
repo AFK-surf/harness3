@@ -316,8 +316,8 @@ fn session_json(session: Session) -> json.Json {
 
 fn execution_json(execution: agent_group.ExecutionState) -> json.Json {
   case execution {
-    agent_group.Idle -> json.object([#("status", json.string("idle"))])
-    agent_group.Completed ->
+    agent_group.Idle(_) -> json.object([#("status", json.string("idle"))])
+    agent_group.Completed(_) ->
       json.object([#("status", json.string("completed"))])
     agent_group.Claimed(owner, epoch, expires_at, _) ->
       json.object([

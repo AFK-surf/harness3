@@ -65,6 +65,20 @@ pub fn new(
       Ok(plugin.hook_result(encode_state(State(configuration.id)), context, Nil))
     }),
   )
+  |> plugin.on_release(
+    plugin.release_hook(fn(_state, context) {
+      // Transports survive the plugin host's normal exit (a normal exit signal
+      // does not take down linked processes), so they are closed explicitly
+      // here. `close` only sends, so the host is not held up.
+      case existing_connections(context) {
+        Some(open) -> {
+          let _ = connections.close(open)
+          Nil
+        }
+        None -> Nil
+      }
+    }),
+  )
   |> plugin.with_tool(list_tool(mcp_runtime, configuration.id))
   |> plugin.with_tool(call_tool(mcp_runtime, configuration.id))
 }

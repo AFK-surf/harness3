@@ -406,28 +406,36 @@ fn start_mcp(backend: Storage) -> Result(mcp.Runtime, String) {
     Error(error) ->
       Error("could not load MCP catalog: " <> string.inspect(error))
   })
-  use configured <- result.try(case existing, path {
-    Some(session), _ -> Ok(mcp_catalog.catalog(session))
-    None, None -> Ok(mcp_catalog.new())
+  // `persist` is False when the durable catalog is already what we want:
+  // committing an identical catalog on every boot bumps its revision for no
+  // reason, and loses the CAS — failing startup — against any edit that lands
+  // concurrently.
+  use #(desired, persist) <- result.try(case existing, path {
+    Some(session), _ -> Ok(#(mcp_catalog.catalog(session), False))
+    None, None -> Ok(#(mcp_catalog.new(), True))
     None, Some(path) -> {
       use configurations <- result.try(config.load_mcp_configurations(path))
       configurations
       |> list.try_fold(mcp_catalog.new(), fn(catalog, configuration) {
         mcp_catalog.put_configuration(catalog, configuration)
       })
+      |> result.map(fn(catalog) { #(catalog, True) })
       |> result.map_error(fn(error) { string.inspect(error) })
     }
   })
-  let desired = configured
   use runtime <- result.try(
     mcp.start(desired, config.environment, fn() { system_time(Second) }),
   )
-  case persist_mcp_catalog(backend, existing, desired) {
-    Error(error) -> {
-      mcp.stop(runtime)
-      Error(error)
-    }
-    Ok(Nil) -> Ok(runtime)
+  case persist {
+    False -> Ok(runtime)
+    True ->
+      case persist_mcp_catalog(backend, existing, desired) {
+        Error(error) -> {
+          mcp.stop(runtime)
+          Error(error)
+        }
+        Ok(Nil) -> Ok(runtime)
+      }
   }
 }
 

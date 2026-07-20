@@ -155,7 +155,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     )
   assert metadata.title == "New coding session"
   assert metadata.prompt == ""
-  assert group.execution == agent_group.Idle
+  assert group.execution == agent_group.Idle(0)
   assert list.length(group.agents) == 3
   assert list.all(group.agents, fn(state) {
     state.status == agent.Waiting && list.is_empty(state.messages)

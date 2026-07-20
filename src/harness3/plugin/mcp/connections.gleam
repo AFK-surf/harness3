@@ -117,7 +117,10 @@ fn ensure_discovered(
   let Spec(load_configuration:, connector:, resolve_environment:, now_seconds:) =
     connections.spec
   case load_configuration() {
-    Error(error) -> #(connections, Error(error))
+    // The configuration was disabled, deleted, or is unreachable. Whatever the
+    // reason, these transports are no longer authorized by anything, so drop
+    // them rather than leaving servers running for the agent's lifetime.
+    Error(error) -> #(close(connections), Error(error))
     Ok(configuration) ->
       case is_fresh(connections, configuration) {
         True -> #(connections, Ok(Nil))

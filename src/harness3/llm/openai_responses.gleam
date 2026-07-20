@@ -33,6 +33,19 @@ pub fn new(config: Config) -> Provider {
   )
 }
 
+/// Appends the API path, tolerating a base URL that already ends in a version
+/// segment — gateways are commonly configured with one, and blindly appending
+/// `/v1` would produce `/v1/v1/...`.
+fn versioned_url(base: String, path: String) -> String {
+  let versioned =
+    ["/v1", "/v2", "/v3", "/v4"]
+    |> list.any(fn(suffix) { string.ends_with(base, suffix) })
+  case versioned {
+    True -> base <> path
+    False -> base <> "/v1" <> path
+  }
+}
+
 fn base_url(config: Config) -> String {
   let Config(base_url:, ..) = config
   case string.ends_with(base_url, "/") {
@@ -77,7 +90,7 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
   let Config(api_key:, ..) = config
   Ok(HttpRequest(
     method: "POST",
-    url: base_url(config) <> "/v1/responses",
+    url: versioned_url(base_url(config), "/responses"),
     headers: [
       #("authorization", "Bearer " <> api_key),
       #("content-type", "application/json"),
@@ -349,16 +362,24 @@ type ResponseData {
 fn usage_decoder() -> decode.Decoder(UsageData) {
   use input <- decode.field("input_tokens", decode.int)
   use output <- decode.field("output_tokens", decode.int)
-  use details <- decode.optional_field("input_tokens_details", #(0, None), {
-    use cached <- decode.optional_field("cached_tokens", 0, decode.int)
-    use cache_write <- decode.optional_field(
-      "cache_write_tokens",
-      None,
-      decode.optional(decode.int),
-    )
-    decode.success(#(cached, cache_write))
-  })
-  decode.success(UsageData(input, output, details.0, details.1))
+  // `optional_field` uses its default only when the key is absent, so an
+  // explicit `null` here would fail the whole decode and lose the usage
+  // report; `optional` accepts it.
+  use details <- decode.optional_field(
+    "input_tokens_details",
+    None,
+    decode.optional({
+      use cached <- decode.optional_field("cached_tokens", 0, decode.int)
+      use cache_write <- decode.optional_field(
+        "cache_write_tokens",
+        None,
+        decode.optional(decode.int),
+      )
+      decode.success(#(cached, cache_write))
+    }),
+  )
+  let #(cached, cache_write) = option.unwrap(details, #(0, None))
+  decode.success(UsageData(input, output, cached, cache_write))
 }
 
 fn part_decoder() -> decode.Decoder(PartData) {

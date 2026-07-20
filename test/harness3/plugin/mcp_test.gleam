@@ -262,6 +262,82 @@ pub fn edited_configuration_reaches_a_running_agent_test() {
   runtime.stop(mcp_runtime)
 }
 
+pub fn releasing_the_plugin_closes_its_transports_test() {
+  // A linked process is NOT taken down by its owner's normal exit, so the
+  // release hook is what actually stops an agent's MCP servers when its
+  // plugin host finishes gracefully.
+  let assert Ok(value) = catalog.put_configuration(catalog.new(), configured())
+  let closed = process.new_subject()
+  let connector = fn(_server, _resolve) {
+    Ok(stub_connection() |> closing_notifier(closed))
+  }
+  let assert Ok(mcp_runtime) =
+    runtime.start_with_connector(
+      value,
+      fn(_) { Ok("token") },
+      fn() { 1234 },
+      connector,
+    )
+  let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
+  let assert Ok(registry) =
+    harness_plugin.registry([mcp_plugin.new(mcp_runtime, current)])
+  let assert Ok(agent) =
+    harness_plugin.activate(registry, harness_plugin.empty_states())
+  let assert Ok(#(agent, harness_plugin.ToolOutput(is_error: False, ..))) =
+    harness_plugin.invoke_tool(
+      agent,
+      "mcp.list",
+      harness_plugin.ToolInvocation("list", "{}"),
+    )
+  assert process.receive(closed, within: 100) == Error(Nil)
+
+  harness_plugin.release(agent)
+  let assert Ok(Nil) = process.receive(closed, within: 1000)
+  runtime.stop(mcp_runtime)
+}
+
+pub fn revoking_a_configuration_closes_its_transports_test() {
+  let assert Ok(value) = catalog.put_configuration(catalog.new(), configured())
+  let closed = process.new_subject()
+  let connector = fn(_server, _resolve) {
+    Ok(stub_connection() |> closing_notifier(closed))
+  }
+  let assert Ok(mcp_runtime) =
+    runtime.start_with_connector(
+      value,
+      fn(_) { Ok("token") },
+      fn() { 1234 },
+      connector,
+    )
+  let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
+  let assert Ok(registry) =
+    harness_plugin.registry([mcp_plugin.new(mcp_runtime, current)])
+  let assert Ok(agent) =
+    harness_plugin.activate(registry, harness_plugin.empty_states())
+  let assert Ok(#(agent, harness_plugin.ToolOutput(is_error: False, ..))) =
+    harness_plugin.invoke_tool(
+      agent,
+      "mcp.list",
+      harness_plugin.ToolInvocation("list", "{}"),
+    )
+
+  // Disabling the configuration must stop the servers, not merely refuse new
+  // calls while they keep running.
+  let assert Ok(Nil) =
+    runtime.put_configuration(
+      mcp_runtime,
+      configuration.Configuration(..current, enabled: False),
+    )
+  let assert Ok(#(_, harness_plugin.ToolOutput(is_error: True, ..))) =
+    harness_plugin.invoke_tool(
+      agent,
+      "mcp.list",
+      harness_plugin.ToolInvocation("list-2", "{}"),
+    )
+  let assert Ok(Nil) = process.receive(closed, within: 1000)
+  runtime.stop(mcp_runtime)
+}
+
 fn stub_connection() -> client.Connection {
   client.connection(
     fn(method, _params, _timeout) {

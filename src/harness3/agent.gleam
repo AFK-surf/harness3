@@ -14,6 +14,8 @@ import harness3/plugin
 
 const callback_timeout_milliseconds = 5000
 
+const plugin_host_stop_milliseconds = 5000
+
 const compaction_instruction = "Create a handover summary of the entire session above so another instance can continue after the earlier model context is discarded. Preserve the objective, constraints, decisions, completed work, exact paths and identifiers, command and test results, failures, current state, and remaining steps. Do not call tools. Output exactly one block and no text outside it:\n\n<handover>\n...\n</handover>"
 
 pub type Status {
@@ -291,7 +293,13 @@ fn handle_plugin_message(
         }
       }
     }
-    StopPlugins -> actor.stop()
+    StopPlugins -> {
+      // A linked process is not taken down by its owner's *normal* exit, so
+      // anything a plugin owns (MCP transports and their OS children) must be
+      // told to stop here. Hooks only send, so this does not block.
+      plugin.release(runtime)
+      actor.stop()
+    }
   }
 }
 
@@ -819,6 +827,13 @@ fn parts_to_content(
       ReasoningPart(summary, encrypted) ->
         Ok(llm.Reasoning([summary], encrypted))
       ToolPart(id, name, arguments) -> {
+        // A tool call with no arguments: providers differ on whether they send
+        // an empty-object delta at all (Anthropic's buffered path does, its
+        // streaming path does not), so normalize rather than fail the round.
+        let arguments = case string.trim(arguments) {
+          "" -> "{}"
+          arguments -> arguments
+        }
         use _ <- result.try(
           json.parse(arguments, decode.dynamic)
           |> result.map_error(fn(error) {
@@ -1035,9 +1050,18 @@ fn stop_plugin_host(host: PluginHost) -> Nil {
   let pid = plugin_host_pid(host)
   let monitor = process.monitor(pid)
   process.send(subject, StopPlugins)
-  process.new_selector()
-  |> process.select_specific_monitor(monitor, fn(_) { Nil })
-  |> process.selector_receive_forever
+  // Bounded: the coordinator calls this (via `discard`) inside its own message
+  // handler, and a host busy in a long tool call would otherwise starve the
+  // coordinator's lease renewal. Kill on timeout — the host's links then tear
+  // down anything it still owns.
+  let stopped =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(_) { Nil })
+    |> process.selector_receive(plugin_host_stop_milliseconds)
+  case stopped {
+    Ok(Nil) -> Nil
+    Error(Nil) -> process.kill(pid)
+  }
 }
 
 pub fn call_callback(

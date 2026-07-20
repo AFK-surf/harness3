@@ -33,6 +33,19 @@ pub fn new(config: Config) -> Provider {
   )
 }
 
+/// Appends the API path, tolerating a base URL that already ends in a version
+/// segment — gateways are commonly configured with one, and blindly appending
+/// `/v1` would produce `/v1/v1/...`.
+fn versioned_url(base: String, path: String) -> String {
+  let versioned =
+    ["/v1", "/v2", "/v3", "/v4"]
+    |> list.any(fn(suffix) { string.ends_with(base, suffix) })
+  case versioned {
+    True -> base <> path
+    False -> base <> "/v1" <> path
+  }
+}
+
 fn base_url(config: Config) -> String {
   let Config(base_url:, ..) = config
   case string.ends_with(base_url, "/") {
@@ -101,7 +114,7 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
   }
   Ok(HttpRequest(
     method: "POST",
-    url: base_url(config) <> "/v1/messages",
+    url: versioned_url(base_url(config), "/messages"),
     headers:,
     body: json.object(fields) |> json.to_string,
   ))
