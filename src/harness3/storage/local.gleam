@@ -544,6 +544,13 @@ fn delete_(config: Config, key: String) -> Result(Nil, Error) {
     case is_file(path) {
       False -> Ok(Nil)
       True -> {
+        // The bumped tombstone must always survive the delete. Garbage
+        // collecting it when the object's mtime second has passed was tried
+        // and is unsound: object mtimes are not monotonic (stream_put commits
+        // temp files whose mtime predates taking the lock, and clocks can
+        // step backwards), so a "no outstanding token can collide" premise
+        // based on the deleted object's mtime does not hold. One small file
+        // per deleted key is the accepted price of token uniqueness.
         let #(_, stored_generation) = read_generation(config, key)
         use _ <- result.try(write_generation(
           config,
@@ -551,12 +558,7 @@ fn delete_(config: Config, key: String) -> Result(Nil, Error) {
           -1,
           stored_generation + 1,
         ))
-        case file_delete(path) |> status_result {
-          Ok(Nil) -> {
-            Ok(Nil)
-          }
-          Error(error) -> Error(error)
-        }
+        file_delete(path) |> status_result
       }
     }
   })

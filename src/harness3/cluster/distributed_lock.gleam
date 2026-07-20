@@ -28,7 +28,7 @@ pub opaque type Lock {
 }
 
 type LockRecord {
-  LockRecord(owner: String, expires_at: Int)
+  LockRecord(owner: String, expires_at: Int, nonce: String)
 }
 
 /// Attempts to acquire a keyed lock without waiting for another owner.
@@ -72,7 +72,7 @@ fn do_try_acquire(
             )),
           )
         Error(storage.PreconditionFailed(_)) ->
-          case confirm_lock_write(backend, object_key, body) {
+          case confirm_lock_write(backend, object_key, nonce) {
             Ok(Some(metadata)) ->
               Ok(
                 Some(make_lock(
@@ -96,10 +96,10 @@ fn do_try_acquire(
         Ok(record) ->
           case record.expires_at > system_time(Second) {
             True ->
-              // This exact body may be an ambiguous successful IfAbsent from
-              // this caller. Owner strings are not sufficient: they can be
-              // reused.
-              case object.body == body {
+              // This may be an ambiguous successful IfAbsent from this
+              // caller. Owner strings are not sufficient: they can be
+              // reused; the nonce is unique to this acquisition attempt.
+              case record.nonce == nonce {
                 True ->
                   Ok(
                     Some(make_lock(
@@ -159,7 +159,7 @@ pub fn renew(lock: Lock) -> Result(Lock, Error) {
   case storage.put(backend, object_key, body, storage.IfUnchanged(version)) {
     Ok(metadata) -> Ok(Lock(..lock, version: metadata.version))
     Error(storage.PreconditionFailed(_)) ->
-      case confirm_lock_write(backend, object_key, body) {
+      case confirm_lock_write(backend, object_key, nonce) {
         Ok(Some(metadata)) -> Ok(Lock(..lock, version: metadata.version))
         Ok(None) -> Error(Lost)
         Error(error) -> Error(error)
@@ -183,7 +183,7 @@ pub fn release(lock: Lock) -> Result(Nil, Error) {
   case storage.put(backend, object_key, body, storage.IfUnchanged(version)) {
     Ok(_) -> Ok(Nil)
     Error(storage.PreconditionFailed(_)) ->
-      case confirm_lock_write(backend, object_key, body) {
+      case confirm_lock_write(backend, object_key, nonce) {
         Ok(Some(_)) -> Ok(Nil)
         Ok(None) -> Error(Lost)
         Error(error) -> Error(error)
@@ -216,7 +216,7 @@ fn replace_lock(
         )),
       )
     Error(storage.PreconditionFailed(_)) ->
-      case confirm_lock_write(backend, object_key, body) {
+      case confirm_lock_write(backend, object_key, nonce) {
         Ok(Some(metadata)) ->
           Ok(
             Some(make_lock(
@@ -236,14 +236,25 @@ fn replace_lock(
   }
 }
 
+/// Confirms whether a lock write that reported `PreconditionFailed` actually
+/// belongs to this lock handle. Identity is the acquisition nonce, not body
+/// equality: an applied-but-unacknowledged renew leaves a stored body whose
+/// `expires_at` differs from the next attempt's, yet the lock is still ours
+/// and must not be reported `Lost`.
 fn confirm_lock_write(
   backend: Storage,
   object_key: String,
-  intended_body: BitArray,
+  nonce: String,
 ) -> Result(Option(storage.Metadata), Error) {
   case storage.get(backend, object_key) {
-    Ok(object) if object.body == intended_body -> Ok(Some(object.metadata))
-    Ok(_) | Error(storage.NotFound(_)) -> Ok(None)
+    Ok(object) ->
+      case decode_record(object.body) {
+        Ok(record) if record.nonce == nonce && nonce != "" ->
+          Ok(Some(object.metadata))
+        Ok(_) | Error(CorruptLock(_)) -> Ok(None)
+        Error(error) -> Error(error)
+      }
+    Error(storage.NotFound(_)) -> Ok(None)
     Error(error) -> Error(StorageFailed(error))
   }
 }
@@ -305,7 +316,8 @@ fn decode_record(body: BitArray) -> Result(LockRecord, Error) {
   json.parse(body, {
     use owner <- decode.field("owner", decode.string)
     use expires_at <- decode.field("expires_at", decode.int)
-    decode.success(LockRecord(owner, expires_at))
+    use nonce <- decode.optional_field("nonce", "", decode.string)
+    decode.success(LockRecord(owner, expires_at, nonce))
   })
   |> result.map_error(fn(error) { CorruptLock(string.inspect(error)) })
 }

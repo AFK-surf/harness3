@@ -77,8 +77,18 @@ pub fn recovery_leader_dispatches_newest_unclaimed_group_and_cleans_index_test()
     )
 
   let dispatched = process.new_subject()
+  let new_claim_key = prefix <> "recover-me/3_node-token"
   let assert Ok(handle) =
     recovery.start(backend, "leader", fn(ip, port, token, group_key) {
+      // A real resume synchronously claims the group and writes the new
+      // claim's index entry before responding.
+      let assert Ok(_) =
+        storage.put(
+          backend,
+          new_claim_key,
+          index_body(3, "groups/new"),
+          storage.IfAbsent,
+        )
       process.send(dispatched, #(ip, port, token, group_key))
       Ok(Nil)
     })
@@ -88,8 +98,10 @@ pub fn recovery_leader_dispatches_newest_unclaimed_group_and_cleans_index_test()
   let assert [candidate] = candidates
   assert candidate.group_id == "recover-me"
   assert candidate.epoch == 2
+  // Superseded entries are cleaned; the new claim's entry must survive so
+  // the group stays visible to recovery if its new node crashes too.
   let assert Ok(index) = storage.list(backend, prefix)
-  assert list.is_empty(index)
+  assert list.map(index, fn(item) { item.key }) == [new_claim_key]
 
   recovery.stop(handle)
   remove_directory(root)

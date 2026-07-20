@@ -79,8 +79,11 @@ pub fn create(
   use _ <- result.try(validate(catalog))
   let body = encode(catalog) |> json.to_string |> bit_array.from_string
   use metadata <- result.try(
-    storage.put(storage, key, body, storage.IfAbsent)
-    |> result.map_error(storage_error),
+    case storage.put(storage, key, body, storage.IfAbsent) {
+      Ok(metadata) -> Ok(metadata)
+      Error(storage.PreconditionFailed(_)) -> confirm_write(storage, key, body)
+      Error(error) -> Error(storage_error(error))
+    },
   )
   Ok(Session(storage, key, catalog, metadata.version))
 }
@@ -147,15 +150,36 @@ pub fn commit(session: Session, catalog: Catalog) -> Result(Session, Error) {
   use _ <- result.try(validate(next))
   let body = encode(next) |> json.to_string |> bit_array.from_string
   use metadata <- result.try(
-    storage.put(
-      session.storage,
-      session.key,
-      body,
-      storage.IfUnchanged(session.version),
-    )
-    |> result.map_error(storage_error),
+    case
+      storage.put(
+        session.storage,
+        session.key,
+        body,
+        storage.IfUnchanged(session.version),
+      )
+    {
+      Ok(metadata) -> Ok(metadata)
+      Error(storage.PreconditionFailed(_)) ->
+        confirm_write(session.storage, session.key, body)
+      Error(error) -> Error(storage_error(error))
+    },
   )
   Ok(Session(session.storage, session.key, next, metadata.version))
+}
+
+/// Confirms whether a conditional write that reported `PreconditionFailed`
+/// actually succeeded (applied remotely, response lost, retry observed its own
+/// object). Only an exact body match counts as our write.
+fn confirm_write(
+  backend: Storage,
+  key: String,
+  intended_body: BitArray,
+) -> Result(storage.Metadata, Error) {
+  case storage.get(backend, key) {
+    Ok(object) if object.body == intended_body -> Ok(object.metadata)
+    Ok(_) | Error(storage.PreconditionFailed(_)) -> Error(ConcurrentUpdate)
+    Error(error) -> Error(StorageFailed(error))
+  }
 }
 
 fn storage_error(error: storage.Error) -> Error {

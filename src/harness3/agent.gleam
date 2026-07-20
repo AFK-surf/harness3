@@ -188,6 +188,15 @@ pub fn activate(state: State, config: Config) -> Result(Active, Error) {
   Ok(Active(state, config, host))
 }
 
+/// Releases an activated agent that will not be started, stopping its plugin
+/// host process. An `Active` that is neither started nor discarded leaks the
+/// host actor: it is linked only to the process that called `activate`, and a
+/// normal exit of that process does not take it down.
+pub fn discard(active: Active) -> Nil {
+  let Active(plugins:, ..) = active
+  stop_plugin_host(plugins)
+}
+
 fn start_plugin_host(
   runtime: plugin.Runtime,
   generation: Int,
@@ -440,7 +449,22 @@ fn run_model(
 fn context_tokens(accumulated: Accumulator) -> Option(Int) {
   case accumulated.input_tokens {
     None -> None
-    Some(input) -> Some(input + option.unwrap(accumulated.output_tokens, 0))
+    Some(input) -> {
+      // `input_tokens` excludes cached tokens on every provider (Anthropic
+      // reports only post-breakpoint tokens; the OpenAI adapters normalize to
+      // the same semantics), and the Anthropic adapter enables automatic
+      // caching unconditionally. Occupancy must therefore add cache reads and
+      // writes, or a cache-dominated conversation never crosses the
+      // compaction threshold and overflows the window instead.
+      let llm.Stats(cache_read_tokens:, cache_write_tokens:, ..) =
+        accumulated.stats
+      Some(
+        input
+        + option.unwrap(accumulated.output_tokens, 0)
+        + cache_read_tokens
+        + cache_write_tokens,
+      )
+    }
   }
 }
 
@@ -573,8 +597,16 @@ fn add_stats(total: llm.Stats, round: llm.Stats) -> llm.Stats {
 }
 
 fn compaction_target(state: State, config: Config) -> Option(Int) {
+  // A failed attempt pauses the manual request rather than retrying it at
+  // every round boundary (one wasted LLM call per round); a new explicit
+  // request clears the recorded error and restores eligibility.
   let manually_requested =
     state.compaction_requested > state.compaction_completed
+    && state.last_compaction_error == None
+  // Automatic compaction deliberately also runs after a round that completed
+  // the agent: a dormant agent is revived by the next message, and compacting
+  // eagerly means that revival starts from a compacted handover instead of
+  // paying for compaction before its first new round.
   let automatically_requested = case state.last_context_tokens {
     Some(tokens) if config.context_window_tokens > 0 ->
       tokens * 5 >= config.context_window_tokens * 4
@@ -906,8 +938,23 @@ fn run_loop(
               last_compaction_error: Some(string.inspect(error)),
             )
           let Checkpointer(commit:) = checkpointer
-          let _ = commit(state.revision, failed)
-          Nil
+          case commit(state.revision, failed) {
+            // The commit atomically folded any messages that arrived during
+            // the failed compaction into the conversation; exiting here would
+            // strand them with no worker. Continue with normal rounds —
+            // deliberately not `run_loop`, which would retry the failing
+            // compaction immediately and block round execution.
+            Ok(CommitReceipt(state: committed, ..))
+              if committed.status == Ready
+            ->
+              run_normal_loop(
+                Active(committed, config, plugins),
+                checkpointer,
+                router,
+                observe,
+              )
+            _ -> Nil
+          }
         }
         Ok(#(_, compacted)) -> {
           let Checkpointer(commit:) = checkpointer

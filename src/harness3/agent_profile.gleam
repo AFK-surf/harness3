@@ -39,6 +39,15 @@ pub fn install(profiles: List(AgentProfile)) -> Nil {
   })
 }
 
+/// Removes installed profiles by ID. Installed profiles are node-global ETS
+/// entries; callers that install per-session profiles should uninstall them
+/// when the session is permanently stopped, or the table grows with every
+/// session ever created. Resuming later simply re-installs.
+pub fn uninstall(ids: List(String)) -> Nil {
+  ensure_tables()
+  list.each(ids, fn(id) { delete_profile(Harness3AgentProfiles, id) })
+}
+
 pub fn profiles(ids: List(String)) -> Result(List(AgentProfile), Error) {
   ensure_tables()
   list.try_map(ids, fn(id) {
@@ -103,6 +112,9 @@ fn new_profiles_table(
 
 @external(erlang, "ets", "insert")
 fn insert_profile(table: ProfilesTable, entry: #(String, AgentProfile)) -> Bool
+
+@external(erlang, "ets", "delete")
+fn delete_profile(table: ProfilesTable, id: String) -> Bool
 
 @external(erlang, "ets", "lookup")
 fn lookup_profile(

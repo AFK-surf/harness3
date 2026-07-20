@@ -2,6 +2,7 @@ import filepath
 import gleam/bit_array
 import gleam/crypto
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleam/list
@@ -68,6 +69,9 @@ pub opaque type Service {
     workspace_root: String,
     model_transport: agent.ModelTransport,
     max_output_tokens: Int,
+    // Stable owner token for group claims, so every wake from this server
+    // identifies the same node instead of minting a random owner per wake.
+    owner: String,
   )
 }
 
@@ -88,6 +92,7 @@ pub fn start() -> Result(Service, String) {
       "HARNESS3_MAX_OUTPUT_TOKENS",
       8192,
     ),
+    owner: new_id(),
   ))
 }
 
@@ -203,23 +208,57 @@ pub fn send_message(
           "could not resume session: " <> string.inspect(error)
         }),
       )
-      use group <- result.try(
-        agent_group.wake(loaded)
-        |> result.map_error(fn(error) {
-          "could not wake session: " <> string.inspect(error)
-        }),
-      )
-      agent_group.send_message(group, agent_id, message)
-      |> result.map_error(fn(error) { string.inspect(error) })
+      // Detached: this runs in a transient web-request handler; a direct
+      // wake would link the whole group process tree to it.
+      case agent_group.wake_detached(loaded, service.owner, fn() { Nil }) {
+        Ok(group) ->
+          agent_group.send_message(group, agent_id, message)
+          |> result.map_error(fn(error) { string.inspect(error) })
+        // A concurrent request won the wake race and the group is now
+        // running; deliver through the registry instead of surfacing the
+        // race to the client. The winner may still be registering, so allow
+        // one short retry.
+        Error(agent_group.ConcurrentGroupUpdate)
+        | Error(agent_group.AlreadyClaimed(_, _)) ->
+          deliver_registered(id, agent_id, message, 3)
+        Error(error) ->
+          Error("could not wake session: " <> string.inspect(error))
+      }
     }
     Error(error) -> Error(string.inspect(error))
   }
 }
 
+fn deliver_registered(
+  id: String,
+  agent_id: String,
+  message: String,
+  attempts: Int,
+) -> Result(Nil, String) {
+  case agent_group_registry.send_message(id, agent_id, message) {
+    Ok(Nil) -> Ok(Nil)
+    Error(agent_group_registry.NotFound(_)) if attempts > 1 -> {
+      process.sleep(100)
+      deliver_registered(id, agent_id, message, attempts - 1)
+    }
+    Error(error) ->
+      Error(
+        "could not deliver after concurrent wake: " <> string.inspect(error),
+      )
+  }
+}
+
 pub fn stop_session(service: Service, id: String) -> Result(Nil, String) {
-  use _ <- result.try(load_metadata(service, id))
+  use metadata <- result.try(load_metadata(service, id))
   case agent_group_registry.force_stop(id) {
-    Ok(Nil) | Error(agent_group_registry.NotFound(_)) -> Ok(Nil)
+    Ok(Nil) | Error(agent_group_registry.NotFound(_)) -> {
+      // Per-session profiles are node-global ETS entries; a later resume
+      // re-installs them, so drop them now instead of growing forever.
+      agent_profile.uninstall(
+        list.map(metadata.agents, fn(spec) { profile_id(metadata.id, spec.id) }),
+      )
+      Ok(Nil)
+    }
     Error(error) -> Error(string.inspect(error))
   }
 }

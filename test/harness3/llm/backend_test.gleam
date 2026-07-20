@@ -268,7 +268,9 @@ pub fn chat_completions_stream_test() {
   assert list.contains(events, llm.MessageStart("chatcmpl_1", "gpt-test"))
   assert list.contains(events, llm.TextDelta(0, "Hello"))
   assert list.contains(events, llm.MessageStop)
-  assert stats(events) == llm.Stats(12, 6, 4, 5)
+  // prompt_tokens (12) includes the 4 cached tokens; input_tokens reports
+  // the non-cached remainder so Stats matches Anthropic's semantics.
+  assert stats(events) == llm.Stats(8, 6, 4, 5)
 }
 
 pub fn chat_completions_embedded_error_test() {
@@ -599,7 +601,9 @@ pub fn responses_stream_test() {
     ),
   )
   assert list.contains(events, llm.Finished(llm.Stop))
-  assert stats(events) == llm.Stats(12, 6, 4, 5)
+  // prompt_tokens (12) includes the 4 cached tokens; input_tokens reports
+  // the non-cached remainder so Stats matches Anthropic's semantics.
+  assert stats(events) == llm.Stats(8, 6, 4, 5)
 }
 
 pub fn anthropic_stream_test() {

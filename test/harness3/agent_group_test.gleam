@@ -131,6 +131,45 @@ fn ambiguous_index_storage(backend: storage.Storage) -> storage.Storage {
   )
 }
 
+/// Reports the first IfUnchanged put — the wake's claim CAS — as failed even
+/// though it was applied, imitating a lost response plus a storage-level
+/// retry observing its own write.
+fn ambiguous_claim_storage(backend: storage.Storage) -> storage.Storage {
+  let assert Ok(started) =
+    actor.new(False)
+    |> actor.on_message(fn(triggered: Bool, message: AmbiguityMessage) {
+      let Ambiguate(_, condition, reply) = message
+      let should_ambiguate = case condition {
+        storage.IfUnchanged(_) -> !triggered
+        _ -> False
+      }
+      process.send(reply, should_ambiguate)
+      actor.continue(triggered || should_ambiguate)
+    })
+    |> actor.start
+  let control = started.data
+  storage.from_functions(
+    get: fn(key) { storage.get(backend, key) },
+    head: fn(key) { storage.head(backend, key) },
+    put: fn(key, body, condition) {
+      let ambiguous =
+        process.call_forever(control, fn(reply) {
+          Ambiguate(body, condition, reply)
+        })
+      case storage.put(backend, key, body, condition), ambiguous {
+        Ok(_), True -> Error(storage.PreconditionFailed(key))
+        result, _ -> result
+      }
+    },
+    list: fn(prefix) { storage.list(backend, prefix) },
+    delete: fn(key) { storage.delete(backend, key) },
+    stream_get: fn(key, consume) { storage.get_stream(backend, key, consume) },
+    stream_put: fn(key, source, condition) {
+      storage.put_stream(backend, key, source, condition)
+    },
+  )
+}
+
 fn temporary_root(label: String) -> String {
   let suffix =
     crypto.strong_random_bytes(12) |> bit_array.base64_url_encode(False)
@@ -1573,6 +1612,353 @@ pub fn resume_registered_tolerates_missing_terminal_profiles_test() {
     list.find(snapshot.agents, fn(state) { state.id == "a" })
   assert revived.status == agent.Completed && revived.round == 1
   let assert Ok(Nil) = agent_group.stop(group)
+  remove_directory(root)
+}
+
+pub fn ambiguous_claim_write_is_confirmed_test() {
+  let root = temporary_root("ambiguous-claim-test")
+  let backend = local.new(local.config(root)) |> ambiguous_claim_storage
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      completing_transport("claimed anyway"),
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/ambiguous-claim", [profile], 10, 100)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("ambiguous-claim", "catalog", [
+        agent.state("agent", "model"),
+      ]),
+    )
+  // The claim CAS reports PreconditionFailed although it was applied; the
+  // wake must confirm its own write by read-back and start the group instead
+  // of leaving it durably claimed with no coordinator.
+  let assert Ok(group) = agent_group.wake(loaded)
+  await_down(process.monitor(agent_group.pid(group)))
+  let assert Ok(snapshot) = agent_group.load(config)
+  let assert [completed] = snapshot.agents
+  assert completed.status == agent.Completed
+  assert completed.round == 1
+  let assert agent_group.Completed = snapshot.execution
+  remove_directory(root)
+}
+
+pub fn concurrent_same_owner_wakes_admit_only_one_claim_test() {
+  let root = temporary_root("duplicate-claim-test")
+  let backend = local.new(local.config(root))
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let gate = process.new_subject()
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      gated_transport(gate, "single claimant"),
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/duplicate-claim", [profile], 10, 100)
+  let assert Ok(loaded_a) =
+    agent_group.create(
+      config,
+      agent_group.new("duplicate-claim", "catalog", [
+        agent.state("agent", "model"),
+      ]),
+    )
+  // A second loaded snapshot at the same storage version, as produced by a
+  // concurrent request racing the first wake.
+  let assert Ok(loaded_b) = agent_group.resume(config)
+
+  let assert Ok(group) = agent_group.wake_as(loaded_a, "stable-owner")
+  let monitor = process.monitor(agent_group.pid(group))
+  let assert Ok(Started(release)) = process.receive(gate, within: 2000)
+  // Same owner, same epoch, possibly the same wall-clock second: without the
+  // per-claim nonce the loser's read-back would match the winner's claim body
+  // and a second coordinator would start for the same group.
+  let assert Error(agent_group.ConcurrentGroupUpdate) =
+    agent_group.wake_as(loaded_b, "stable-owner")
+
+  process.send(release, Nil)
+  await_down(monitor)
+  let assert Ok(snapshot) = agent_group.load(config)
+  let assert [completed] = snapshot.agents
+  assert completed.status == agent.Completed
+  assert completed.round == 1
+  remove_directory(root)
+}
+
+pub fn failed_compaction_still_processes_messages_queued_during_it_test() {
+  let root = temporary_root("failed-compaction-message-test")
+  let backend = local.new(local.config(root))
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let gate = process.new_subject()
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      case
+        contains_text_fragment(request.messages, "Create a handover summary")
+      {
+        True -> {
+          let release = process.new_subject()
+          process.send(gate, Started(release))
+          let assert Ok(Nil) = process.receive(release, within: 5000)
+          // Malformed handover: the compaction attempt must fail.
+          let assert Ok(Nil) = consume(llm.MessageStart("c", "test-model"))
+          let assert Ok(Nil) = consume(llm.TextDelta(0, "not a handover"))
+          let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+          Ok(Nil)
+        }
+        False -> {
+          let assert Ok(Nil) = consume(llm.MessageStart("m", "test-model"))
+          let assert Ok(Nil) = consume(llm.TextDelta(0, "processed anyway"))
+          let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+          Ok(Nil)
+        }
+      }
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(
+      backend,
+      "groups/failed-compaction",
+      [profile],
+      10,
+      60_000,
+    )
+  let dormant =
+    agent.State(
+      ..agent.state("agent", "model"),
+      messages: [llm.Message(llm.User, [llm.Text("original task")])],
+      status: agent.Completed,
+    )
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("failed-compaction", "catalog", [dormant]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+
+  let assert Ok(1) = agent_group.request_compaction(group, "agent")
+  let assert Ok(Started(release)) = process.receive(gate, within: 2000)
+  // Delivered while the compaction LLM call is in flight: lands in the
+  // durable inbox and is folded into the conversation by the compaction
+  // worker's next commit — even a failing one.
+  let assert Ok(Nil) =
+    agent_group.send_message(group, "agent", "queued during compaction")
+  process.send(release, Nil)
+
+  process.sleep(500)
+  let assert Ok(snapshot) = agent_group.snapshot(group)
+  let assert [state] = snapshot.agents
+  // The failed compaction is recorded, and the queued message was processed
+  // by a normal round instead of being stranded with no worker.
+  let assert Some(_) = state.last_compaction_error
+  assert state.compaction_completed == 0
+  assert contains_user_text(state.messages, "queued during compaction")
+  assert contains_text_fragment(state.messages, "processed anyway")
+  assert state.status == agent.Completed
+  let assert Ok(Nil) = agent_group.stop(group)
+  remove_directory(root)
+}
+
+pub fn compaction_rerequest_survives_stale_worker_error_test() {
+  let root = temporary_root("compaction-rerequest-test")
+  let backend = local.new(local.config(root))
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let compaction_gate = process.new_subject()
+  let round_gate = process.new_subject()
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      let compacting =
+        contains_text_fragment(request.messages, "Create a handover summary")
+      let after_round =
+        contains_text_fragment(request.messages, "processed anyway")
+      case compacting, after_round {
+        // First compaction attempt: held open, then malformed → fails.
+        True, False -> {
+          let release = process.new_subject()
+          process.send(compaction_gate, Started(release))
+          let assert Ok(Nil) = process.receive(release, within: 5000)
+          let assert Ok(Nil) = consume(llm.MessageStart("c1", "test-model"))
+          let assert Ok(Nil) = consume(llm.TextDelta(0, "not a handover"))
+          let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+          Ok(Nil)
+        }
+        // Second compaction attempt (the re-request): succeeds.
+        True, True -> {
+          let assert Ok(Nil) = consume(llm.MessageStart("c2", "test-model"))
+          let assert Ok(Nil) =
+            consume(llm.TextDelta(0, "<handover>second attempt</handover>"))
+          let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+          Ok(Nil)
+        }
+        // The normal round processing the queued message: held open so the
+        // re-request lands while this worker is mid-round.
+        False, _ -> {
+          let release = process.new_subject()
+          process.send(round_gate, Started(release))
+          let assert Ok(Nil) = process.receive(release, within: 5000)
+          let assert Ok(Nil) = consume(llm.MessageStart("m", "test-model"))
+          let assert Ok(Nil) = consume(llm.TextDelta(0, "processed anyway"))
+          let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+          Ok(Nil)
+        }
+      }
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(
+      backend,
+      "groups/compaction-rerequest",
+      [profile],
+      10,
+      60_000,
+    )
+  let dormant =
+    agent.State(
+      ..agent.state("agent", "model"),
+      messages: [llm.Message(llm.User, [llm.Text("original task")])],
+      status: agent.Completed,
+    )
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("compaction-rerequest", "catalog", [dormant]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+
+  let assert Ok(1) = agent_group.request_compaction(group, "agent")
+  let assert Ok(Started(release_compaction)) =
+    process.receive(compaction_gate, within: 2000)
+  let assert Ok(Nil) =
+    agent_group.send_message(group, "agent", "please continue")
+  process.send(release_compaction, Nil)
+
+  // The failed compaction folded the queued message in; the worker is now
+  // held mid-round. A re-request accepted here durably clears the failure —
+  // and the worker's round commit must not resurrect its stale error, or the
+  // acknowledged request would never execute.
+  let assert Ok(Started(release_round)) =
+    process.receive(round_gate, within: 2000)
+  let assert Ok(2) = agent_group.request_compaction(group, "agent")
+  process.send(release_round, Nil)
+
+  process.sleep(500)
+  let assert Ok(snapshot) = agent_group.snapshot(group)
+  let assert [state] = snapshot.agents
+  assert state.compaction_completed == 2
+  assert state.last_compaction_error == None
+  let assert Some(context) = state.context_messages
+  assert contains_text_fragment(context, "second attempt")
+  assert contains_user_text(state.messages, "please continue")
+  let assert Ok(Nil) = agent_group.stop(group)
+  remove_directory(root)
+}
+
+pub fn automatic_compaction_counts_cached_context_test() {
+  let root = temporary_root("cached-compaction-test")
+  let backend = local.new(local.config(root))
+  let model = model_catalog.Model(..test_model(), context_window_tokens: 100)
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      let compacting =
+        contains_text_fragment(request.messages, "Create a handover summary")
+      let assert Ok(Nil) = consume(llm.MessageStart("m", "test-model"))
+      let assert Ok(Nil) =
+        consume(
+          llm.TextDelta(0, case compacting {
+            True -> "<handover>cached summary</handover>"
+            False -> "answer"
+          }),
+        )
+      let assert Ok(Nil) = case compacting {
+        True -> Ok(Nil)
+        False ->
+          // input_tokens excludes cached tokens: only 8 new tokens, but the
+          // cached prefix means the context is really 83/100 full.
+          consume(
+            llm.UsageReported(llm.Usage(
+              input_tokens: Some(5),
+              output_tokens: Some(3),
+              cache_read_tokens: Some(60),
+              cache_write_tokens: Some(15),
+            )),
+          )
+      }
+      let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+      let assert Ok(Nil) = consume(llm.MessageStop)
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/cached-compaction", [profile], 10, 100)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("cached-compaction", "catalog", [
+        agent.state("agent", "model"),
+      ]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  await_down(process.monitor(agent_group.pid(group)))
+  let assert Ok(snapshot) = agent_group.load(config)
+  let assert [compacted] = snapshot.agents
+  // Occupancy counts cache reads/writes, so automatic compaction fired even
+  // though only 8 non-cached tokens were reported.
+  assert compacted.compaction_completed == 1
+  let assert Some(context) = compacted.context_messages
+  assert contains_text_fragment(context, "cached summary")
   remove_directory(root)
 }
 

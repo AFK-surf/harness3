@@ -1,4 +1,5 @@
 import gleam/dynamic/decode
+import gleam/int
 import gleam/json.{type Json}
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -556,7 +557,10 @@ fn decode_chunk_events(
   let usage = case usage {
     Some(UsageData(input, output, cached, cache_write)) -> [
       UsageReported(Usage(
-        input_tokens: Some(input),
+        // OpenAI's prompt_tokens includes cached tokens while Anthropic's
+        // input_tokens excludes cache reads; normalize to the Anthropic
+        // semantics so Stats never double-counts cache reads.
+        input_tokens: Some(int.max(0, input - cached)),
         output_tokens: Some(output),
         cache_read_tokens: Some(cached),
         cache_write_tokens: cache_write,

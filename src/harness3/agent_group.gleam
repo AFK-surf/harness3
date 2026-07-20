@@ -22,7 +22,11 @@ const default_minimum_lifetime_milliseconds = 10_000
 
 pub type ExecutionState {
   Idle
-  Claimed(owner: String, epoch: Int, lease_expires_at: Int)
+  /// `nonce` is unique per claim attempt. Claim bodies must differ between
+  /// two concurrent wakes even when they share an owner and a wall-clock
+  /// second, otherwise the ambiguous-CAS read-back confirmation could accept
+  /// a twin's claim as its own and run two coordinators for one group.
+  Claimed(owner: String, epoch: Int, lease_expires_at: Int, nonce: String)
   Completed
 }
 
@@ -172,8 +176,16 @@ pub fn create(config: Config, group: AgentGroup) -> Result(LoadedGroup, Error) {
   agent_profile.install(config.profiles)
   let body = encode_group(group) |> json.to_string |> bit_array.from_string
   use metadata <- result.try(
-    storage.put(config.storage, config.object_key, body, storage.IfAbsent)
-    |> result.map_error(storage_error),
+    case
+      storage.put(config.storage, config.object_key, body, storage.IfAbsent)
+    {
+      Ok(metadata) -> Ok(metadata)
+      // An ambiguous IfAbsent success (applied, response lost, retry saw the
+      // object) must not fail creation of a group that now durably exists.
+      Error(storage.PreconditionFailed(_)) ->
+        confirm_group_write(config.storage, config.object_key, body)
+      Error(error) -> Error(storage_error(error))
+    },
   )
   Ok(LoadedGroup(config, group, metadata.version))
 }
@@ -253,6 +265,40 @@ pub fn wake_as(loaded: LoadedGroup, owner: String) -> Result(Group, Error) {
   wake_as_with_membership_refresh(loaded, owner, fn() { Nil })
 }
 
+/// Like `wake_as_with_membership_refresh`, but runs the wake in a short-lived
+/// process so the coordinator's fate is not tied to a transient caller.
+///
+/// `wake` links the started process tree to the waking process — deliberate
+/// for embedders that supervise the group with their own lifetime. For an RPC
+/// or web request handler that link is a hazard: an abnormal handler exit
+/// (client disconnect, listener shutdown) would kill the whole group with no
+/// cleanup, leaving the lease claimed until expiry. The spawned waker exits
+/// normally after the group starts, which dissolves its links harmlessly.
+pub fn wake_detached(
+  loaded: LoadedGroup,
+  owner: String,
+  refresh_membership: fn() -> Nil,
+) -> Result(Group, Error) {
+  let reply = process.new_subject()
+  let waker =
+    process.spawn_unlinked(fn() {
+      process.send(
+        reply,
+        wake_as_with_membership_refresh(loaded, owner, refresh_membership),
+      )
+    })
+  let monitor = process.monitor(waker)
+  let outcome =
+    process.new_selector()
+    |> process.select(reply)
+    |> process.select_specific_monitor(monitor, fn(down) {
+      Error(ProcessStartFailed(string.inspect(down)))
+    })
+    |> process.selector_receive_forever
+  process.demonitor_process(monitor)
+  outcome
+}
+
 /// Claims and runs a group, synchronously publishing membership after local
 /// registration and before creating the durable running index.
 pub fn wake_as_with_membership_refresh(
@@ -272,13 +318,24 @@ pub fn wake_as_with_membership_refresh(
   let claimed_body =
     encode_group(claimed) |> json.to_string |> bit_array.from_string
   use metadata <- result.try(
-    storage.put(
-      config.storage,
-      config.object_key,
-      claimed_body,
-      storage.IfUnchanged(version),
-    )
-    |> result.map_error(storage_error),
+    case
+      storage.put(
+        config.storage,
+        config.object_key,
+        claimed_body,
+        storage.IfUnchanged(version),
+      )
+    {
+      Ok(metadata) -> Ok(metadata)
+      // The claim is the single most important CAS: an ambiguous success here
+      // (write applied, response lost, retry observed 412) would leave the
+      // group durably claimed by an owner that believes the wake failed — no
+      // coordinator, no running-index entry, invisible to recovery until the
+      // lease expires. Confirm by read-back exactly like write_group does.
+      Error(storage.PreconditionFailed(_)) ->
+        confirm_group_write(config.storage, config.object_key, claimed_body)
+      Error(error) -> Error(storage_error(error))
+    },
   )
   let index_key = running_index_key(claimed, owner)
   start_coordinator(
@@ -342,7 +399,10 @@ fn start_coordinator(
     actor.new(state)
     |> actor.on_message(handle_message)
     |> actor.start
-    |> result.map_error(fn(error) { ProcessStartFailed(string.inspect(error)) }),
+    |> result.map_error(fn(error) {
+      discard_prepared(prepared)
+      ProcessStartFailed(string.inspect(error))
+    }),
   )
   let handle = Group(started.data)
   agent_group_registry.register(
@@ -389,6 +449,7 @@ fn start_coordinator(
       refresh_membership()
       process.unlink(started.pid)
       process.kill(started.pid)
+      discard_prepared(prepared)
       Error(StorageFailed(error))
     }
     Ok(_) -> start_agents(config, prepared, handle, started.data)
@@ -420,7 +481,25 @@ fn prepare_agents(
 ) -> Result(List(PreparedAgent), Error) {
   group.agents
   |> list.filter(fn(state) { state.status == agent.Ready })
-  |> list.try_map(fn(state) { prepare_agent(config, state, catalog) })
+  |> list.try_fold([], fn(prepared, state) {
+    case prepare_agent(config, state, catalog) {
+      Ok(item) -> Ok([item, ..prepared])
+      Error(error) -> {
+        // Plugin hosts already started for earlier agents must not outlive a
+        // failed group start.
+        discard_prepared(prepared)
+        Error(error)
+      }
+    }
+  })
+  |> result.map(list.reverse)
+}
+
+fn discard_prepared(prepared: List(PreparedAgent)) -> Nil {
+  list.each(prepared, fn(item) {
+    let PreparedAgent(active:, ..) = item
+    agent.discard(active)
+  })
 }
 
 fn prepare_agent(
@@ -617,20 +696,55 @@ fn handle_message(
           child.0 != id || agent.pid(child.1) != pid
         })
       let state = CoordinatorState(..state, children:)
-      case find_agent(state.group.agents, id) {
-        Ok(current) ->
-          case current.pending_messages {
-            [] -> settle_idle(state)
-            [_, ..] ->
-              case inject_and_start(state, current, [], coordinator) {
-                Ok(next) -> actor.continue(next)
-                Error(_) -> {
-                  abandon(state)
-                  actor.stop()
-                }
+      // This exit notice may be stale: a message delivery or compaction
+      // request processed ahead of it can already have started a replacement
+      // worker. Restarting again would run a duplicate worker and drop the
+      // live replacement from `children`, orphaning it from stop/abandon
+      // cleanup. The replacement's own commits consume the inbox and any
+      // pending compaction, so a live replacement means nothing to do here.
+      let replacement_running =
+        state.children
+        |> list.find(fn(child) { child.0 == id })
+        |> result.map(fn(child) { process.is_alive(agent.pid(child.1)) })
+        |> result.unwrap(False)
+      case replacement_running {
+        True -> settle_idle(state)
+        False ->
+          case find_agent(state.group.agents, id) {
+            Ok(current) ->
+              case current.pending_messages {
+                [] ->
+                  // A compaction request accepted while this worker was
+                  // already exiting is durable but was never executed;
+                  // nothing else would ever pick it up (wakes only start
+                  // Ready agents). Restart a worker for it — unless the last
+                  // attempt failed, in which case restarting would retry a
+                  // failing compaction forever.
+                  case
+                    current.compaction_requested > current.compaction_completed
+                    && current.last_compaction_error == None
+                  {
+                    False -> settle_idle(state)
+                    True ->
+                      case start_agent_worker(state, current, coordinator) {
+                        Ok(next) -> actor.continue(next)
+                        Error(_) -> {
+                          abandon(state)
+                          actor.stop()
+                        }
+                      }
+                  }
+                [_, ..] ->
+                  case inject_and_start(state, current, [], coordinator) {
+                    Ok(next) -> actor.continue(next)
+                    Error(_) -> {
+                      abandon(state)
+                      actor.stop()
+                    }
+                  }
               }
+            _ -> settle_idle(state)
           }
-        _ -> settle_idle(state)
       }
     }
     CallbackHelperExited(pid, _coordinator) -> {
@@ -833,6 +947,40 @@ fn deliver_message(
   }
 }
 
+/// Starts a worker for an agent's current durable state without persisting
+/// any change — used to resume a durably recorded but never-executed
+/// compaction request after its worker exited.
+fn start_agent_worker(
+  state: CoordinatorState,
+  current: agent.State,
+  coordinator: Subject(Message),
+) -> Result(CoordinatorState, Error) {
+  use catalog_session <- result.try(
+    model_catalog.resume(state.storage, state.group.model_catalog_key)
+    |> result.map_error(ModelCatalogFailed),
+  )
+  let catalog = model_catalog.catalog(catalog_session)
+  use prepared <- result.try(prepare_agent(
+    Config(
+      state.storage,
+      state.key,
+      state.profiles,
+      state.lease_duration_seconds,
+      state.minimum_lifetime_milliseconds,
+    ),
+    current,
+    catalog,
+  ))
+  let child = make_agent(Group(coordinator), prepared)
+  let assert True = process.link(agent.pid(child))
+  agent.release(child)
+  let children = [
+    #(current.id, child),
+    ..list.filter(state.children, fn(child) { child.0 != current.id })
+  ]
+  Ok(CoordinatorState(..state, children:))
+}
+
 fn request_agent_compaction(
   state: CoordinatorState,
   agent_id: String,
@@ -855,7 +1003,15 @@ fn request_agent_compaction(
     False ->
       int.max(current.compaction_requested, current.compaction_completed) + 1
   }
-  let replacement = agent.State(..current, compaction_requested: generation)
+  // A new explicit request clears any recorded failure: the error is what
+  // pauses retries of a failing compaction, and re-requesting is the caller's
+  // way to try again.
+  let replacement =
+    agent.State(
+      ..current,
+      compaction_requested: generation,
+      last_compaction_error: option.None,
+    )
   let running =
     state.children
     |> list.find(fn(child) { child.0 == agent_id })
@@ -887,10 +1043,14 @@ fn request_agent_compaction(
         replacement,
         catalog,
       ))
-      use state <- result.try(persist_agents(
-        state,
-        replace_agent(state.group.agents, replacement),
-      ))
+      use state <- result.try(
+        persist_agents(state, replace_agent(state.group.agents, replacement))
+        |> result.map_error(fn(error) {
+          let PreparedAgent(active:, ..) = prepared
+          agent.discard(active)
+          error
+        }),
+      )
       let child = make_agent(Group(coordinator), prepared)
       let assert True = process.link(agent.pid(child))
       agent.release(child)
@@ -960,10 +1120,14 @@ fn inject_and_start(
     )
   use prepared <- result.try(prepare_agents(config, single, catalog))
   let assert [prepared] = prepared
-  use state <- result.try(persist_agents(
-    state,
-    replace_agent(state.group.agents, next_agent),
-  ))
+  use state <- result.try(
+    persist_agents(state, replace_agent(state.group.agents, next_agent))
+    |> result.map_error(fn(error) {
+      let PreparedAgent(active:, ..) = prepared
+      agent.discard(active)
+      error
+    }),
+  )
   let child = make_agent(Group(coordinator), prepared)
   let assert True = process.link(agent.pid(child))
   agent.release(child)
@@ -1016,6 +1180,7 @@ fn extend_claim(state: CoordinatorState) -> ExecutionState {
     state.owner,
     execution_epoch(state.group.execution),
     system_time(Second) + state.lease_duration_seconds,
+    execution_nonce(state.group.execution),
   )
 }
 
@@ -1085,6 +1250,17 @@ fn do_commit_agent(
         new_agent.compaction_completed,
         current.compaction_completed,
       ),
+      // A re-request accepted while this worker was mid-round durably bumped
+      // `compaction_requested` and cleared the failure record. The worker's
+      // stale in-memory error must not resurrect here, or the acknowledged
+      // request stays paused forever (both the round-loop trigger and the
+      // exit-restart path require a clear error).
+      last_compaction_error: case
+        current.compaction_requested > new_agent.compaction_requested
+      {
+        True -> current.last_compaction_error
+        False -> new_agent.last_compaction_error
+      },
       status: case has_pending {
         True -> agent.Ready
         False -> new_agent.status
@@ -1103,6 +1279,7 @@ fn do_commit_agent(
       state.owner,
       execution_epoch(state.group.execution),
       system_time(Second) + state.lease_duration_seconds,
+      execution_nonce(state.group.execution),
     )
   let group =
     AgentGroup(..state.group, revision: group_revision, agents:, execution:)
@@ -1150,11 +1327,12 @@ fn write_callback_states(
       }
     })
   let execution = case state.group.execution {
-    Claimed(_, epoch, _) ->
+    Claimed(_, epoch, _, nonce) ->
       Claimed(
         state.owner,
         epoch,
         system_time(Second) + state.lease_duration_seconds,
+        nonce,
       )
     execution -> execution
   }
@@ -1176,7 +1354,7 @@ fn renew(state: CoordinatorState) -> Result(CoordinatorState, Error) {
   })
   case state.group.execution {
     Completed -> Ok(state)
-    Claimed(owner, epoch, expires_at) ->
+    Claimed(owner, epoch, expires_at, nonce) ->
       case owner == state.owner && expires_at > system_time(Second) {
         False -> Error(LostGroupOwnership)
         True -> {
@@ -1188,6 +1366,7 @@ fn renew(state: CoordinatorState) -> Result(CoordinatorState, Error) {
                 state.owner,
                 epoch,
                 system_time(Second) + state.lease_duration_seconds,
+                nonce,
               ),
             )
           use metadata <- result.try(write_group(state, group))
@@ -1271,7 +1450,7 @@ fn write_running_index(
   owner: String,
 ) -> Result(storage.Metadata, storage.Error) {
   let #(epoch, lease_expires_at) = case group.execution {
-    Claimed(_, epoch, lease_expires_at) -> #(epoch, lease_expires_at)
+    Claimed(_, epoch, lease_expires_at, _) -> #(epoch, lease_expires_at)
     _ -> #(0, 0)
   }
   let body =
@@ -1429,7 +1608,7 @@ fn find_agent(
 
 fn ensure_claimable(execution: ExecutionState) -> Result(Nil, Error) {
   case execution {
-    Claimed(owner, _, expires) ->
+    Claimed(owner, _, expires, _) ->
       case expires > system_time(Second) {
         True -> Error(AlreadyClaimed(owner, expires))
         False -> Ok(Nil)
@@ -1451,6 +1630,7 @@ fn claim(
       owner,
       execution_epoch(group.execution) + 1,
       system_time(Second) + lease_duration_seconds,
+      claim_nonce(),
     ),
   )
 }
@@ -1472,9 +1652,20 @@ fn inject_pending(state: agent.State) -> agent.State {
 
 fn execution_epoch(execution: ExecutionState) -> Int {
   case execution {
-    Claimed(_, epoch, _) -> epoch
+    Claimed(_, epoch, _, _) -> epoch
     _ -> 0
   }
+}
+
+fn execution_nonce(execution: ExecutionState) -> String {
+  case execution {
+    Claimed(_, _, _, nonce) -> nonce
+    _ -> ""
+  }
+}
+
+fn claim_nonce() -> String {
+  crypto.strong_random_bytes(18) |> bit_array.base64_url_encode(False)
 }
 
 fn schedule_renewal(subject: Subject(Message), lease_seconds: Int) -> Nil {
@@ -1509,12 +1700,13 @@ fn encode_execution(execution: ExecutionState) -> json.Json {
   case execution {
     Idle -> json.object([#("type", json.string("idle"))])
     Completed -> json.object([#("type", json.string("completed"))])
-    Claimed(owner, epoch, expires) ->
+    Claimed(owner, epoch, expires, nonce) ->
       json.object([
         #("type", json.string("claimed")),
         #("owner", json.string(owner)),
         #("epoch", json.int(epoch)),
         #("lease_expires_at", json.int(expires)),
+        #("nonce", json.string(nonce)),
       ])
   }
 }
@@ -1552,7 +1744,8 @@ fn execution_decoder() -> decode.Decoder(ExecutionState) {
       use owner <- decode.field("owner", decode.string)
       use epoch <- decode.field("epoch", decode.int)
       use expires <- decode.field("lease_expires_at", decode.int)
-      decode.success(Claimed(owner, epoch, expires))
+      use nonce <- decode.optional_field("nonce", "", decode.string)
+      decode.success(Claimed(owner, epoch, expires, nonce))
     }
     _ -> decode.failure(Idle, "unknown execution state")
   }

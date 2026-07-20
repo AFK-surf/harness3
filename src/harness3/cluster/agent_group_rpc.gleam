@@ -43,11 +43,11 @@ pub fn plugin(storage: Storage, lease_duration_seconds: Int) -> core.RpcPlugin {
         }
         False -> {
           use _ <- result.try(
-            agent_group.wake_as_with_membership_refresh(
-              loaded,
-              core.context_token(context),
-              fn() { core.context_refresh_membership(context) },
-            )
+            // Detached: this handler is a transient request process; waking
+            // directly would link the group's process tree to it.
+            agent_group.wake_detached(loaded, core.context_token(context), fn() {
+              core.context_refresh_membership(context)
+            })
             |> result.map_error(fn(error) {
               core.HandlerError("wake_failed", string.inspect(error))
             }),

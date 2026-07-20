@@ -245,7 +245,7 @@ fn execution_json(execution: agent_group.ExecutionState) -> json.Json {
     agent_group.Idle -> json.object([#("status", json.string("idle"))])
     agent_group.Completed ->
       json.object([#("status", json.string("completed"))])
-    agent_group.Claimed(owner, epoch, expires_at) ->
+    agent_group.Claimed(owner, epoch, expires_at, _) ->
       json.object([
         #("status", json.string("running")),
         #("owner", json.string(owner)),

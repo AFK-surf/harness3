@@ -54,11 +54,7 @@ type Membership {
 }
 
 type Scan {
-  Scan(
-    candidates: List(agent_group.RunningIndexEntry),
-    nodes: List(Membership),
-    running: List(agent_group.RunningIndexEntry),
-  )
+  Scan(candidates: List(agent_group.RunningIndexEntry), nodes: List(Membership))
 }
 
 pub fn start(
@@ -114,35 +110,43 @@ fn handle_message(
 }
 
 fn elect_and_scan(state: State) -> State {
-  let lock = case state.lock {
+  case state.lock {
     Some(lock) ->
-      distributed_lock.renew(lock)
-      |> result.map(Some)
-    None ->
-      distributed_lock.try_acquire(
-        state.storage,
-        "recovery-leader",
-        state.owner,
-        leader_lease_seconds,
-      )
-  }
-  case lock {
-    Error(_) -> State(..state, lock: None, candidates: [])
-    Ok(None) -> State(..state, lock: None, candidates: [])
-    Ok(Some(lock)) ->
-      case scan(state.storage) {
-        Ok(Scan(candidates:, nodes:, running:)) -> {
-          dispatch_candidates(
-            state.storage,
-            state.dispatch,
-            candidates,
-            nodes,
-            running,
-          )
-          State(..state, lock: Some(lock), candidates:)
-        }
+      case distributed_lock.renew(lock) {
+        Ok(renewed) -> scan_as_leader(state, renewed)
+        // Only a confirmed replacement forfeits leadership. Dropping the lock
+        // on a transient storage error would leave the cluster with no
+        // recovery leader for a full lease even though nobody took over.
+        Error(distributed_lock.Lost) ->
+          State(..state, lock: None, candidates: [])
+        // Keep the (possibly version-stale) lock but skip this cycle: the
+        // lease was not extended, so scanning now could overlap a successor.
+        // The next renew settles the version via read-back or comes back
+        // `Lost`.
         Error(_) -> State(..state, lock: Some(lock), candidates: [])
       }
+    None ->
+      case
+        distributed_lock.try_acquire(
+          state.storage,
+          "recovery-leader",
+          state.owner,
+          leader_lease_seconds,
+        )
+      {
+        Ok(Some(lock)) -> scan_as_leader(state, lock)
+        Ok(None) | Error(_) -> State(..state, lock: None, candidates: [])
+      }
+  }
+}
+
+fn scan_as_leader(state: State, lock: distributed_lock.Lock) -> State {
+  case scan(state.storage) {
+    Ok(Scan(candidates:, nodes:)) -> {
+      dispatch_candidates(state.storage, state.dispatch, candidates, nodes)
+      State(..state, lock: Some(lock), candidates:)
+    }
+    Error(_) -> State(..state, lock: Some(lock), candidates: [])
   }
 }
 
@@ -208,7 +212,7 @@ fn scan(backend: Storage) -> Result(Scan, storage.Error) {
     |> list.filter(fn(entry) { !list.contains(claimed, entry.group_id) })
     |> newest_claims
     |> list.sort(fn(a, b) { string.compare(a.group_id, b.group_id) })
-  Ok(Scan(candidates, alive_nodes, running))
+  Ok(Scan(candidates, alive_nodes))
 }
 
 fn dispatch_candidates(
@@ -216,18 +220,11 @@ fn dispatch_candidates(
   dispatch: fn(String, Int, String, String) -> Result(Nil, String),
   candidates: List(agent_group.RunningIndexEntry),
   nodes: List(Membership),
-  running: List(agent_group.RunningIndexEntry),
 ) -> Nil {
   case nodes {
     [] -> Nil
     _ ->
-      dispatch_round_robin(
-        backend,
-        dispatch,
-        candidates,
-        list.shuffle(nodes),
-        running,
-      )
+      dispatch_round_robin(backend, dispatch, candidates, list.shuffle(nodes))
   }
 }
 
@@ -236,30 +233,80 @@ fn dispatch_round_robin(
   dispatch: fn(String, Int, String, String) -> Result(Nil, String),
   candidates: List(agent_group.RunningIndexEntry),
   nodes: List(Membership),
-  running: List(agent_group.RunningIndexEntry),
 ) -> Nil {
   case candidates, nodes {
     [], _ | _, [] -> Nil
     [candidate, ..rest], [node, ..remaining_nodes] -> {
-      case dispatch_candidate(dispatch, candidate, nodes) {
-        False -> Nil
-        True ->
-          running
-          |> list.filter(fn(entry) { entry.group_id == candidate.group_id })
-          |> list.each(fn(entry) {
-            let _ = storage.delete(backend, entry.index_key)
-            Nil
-          })
+      // A group that stopped cleanly after this scan's index snapshot was
+      // taken has already deleted its entry and released its claim;
+      // dispatching from the stale snapshot would resurrect it. Re-check the
+      // entry immediately before dispatching, and skip conservatively when
+      // the check itself fails.
+      case storage.get(backend, candidate.index_key) {
+        Ok(_) -> {
+          case dispatch_candidate(dispatch, candidate, nodes) {
+            False -> Nil
+            True -> clean_stale_entries(backend, candidate.group_id)
+          }
+          dispatch_round_robin(
+            backend,
+            dispatch,
+            rest,
+            list.append(remaining_nodes, [node]),
+          )
+        }
+        Error(_) ->
+          dispatch_round_robin(backend, dispatch, rest, [
+            node,
+            ..remaining_nodes
+          ])
       }
-      dispatch_round_robin(
-        backend,
-        dispatch,
-        rest,
-        list.append(remaining_nodes, [node]),
-        running,
-      )
     }
   }
+}
+
+/// Removes the dispatched group's superseded index entries. The entries are
+/// re-listed after the dispatch, and only epochs strictly below the newest
+/// are deleted: after a fresh wake the newest is the new claim's entry, and
+/// after an "already running" response it is the live claim itself — which a
+/// snapshot-based delete would erase, leaving a running group invisible to
+/// recovery when its node later crashes. On any read failure nothing is
+/// deleted; stale entries cost only a spurious wake later.
+fn clean_stale_entries(backend: Storage, group_id: String) -> Nil {
+  case group_entries(backend, group_id) {
+    Error(_) -> Nil
+    Ok(entries) -> {
+      let newest =
+        list.fold(entries, 0, fn(max, entry) { int.max(max, entry.epoch) })
+      entries
+      |> list.filter(fn(entry) { entry.epoch < newest })
+      |> list.each(fn(entry) {
+        let _ = storage.delete(backend, entry.index_key)
+        Nil
+      })
+    }
+  }
+}
+
+fn group_entries(
+  backend: Storage,
+  group_id: String,
+) -> Result(List(agent_group.RunningIndexEntry), storage.Error) {
+  use metadata <- result.try(storage.list(
+    backend,
+    agent_group.running_index_prefix(),
+  ))
+  list.try_fold(metadata, [], fn(entries, item) {
+    case storage.get(backend, item.key) {
+      Error(storage.NotFound(_)) -> Ok(entries)
+      Error(error) -> Error(error)
+      Ok(object) ->
+        case agent_group.decode_running_index(item.key, object.body) {
+          Ok(entry) if entry.group_id == group_id -> Ok([entry, ..entries])
+          _ -> Ok(entries)
+        }
+    }
+  })
 }
 
 fn dispatch_candidate(

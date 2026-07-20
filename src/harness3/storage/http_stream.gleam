@@ -71,23 +71,32 @@ pub fn connect(request: Request(body)) -> Result(Connection, Error) {
   |> result.map_error(fn(error) { Transport(string.inspect(error)) })
 }
 
+/// Bounded like `retry.http`: a persistent outage must surface as an error
+/// rather than block the calling process forever.
+const maximum_attempts = 8
+
 pub fn connect_retry(
   make_request: fn() -> Result(Request(body), Error),
 ) -> Result(Connection, Error) {
-  connect_retry_loop(make_request, 100)
+  connect_retry_loop(make_request, 100, maximum_attempts - 1)
 }
 
 fn connect_retry_loop(
   make_request: fn() -> Result(Request(body), Error),
   delay_ms: Int,
+  remaining: Int,
 ) -> Result(Connection, Error) {
   use request <- result.try(make_request())
   case connect(request) {
     Ok(connection) -> Ok(connection)
-    Error(Transport(_)) -> {
-      let next_delay = wait(delay_ms)
-      connect_retry_loop(make_request, next_delay)
-    }
+    Error(Transport(_)) as failure ->
+      case remaining > 0 {
+        True -> {
+          let next_delay = wait(delay_ms)
+          connect_retry_loop(make_request, next_delay, remaining - 1)
+        }
+        False -> failure
+      }
     Error(error) -> Error(error)
   }
 }
@@ -96,30 +105,40 @@ fn connect_retry_loop(
 pub fn open_download(
   make_request: fn() -> Result(Request(body), Error),
 ) -> Result(StreamingResponse, Error) {
-  open_download_loop(make_request, 100)
+  open_download_loop(make_request, 100, maximum_attempts - 1)
 }
 
 fn open_download_loop(
   make_request: fn() -> Result(Request(body), Error),
   delay_ms: Int,
+  remaining: Int,
 ) -> Result(StreamingResponse, Error) {
-  use connection <- result.try(connect_retry_loop(make_request, delay_ms))
+  use connection <- result.try(connect_retry_loop(
+    make_request,
+    delay_ms,
+    remaining,
+  ))
   case finish(connection) {
-    Error(Transport(_)) -> {
+    Error(Transport(_)) as failure -> {
       close(connection)
-      let next_delay = wait(delay_ms)
-      open_download_loop(make_request, next_delay)
+      case remaining > 0 {
+        True -> {
+          let next_delay = wait(delay_ms)
+          open_download_loop(make_request, next_delay, remaining - 1)
+        }
+        False -> failure
+      }
     }
     Error(error) -> {
       close(connection)
       Error(error)
     }
     Ok(StreamingResponse(status:, ..) as response) ->
-      case transient_status(status) {
+      case transient_status(status) && remaining > 0 {
         True -> {
           close(connection)
           let next_delay = wait(delay_ms)
-          open_download_loop(make_request, next_delay)
+          open_download_loop(make_request, next_delay, remaining - 1)
         }
         False -> Ok(response)
       }
