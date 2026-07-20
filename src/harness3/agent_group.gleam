@@ -20,6 +20,11 @@ import harness3/storage.{type Metadata, type Storage, type VersionToken}
 
 const default_minimum_lifetime_milliseconds = 10_000
 
+/// User message prepended to an injected synthetic tool call when the pair
+/// would otherwise start the conversation or directly follow an assistant
+/// message; provider APIs reject both shapes.
+const synthetic_call_hint = "The next message is a synthetic tool call and its result, injected into this session by the harness."
+
 pub type ExecutionState {
   /// `epoch` is carried through every state, not just `Claimed`: it is the
   /// fencing token in the running-index key, so releasing a claim must not
@@ -159,6 +164,14 @@ type Message {
     coordinator: Subject(Message),
     reply: Subject(Result(Nil, Error)),
   )
+  InjectGroupToolCall(
+    agent_id: String,
+    tool_name: String,
+    arguments: String,
+    response: String,
+    coordinator: Subject(Message),
+    reply: Subject(Result(Nil, Error)),
+  )
   RequestCompaction(
     agent_id: String,
     coordinator: Subject(Message),
@@ -174,6 +187,12 @@ type PreparedAgent {
     active: agent.Active,
     profile: agent_profile.AgentProfile,
   )
+}
+
+/// What a delivery injects into an agent's conversation.
+type Delivery {
+  TextDelivery(content: String)
+  ToolCallDelivery(tool_name: String, arguments: String, response: String)
 }
 
 pub fn create(config: Config, group: AgentGroup) -> Result(LoadedGroup, Error) {
@@ -416,6 +435,10 @@ fn start_coordinator(
     fn() { stop(handle) |> result.map_error(string.inspect) },
     fn(agent_id, message) {
       send_message(handle, agent_id, message)
+      |> result.map_error(string.inspect)
+    },
+    fn(agent_id, tool_name, arguments, response) {
+      inject_tool_call(handle, agent_id, tool_name, arguments, response)
       |> result.map_error(string.inspect)
     },
     fn(agent_id) {
@@ -669,6 +692,30 @@ pub fn send_message(
   })
 }
 
+/// Durably injects a synthetic tool call and its result into an agent's
+/// history: an assistant `ToolCall` followed by the matching `ToolResult`.
+/// The tool does not need to exist in the agent's tool list. The agent wakes
+/// or picks the pair up at its next round exactly like a user message.
+pub fn inject_tool_call(
+  group: Group,
+  agent_id: String,
+  tool_name: String,
+  arguments: String,
+  response: String,
+) -> Result(Nil, Error) {
+  let Group(subject) = group
+  process.call_forever(subject, fn(reply) {
+    InjectGroupToolCall(
+      agent_id,
+      tool_name,
+      arguments,
+      response,
+      subject,
+      reply,
+    )
+  })
+}
+
 /// Durably requests context compaction for one agent in an awake group.
 pub fn request_compaction(
   group: Group,
@@ -873,24 +920,29 @@ fn handle_message(
         }
       }
     }
-    SendGroupMessage(agent_id, content, coordinator, reply) -> {
-      case deliver_message(state, agent_id, content, coordinator) {
-        Error(error) -> {
-          process.send(reply, Error(error))
-          case error {
-            ConcurrentGroupUpdate | LostGroupOwnership -> {
-              abandon(state)
-              actor.stop()
-            }
-            _ -> actor.continue(state)
-          }
-        }
-        Ok(next) -> {
-          process.send(reply, Ok(Nil))
-          actor.continue(next)
-        }
-      }
-    }
+    SendGroupMessage(agent_id, content, coordinator, reply) ->
+      handle_delivery(
+        state,
+        agent_id,
+        TextDelivery(content),
+        coordinator,
+        reply,
+      )
+    InjectGroupToolCall(
+      agent_id,
+      tool_name,
+      arguments,
+      response,
+      coordinator,
+      reply,
+    ) ->
+      handle_delivery(
+        state,
+        agent_id,
+        ToolCallDelivery(tool_name, arguments, response),
+        coordinator,
+        reply,
+      )
     RequestCompaction(agent_id, coordinator, reply) -> {
       case request_agent_compaction(state, agent_id, coordinator) {
         Error(error) -> {
@@ -955,32 +1007,137 @@ fn settle_idle(
   }
 }
 
+fn handle_delivery(
+  state: CoordinatorState,
+  agent_id: String,
+  delivery: Delivery,
+  coordinator: Subject(Message),
+  reply: Subject(Result(Nil, Error)),
+) -> actor.Next(CoordinatorState, Message) {
+  case deliver_message(state, agent_id, delivery, coordinator) {
+    Error(error) -> {
+      process.send(reply, Error(error))
+      case error {
+        ConcurrentGroupUpdate | LostGroupOwnership -> {
+          abandon(state)
+          actor.stop()
+        }
+        _ -> actor.continue(state)
+      }
+    }
+    Ok(next) -> {
+      process.send(reply, Ok(Nil))
+      actor.continue(next)
+    }
+  }
+}
+
 fn deliver_message(
   state: CoordinatorState,
   target_id: String,
-  content: String,
+  delivery: Delivery,
   coordinator: Subject(Message),
 ) -> Result(CoordinatorState, Error) {
-  use _ <- result.try(case string.trim(content) {
-    "" -> Error(InvalidMessage("message cannot be empty"))
-    _ -> Ok(Nil)
-  })
+  // Shape validation is pure, so it runs before any ownership or existence
+  // check: a malformed delivery fails the same way regardless of coordinator
+  // state.
+  use base <- result.try(delivery_messages(delivery))
   use _ <- result.try(case state.owned {
     True -> Ok(Nil)
     False -> Error(LostGroupOwnership)
   })
   use current <- result.try(find_agent(state.group.agents, target_id))
-  let incoming = llm.Message(llm.User, [llm.Text(content)])
   let running =
     state.children
     |> list.find(fn(child) { child.0 == target_id })
     |> result.map(fn(child) { process.is_alive(agent.pid(child.1)) })
     |> result.unwrap(False)
+  let incoming = case delivery {
+    TextDelivery(_) -> base
+    ToolCallDelivery(..) ->
+      case injection_needs_hint(current, running) {
+        True -> [llm.Message(llm.User, [llm.Text(synthetic_call_hint)]), ..base]
+        False -> base
+      }
+  }
   case running {
-    True -> queue_pending_message(state, current, incoming)
-    False -> inject_and_start(state, current, [incoming], coordinator)
+    True -> queue_pending_messages(state, current, incoming)
+    False -> inject_and_start(state, current, incoming, coordinator)
   }
 }
+
+fn delivery_messages(delivery: Delivery) -> Result(List(llm.Message), Error) {
+  case delivery {
+    TextDelivery(content) ->
+      case string.trim(content) {
+        "" -> Error(InvalidMessage("message cannot be empty"))
+        _ -> Ok([llm.Message(llm.User, [llm.Text(content)])])
+      }
+    ToolCallDelivery(tool_name, arguments, response) ->
+      synthetic_tool_call(tool_name, arguments, response)
+  }
+}
+
+/// A synthetic tool call cannot start a conversation (provider APIs require a
+/// user turn first) or directly follow an assistant message (role alternation
+/// and `tool_use`/`tool_result` pairing break), so those shapes get a user
+/// hint before the pair. For a running worker the in-flight round's output
+/// lands between the durable tail and the pair, and it may end with a bare
+/// assistant message, so an empty inbox always gets the hint; an
+/// already-queued inbox never ends with an assistant message (deliveries only
+/// append sequences ending in user text or a tool result) and needs none. The
+/// hint can produce consecutive user messages; every supported provider
+/// accepts those.
+fn injection_needs_hint(current: agent.State, running: Bool) -> Bool {
+  case running {
+    True -> list.is_empty(current.pending_messages)
+    False ->
+      case list.last(list.append(current.messages, current.pending_messages)) {
+        Error(_) -> True
+        Ok(llm.Message(llm.Assistant, _)) -> True
+        Ok(_) -> False
+      }
+  }
+}
+
+/// Builds the assistant `ToolCall` + `ToolResult` pair for a synthetic tool
+/// call. Arguments must be a JSON object: that is the only shape provider
+/// APIs accept for tool-use input.
+fn synthetic_tool_call(
+  tool_name: String,
+  arguments: String,
+  response: String,
+) -> Result(List(llm.Message), Error) {
+  use _ <- result.try(case string.trim(tool_name) {
+    "" -> Error(InvalidMessage("tool name cannot be empty"))
+    _ -> Ok(Nil)
+  })
+  use _ <- result.try(
+    json.parse(arguments, decode.dict(decode.string, decode.dynamic))
+    |> result.map(fn(_) { Nil })
+    |> result.map_error(fn(_) {
+      InvalidMessage("tool call arguments must be a JSON object")
+    }),
+  )
+  use _ <- result.try(case string.trim(response) {
+    "" -> Error(InvalidMessage("tool call response cannot be empty"))
+    _ -> Ok(Nil)
+  })
+  let call_id =
+    "synthetic-"
+    <> { crypto.strong_random_bytes(9) |> bit_array.base64_url_encode(False) }
+  Ok([
+    llm.Message(llm.Assistant, [
+      llm.ToolCall(call_id, tool_name, raw_json(arguments)),
+    ]),
+    llm.Message(llm.ToolRole, [
+      llm.ToolResult(call_id, [llm.Text(response)], False),
+    ]),
+  ])
+}
+
+@external(erlang, "gleam_stdlib", "identity")
+fn raw_json(value: String) -> json.Json
 
 /// Starts a worker for an agent's current durable state without persisting
 /// any change — used to resume a durably recorded but never-executed
@@ -1098,10 +1255,10 @@ fn request_agent_compaction(
   }
 }
 
-fn queue_pending_message(
+fn queue_pending_messages(
   state: CoordinatorState,
   current: agent.State,
-  incoming: llm.Message,
+  incoming: List(llm.Message),
 ) -> Result(CoordinatorState, Error) {
   // The active worker still commits against this same agent revision. Persist
   // the inbox without advancing that revision; its next commit atomically
@@ -1109,7 +1266,7 @@ fn queue_pending_message(
   let replacement =
     agent.State(
       ..current,
-      pending_messages: list.append(current.pending_messages, [incoming]),
+      pending_messages: list.append(current.pending_messages, incoming),
     )
   persist_agents(state, replace_agent(state.group.agents, replacement))
 }

@@ -73,6 +73,24 @@ pub fn plugin(storage: Storage, lease_duration_seconds: Int) -> core.RpcPlugin {
       },
     ),
     core.contextual_method(
+      inject_method_name(),
+      inject_decoder(),
+      fn(context, request) {
+        let #(group_id, agent_id, tool_name, arguments, response, visited) =
+          request
+        route_inject(
+          storage,
+          context,
+          group_id,
+          agent_id,
+          tool_name,
+          arguments,
+          response,
+          visited,
+        )
+      },
+    ),
+    core.contextual_method(
       compaction_method_name(),
       compaction_decoder(),
       fn(context, request) {
@@ -103,6 +121,18 @@ pub fn message_request(
   message: String,
 ) -> #(String, String, String, List(String)) {
   #(group_id, agent_id, message, [])
+}
+
+/// Builds a host-routed synthetic tool call injection request. The tool does
+/// not need to exist in the target agent's tool list.
+pub fn inject_request(
+  group_id: String,
+  agent_id: String,
+  tool_name: String,
+  arguments: String,
+  response: String,
+) -> #(String, String, String, String, String, List(String)) {
+  #(group_id, agent_id, tool_name, arguments, response, [])
 }
 
 /// Builds an awake-only, host-routed per-agent compaction request.
@@ -199,6 +229,92 @@ fn dispatch_wake(
   }
 }
 
+/// How a host-routed RPC reports a group with no live host: message-style
+/// routing treats it as simply not running, while awake-only routing
+/// (compaction) reports it as not awake.
+type SleepingGroup {
+  NotRunning
+  NotAwake
+}
+
+/// A per-agent RPC served from the local registry when the group lives on
+/// this node, and otherwise redirected to the group's host exactly once
+/// (loop-checked via the `visited` token list). It never wakes a dormant
+/// group.
+type HostRoutedCall(request, response) {
+  HostRoutedCall(
+    local: fn() -> Result(response, agent_group_registry.Error),
+    method_name: String,
+    payload: fn(List(String)) -> request,
+    response_decoder: decode.Decoder(response),
+    sleeping: SleepingGroup,
+    /// Prefix for handler error codes: `<prefix>_failed` for local registry
+    /// errors and `<prefix>_redirect_failed` for forwarding failures.
+    error_prefix: String,
+  )
+}
+
+fn route_to_group_host(
+  backend: Storage,
+  context: core.RpcContext,
+  group_id: String,
+  visited: List(String),
+  routed: HostRoutedCall(request, response),
+) -> Result(response, core.RpcError) {
+  let HostRoutedCall(
+    local:,
+    method_name:,
+    payload:,
+    response_decoder:,
+    sleeping:,
+    error_prefix:,
+  ) = routed
+  let current = core.context_token(context)
+  use _ <- result.try(check_loop(current, visited))
+  case local() {
+    Ok(response) -> Ok(response)
+    Error(agent_group_registry.NotFound(_)) -> {
+      use nodes <- result.try(alive_memberships(backend))
+      use host <- result.try(
+        group_host(backend, group_id, nodes)
+        |> result.map_error(fn(_) { sleeping_error(sleeping, "anywhere") }),
+      )
+      use _ <- result.try(case host.token == current {
+        True -> Error(sleeping_error(sleeping, "on its indexed node"))
+        False -> check_redirect(host.token, visited)
+      })
+      core.call(
+        host.ip,
+        host.port,
+        host.token,
+        method_name,
+        payload([current, ..visited]),
+        response_decoder,
+      )
+      |> result.map_error(fn(error) {
+        core.HandlerError(
+          error_prefix <> "_redirect_failed",
+          string.inspect(error),
+        )
+      })
+    }
+    Error(error) ->
+      Error(core.HandlerError(error_prefix <> "_failed", string.inspect(error)))
+  }
+}
+
+fn sleeping_error(sleeping: SleepingGroup, location: String) -> core.RpcError {
+  case sleeping {
+    NotRunning ->
+      core.HandlerError(
+        "not_running",
+        "agent group is not running " <> location,
+      )
+    NotAwake ->
+      core.HandlerError("not_awake", "agent group is not awake " <> location)
+  }
+}
+
 fn route_message(
   backend: Storage,
   context: core.RpcContext,
@@ -207,36 +323,60 @@ fn route_message(
   message: String,
   visited: List(String),
 ) -> Result(String, core.RpcError) {
-  let current = core.context_token(context)
-  use _ <- result.try(check_loop(current, visited))
-  case agent_group_registry.send_message(group_id, agent_id, message) {
-    Ok(Nil) -> Ok("ok")
-    Error(agent_group_registry.NotFound(_)) -> {
-      use nodes <- result.try(alive_memberships(backend))
-      use host <- result.try(group_host(backend, group_id, nodes))
-      use _ <- result.try(case host.token == current {
-        True ->
-          Error(core.HandlerError(
-            "not_running",
-            "agent group is not running on its indexed node",
-          ))
-        False -> check_redirect(host.token, visited)
-      })
-      core.call(
-        host.ip,
-        host.port,
-        host.token,
-        message_method_name(),
-        #(group_id, agent_id, message, [current, ..visited]),
-        decode.string,
-      )
-      |> result.map_error(fn(error) {
-        core.HandlerError("message_redirect_failed", string.inspect(error))
-      })
-    }
-    Error(error) ->
-      Error(core.HandlerError("message_failed", string.inspect(error)))
-  }
+  route_to_group_host(
+    backend,
+    context,
+    group_id,
+    visited,
+    HostRoutedCall(
+      local: fn() {
+        agent_group_registry.send_message(group_id, agent_id, message)
+        |> result.map(fn(_) { "ok" })
+      },
+      method_name: message_method_name(),
+      payload: fn(next_visited) { #(group_id, agent_id, message, next_visited) },
+      response_decoder: decode.string,
+      sleeping: NotRunning,
+      error_prefix: "message",
+    ),
+  )
+}
+
+fn route_inject(
+  backend: Storage,
+  context: core.RpcContext,
+  group_id: String,
+  agent_id: String,
+  tool_name: String,
+  arguments: String,
+  response: String,
+  visited: List(String),
+) -> Result(String, core.RpcError) {
+  route_to_group_host(
+    backend,
+    context,
+    group_id,
+    visited,
+    HostRoutedCall(
+      local: fn() {
+        agent_group_registry.inject_tool_call(
+          group_id,
+          agent_id,
+          tool_name,
+          arguments,
+          response,
+        )
+        |> result.map(fn(_) { "ok" })
+      },
+      method_name: inject_method_name(),
+      payload: fn(next_visited) {
+        #(group_id, agent_id, tool_name, arguments, response, next_visited)
+      },
+      response_decoder: decode.string,
+      sleeping: NotRunning,
+      error_prefix: "inject",
+    ),
+  )
 }
 
 fn route_compaction(
@@ -246,52 +386,29 @@ fn route_compaction(
   agent_id: String,
   visited: List(String),
 ) -> Result(Int, core.RpcError) {
-  let current = core.context_token(context)
-  use _ <- result.try(check_loop(current, visited))
-  case agent_group_registry.request_compaction(group_id, agent_id) {
-    Ok(generation) -> Ok(generation)
-    Error(agent_group_registry.NotFound(_)) -> {
-      use nodes <- result.try(alive_memberships(backend))
-      use host <- result.try(
-        group_host(backend, group_id, nodes)
-        |> result.map_error(fn(error) {
-          case error {
-            core.HandlerError("not_running", _) ->
-              core.HandlerError("not_awake", "agent group is not awake")
-            error -> error
-          }
-        }),
-      )
-      use _ <- result.try(case host.token == current {
-        True ->
-          Error(core.HandlerError(
-            "not_awake",
-            "agent group is not awake on its indexed node",
-          ))
-        False -> check_redirect(host.token, visited)
-      })
-      core.call(
-        host.ip,
-        host.port,
-        host.token,
-        compaction_method_name(),
-        #(group_id, agent_id, [current, ..visited]),
-        decode.int,
-      )
-      |> result.map_error(fn(error) {
-        core.HandlerError("compaction_redirect_failed", string.inspect(error))
-      })
-    }
-    Error(error) ->
-      Error(core.HandlerError("compaction_failed", string.inspect(error)))
-  }
+  route_to_group_host(
+    backend,
+    context,
+    group_id,
+    visited,
+    HostRoutedCall(
+      local: fn() {
+        agent_group_registry.request_compaction(group_id, agent_id)
+      },
+      method_name: compaction_method_name(),
+      payload: fn(next_visited) { #(group_id, agent_id, next_visited) },
+      response_decoder: decode.int,
+      sleeping: NotAwake,
+      error_prefix: "compaction",
+    ),
+  )
 }
 
 fn group_host(
   backend: Storage,
   group_id: String,
   nodes: List(Endpoint),
-) -> Result(Endpoint, core.RpcError) {
+) -> Result(Endpoint, Nil) {
   let indexed = case running_owner(backend, group_id) {
     Ok(owner) -> list.find(nodes, fn(node) { node.token == owner })
     Error(_) -> Error(Nil)
@@ -299,11 +416,7 @@ fn group_host(
   case indexed {
     Ok(node) -> Ok(node)
     Error(_) ->
-      nodes
-      |> list.find(fn(node) { list.contains(node.agent_groups, group_id) })
-      |> result.map_error(fn(_) {
-        core.HandlerError("not_running", "agent group is not running anywhere")
-      })
+      list.find(nodes, fn(node) { list.contains(node.agent_groups, group_id) })
   }
 }
 
@@ -464,6 +577,30 @@ fn message_decoder() -> decode.Decoder(#(String, String, String, List(String))) 
   })
 }
 
+fn inject_decoder() -> decode.Decoder(
+  #(String, String, String, String, String, List(String)),
+) {
+  decode.at([0], decode.string)
+  |> decode.then(fn(group_id) {
+    decode.at([1], decode.string)
+    |> decode.then(fn(agent_id) {
+      decode.at([2], decode.string)
+      |> decode.then(fn(tool_name) {
+        decode.at([3], decode.string)
+        |> decode.then(fn(arguments) {
+          decode.at([4], decode.string)
+          |> decode.then(fn(response) {
+            decode.at([5], decode.list(of: decode.string))
+            |> decode.map(fn(visited) {
+              #(group_id, agent_id, tool_name, arguments, response, visited)
+            })
+          })
+        })
+      })
+    })
+  })
+}
+
 fn compaction_decoder() -> decode.Decoder(#(String, String, List(String))) {
   decode.at([0], decode.string)
   |> decode.then(fn(group_id) {
@@ -490,6 +627,13 @@ pub fn wake_method_name() -> String {
 
 pub fn message_method_name() -> String {
   "message_agent_group"
+}
+
+/// RPC that injects a synthetic tool call and its result into an agent's
+/// history on the current host, or forwards to the host. It never wakes or
+/// resumes a dormant group.
+pub fn inject_method_name() -> String {
+  "inject_agent_tool_call"
 }
 
 /// RPC that records compaction on the current host or forwards to it. It never

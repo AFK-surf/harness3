@@ -92,6 +92,7 @@ pub fn membership_refresh_publishes_only_live_registered_agent_groups_test() {
     live,
     fn() { Ok(Nil) },
     fn(_, _) { Ok(Nil) },
+    fn(_, _, _, _) { Ok(Nil) },
     fn(_) { Ok(1) },
   )
   agent_group_registry.register(
@@ -99,6 +100,7 @@ pub fn membership_refresh_publishes_only_live_registered_agent_groups_test() {
     dead,
     fn() { Ok(Nil) },
     fn(_, _) { Ok(Nil) },
+    fn(_, _, _, _) { Ok(Nil) },
     fn(_) { Ok(1) },
   )
   use <- exception.defer(fn() {

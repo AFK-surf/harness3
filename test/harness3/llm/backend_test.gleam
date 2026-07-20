@@ -77,6 +77,67 @@ pub fn multimodal_requests_test() {
   ))
 }
 
+pub fn synthetic_tool_call_pair_request_test() {
+  // The inter-agent injection shape: a user hint followed by an assistant
+  // tool call and its result for a tool that is not in the tool list. The
+  // hint keeps the conversation from starting with an assistant message.
+  let request =
+    llm.Request(
+      model: "test-model",
+      messages: [
+        llm.Message(llm.User, [
+          llm.Text(
+            "The next message is a synthetic tool call and its result, injected into this session by the harness.",
+          ),
+        ]),
+        llm.Message(llm.Assistant, [
+          llm.ToolCall(
+            "synthetic-AbC123_-x",
+            "team.receive_message",
+            json.object([#("from", json.string("lead"))]),
+          ),
+        ]),
+        llm.Message(llm.ToolRole, [
+          llm.ToolResult(
+            "synthetic-AbC123_-x",
+            [llm.Text("teammate update")],
+            False,
+          ),
+        ]),
+      ],
+      tools: [],
+      max_output_tokens: None,
+      reasoning_effort: None,
+      stream: False,
+    )
+
+  let assert Ok(llm.HttpRequest(body: chat_body, ..)) =
+    llm.build_request(
+      openai_chat_completions.new(openai_chat_completions.config("key")),
+      request,
+    )
+  assert string.contains(chat_body, "tool_calls")
+  assert string.contains(chat_body, "\"role\":\"tool\"")
+  assert string.contains(chat_body, "team.receive_message")
+
+  let assert Ok(llm.HttpRequest(body: responses_body, ..)) =
+    llm.build_request(
+      openai_responses.new(openai_responses.config("key")),
+      request,
+    )
+  assert string.contains(responses_body, "\"type\":\"function_call\"")
+  assert string.contains(responses_body, "\"type\":\"function_call_output\"")
+
+  let assert Ok(llm.HttpRequest(body: anthropic_body, ..)) =
+    llm.build_request(
+      anthropic_messages.new(anthropic_messages.config("key")),
+      request,
+    )
+  assert string.contains(anthropic_body, "\"type\":\"tool_use\"")
+  assert string.contains(anthropic_body, "\"type\":\"tool_result\"")
+  assert string.contains(anthropic_body, "\"name\":\"team.receive_message\"")
+}
+
 pub fn tool_call_replay_request_test() {
   let request =
     llm.Request(

@@ -24,6 +24,7 @@ pub fn live_entries_force_stop_and_dead_entries_are_swept_test() {
       Ok(Nil)
     },
     fn(_, _) { Ok(Nil) },
+    fn(_, _, _, _) { Ok(Nil) },
     fn(_) { Ok(1) },
   )
   assert list.contains(agent_group_registry.alive_ids(), live_id)
@@ -41,6 +42,7 @@ pub fn live_entries_force_stop_and_dead_entries_are_swept_test() {
     dead,
     fn() { Ok(Nil) },
     fn(_, _) { Ok(Nil) },
+    fn(_, _, _, _) { Ok(Nil) },
     fn(_) { Ok(1) },
   )
 

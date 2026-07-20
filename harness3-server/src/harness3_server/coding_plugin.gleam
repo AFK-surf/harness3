@@ -14,6 +14,10 @@ import simplifile
 
 const plugin_name = "coding"
 
+/// Synthetic tool call used to deliver incoming teammate messages. It is
+/// injected into the recipient's history and never appears in a tool list.
+const receive_tool_name = "team.receive_message"
+
 /// Filesystem and shell capabilities for agents that are allowed to modify the
 /// selected workspace. Team coordination is installed separately so other
 /// agent kinds do not inherit these capabilities.
@@ -50,7 +54,9 @@ pub fn collaboration(
       <> capability_instructions
       <> " Your permitted `team.message_agent` recipients are: "
       <> string.join(teammates, ", ")
-      <> ". `team.message_agent` rejects every other recipient. Subagents communicate only with the lead; the lead may communicate with every subagent. Messages are durable and wake the target agent. Coordinate explicitly and report concrete results.",
+      <> ". `team.message_agent` rejects every other recipient. Subagents communicate only with the lead; the lead may communicate with every subagent. Messages are durable and wake the target agent; incoming messages arrive as `"
+      <> receive_tool_name
+      <> "` synthetic tool results naming the sender. Replies are delivered automatically. Coordinate explicitly and report concrete results.",
   ))
   |> plugin.with_tool(message_tool(group_id, agent_id, teammates))
 }
@@ -274,7 +280,14 @@ fn message_tool(
               ))
             False ->
               case
-                agent_group_registry.send_message(group_id, target, message)
+                agent_group_registry.inject_tool_call(
+                  group_id,
+                  target,
+                  receive_tool_name,
+                  json.object([#("from", json.string(own_id))])
+                    |> json.to_string,
+                  message,
+                )
               {
                 Ok(Nil) ->
                   Ok(tool_result(

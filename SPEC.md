@@ -486,14 +486,23 @@ that scan cycle.
 - `message_agent_group(group_id, agent_id, message, visited)` — try the local registry;
   otherwise locate the host via running index (newest epoch) or membership listing and
   redirect once (loop-checked). Messaging never wakes a dormant group.
+- `inject_agent_tool_call(group_id, agent_id, tool_name, arguments, response, visited)` —
+  same host routing as `message_agent_group`, but the injection is a synthetic tool call:
+  an assistant `ToolCall` (generated `synthetic-*` id, caller-chosen name and JSON-object
+  arguments, not necessarily in the agent's tool list) followed by its `ToolResult`
+  carrying the caller-chosen response. When the pair would start the conversation or
+  directly follow an assistant message (including the uncertain tail behind an in-flight
+  round with an empty inbox), a fixed user hint message is prepended — the two shapes
+  providers reject. The hint can produce consecutive user messages, which every
+  supported provider accepts. Never wakes a dormant group.
 - `force_stop_agent_group(group_id)` — local registry force-stop.
 
 ### 8.5 Node-local registries
 
 `agent_group_registry` and `agent_profile` are public named ETS tables created lazily by
 a detached holder process. The group registry stores id → (pid, stop closure, send
-closure); reads sweep entries whose pids died. Registration of an id overwrites;
-unregistration only removes the exact (id, pid) pair.
+closure, inject closure, compaction closure); reads sweep entries whose pids died.
+Registration of an id overwrites; unregistration only removes the exact (id, pid) pair.
 
 ---
 

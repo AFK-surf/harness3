@@ -1,6 +1,7 @@
 import exception
 import gleam/bit_array
 import gleam/crypto
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/json
 import gleam/string
@@ -79,25 +80,28 @@ pub fn coding_tools_write_read_exec_and_reject_escape_test() {
   let assert Ok(Nil) = simplifile.delete(root)
 }
 
-pub fn message_agent_says_replies_arrive_without_polling_test() {
-  let group_id = temporary_root()
+pub fn message_agent_injects_synthetic_tool_call_test() {
+  let group_id =
+    "group-"
+    <> { crypto.strong_random_bytes(9) |> bit_array.base64_url_encode(False) }
   let delivered = process.new_subject()
-  let coordinator = process.spawn_unlinked(fn() { process.sleep_forever() })
+  let fake_group = process.spawn_unlinked(fn() { process.sleep_forever() })
   agent_group_registry.register(
     group_id,
-    coordinator,
+    fake_group,
     fn() { Ok(Nil) },
-    fn(agent_id, message) {
-      process.send(delivered, #(agent_id, message))
+    // Inter-agent messaging must not arrive as user messages.
+    fn(_, _) { Error("user messages are not used") },
+    fn(agent_id, tool_name, arguments, response) {
+      process.send(delivered, #(agent_id, tool_name, arguments, response))
       Ok(Nil)
     },
-    fn(_) { Ok(1) },
+    fn(_) { Ok(0) },
   )
   use <- exception.defer(fn() {
-    agent_group_registry.unregister(group_id, coordinator)
-    process.kill(coordinator)
+    agent_group_registry.unregister(group_id, fake_group)
+    process.kill(fake_group)
   })
-
   let team =
     coding_plugin.collaboration(
       group_id,
@@ -108,20 +112,109 @@ pub fn message_agent_says_replies_arrive_without_polling_test() {
     )
   let assert Ok(registry) = plugin.registry([team])
   let assert Ok(runtime) = plugin.activate(registry, plugin.empty_states())
-  let assert Ok(#(
-    _,
-    plugin.ToolOutput(content: [llm.Text(message)], is_error: False),
-  )) =
+
+  let assert Ok(#(runtime, sent)) =
     plugin.invoke_tool(
       runtime,
       "team.message_agent",
       invocation("message", [
         #("agent_id", json.string("researcher")),
-        #("message", json.string("Investigate the failure")),
+        #("message", json.string("look at src/")),
       ]),
     )
-  assert message
+  let plugin.ToolOutput(is_error: sent_error, ..) = sent
+  assert !sent_error
+  assert output_text(sent)
     == "Message delivered to `researcher`. Any reply will be delivered automatically; there is no need to poll or wait."
-  let assert Ok(#("researcher", "Investigate the failure")) =
+  let assert Ok(#(target, tool_name, arguments, response)) =
     process.receive(delivered, within: 1000)
+  assert target == "researcher"
+  assert tool_name == "team.receive_message"
+  let assert Ok(from) =
+    json.parse(arguments, {
+      use from <- decode.field("from", decode.string)
+      decode.success(from)
+    })
+  assert from == "lead"
+  assert response == "look at src/"
+
+  let assert Ok(#(_, rejected)) =
+    plugin.invoke_tool(
+      runtime,
+      "team.message_agent",
+      invocation("reject", [
+        #("agent_id", json.string("ghost")),
+        #("message", json.string("hello")),
+      ]),
+    )
+  let plugin.ToolOutput(is_error: rejected_error, ..) = rejected
+  assert rejected_error
+  assert string.contains(output_text(rejected), "Unknown teammate")
+}
+
+pub fn message_agent_reports_inject_failure_test() {
+  let group_id =
+    "group-"
+    <> { crypto.strong_random_bytes(9) |> bit_array.base64_url_encode(False) }
+  let fake_group = process.spawn_unlinked(fn() { process.sleep_forever() })
+  agent_group_registry.register(
+    group_id,
+    fake_group,
+    fn() { Ok(Nil) },
+    fn(_, _) { Error("unused") },
+    fn(_, _, _, _) { Error("target agent is wedged") },
+    fn(_) { Ok(0) },
+  )
+  use <- exception.defer(fn() {
+    agent_group_registry.unregister(group_id, fake_group)
+    process.kill(fake_group)
+  })
+  let team =
+    coding_plugin.collaboration(
+      group_id,
+      "lead",
+      "Lead",
+      ["researcher"],
+      "Workspace access.",
+    )
+  let assert Ok(registry) = plugin.registry([team])
+  let assert Ok(runtime) = plugin.activate(registry, plugin.empty_states())
+
+  let assert Ok(#(_, failed)) =
+    plugin.invoke_tool(
+      runtime,
+      "team.message_agent",
+      invocation("inject-failure", [
+        #("agent_id", json.string("researcher")),
+        #("message", json.string("hello")),
+      ]),
+    )
+  let plugin.ToolOutput(is_error: failed_error, ..) = failed
+  assert failed_error
+  assert string.contains(output_text(failed), "Could not message teammate")
+  assert string.contains(output_text(failed), "target agent is wedged")
+
+  // A group that is not registered locally at all fails the same way.
+  let unregistered =
+    coding_plugin.collaboration(
+      "no-such-group",
+      "lead",
+      "Lead",
+      ["researcher"],
+      "Workspace access.",
+    )
+  let assert Ok(registry) = plugin.registry([unregistered])
+  let assert Ok(runtime) = plugin.activate(registry, plugin.empty_states())
+  let assert Ok(#(_, not_found)) =
+    plugin.invoke_tool(
+      runtime,
+      "team.message_agent",
+      invocation("inject-not-found", [
+        #("agent_id", json.string("researcher")),
+        #("message", json.string("hello")),
+      ]),
+    )
+  let plugin.ToolOutput(is_error: not_found_error, ..) = not_found
+  assert not_found_error
+  assert string.contains(output_text(not_found), "Could not message teammate")
 }

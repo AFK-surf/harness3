@@ -695,6 +695,729 @@ pub fn message_sent_to_inactive_agent_persists_and_starts_it_test() {
   remove_directory(root)
 }
 
+fn synthetic_call_present(
+  messages: List(llm.Message),
+  tool_name: String,
+  response: String,
+) -> Bool {
+  list.any(messages, fn(message) {
+    case message {
+      llm.Message(llm.Assistant, content) ->
+        list.any(content, fn(part) {
+          case part {
+            llm.ToolCall(call_id, name, _) if name == tool_name ->
+              synthetic_result_present(messages, call_id, response)
+            _ -> False
+          }
+        })
+      _ -> False
+    }
+  })
+}
+
+fn synthetic_result_present(
+  messages: List(llm.Message),
+  call_id: String,
+  response: String,
+) -> Bool {
+  list.any(messages, fn(message) {
+    case message {
+      llm.Message(llm.ToolRole, content) ->
+        list.any(content, fn(part) {
+          case part {
+            llm.ToolResult(id, result_content, False) if id == call_id ->
+              list.any(result_content, fn(result_part) {
+                case result_part {
+                  llm.Text(text) -> text == response
+                  _ -> False
+                }
+              })
+            _ -> False
+          }
+        })
+      _ -> False
+    }
+  })
+}
+
+pub fn tool_call_injected_into_inactive_agent_persists_and_starts_it_test() {
+  let root = temporary_root("inactive-agent-inject-test")
+  let backend = local.new(local.config(root))
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+      100_000,
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let gate = process.new_subject()
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      gated_transport(gate, "tool call handled"),
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/inactive-inject", [profile], 10, 100)
+  let inactive =
+    agent.State(..agent.state("agent", "model"), status: agent.Completed)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("inactive-inject", "catalog", [inactive]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let group_monitor = process.monitor(agent_group.pid(group))
+  assert list.is_empty(agent_group.agent_pids(group))
+
+  let assert Ok(Nil) =
+    agent_group.inject_tool_call(
+      group,
+      "agent",
+      "team.receive_message",
+      "{\"from\":\"lead\"}",
+      "please review the diff",
+    )
+  let assert Ok(Started(release)) = process.receive(gate, within: 5000)
+  let assert Ok(injected) = agent_group.load(config)
+  let assert [injected_agent] = injected.agents
+  assert list.is_empty(injected_agent.pending_messages)
+  // The conversation was empty, so a user hint precedes the pair: a tool call
+  // must not start a conversation.
+  let assert [hint, call, result] = injected_agent.messages
+  let assert llm.Message(llm.User, [llm.Text(_)]) = hint
+  let assert llm.Message(
+    llm.Assistant,
+    [llm.ToolCall(_, "team.receive_message", _)],
+  ) = call
+  let assert llm.Message(llm.ToolRole, [llm.ToolResult(_, _, False)]) = result
+  assert synthetic_call_present(
+    injected_agent.messages,
+    "team.receive_message",
+    "please review the diff",
+  )
+
+  process.send(release, Nil)
+  await_down(group_monitor)
+  let assert Ok(completed) = agent_group.load(config)
+  let assert [completed_agent] = completed.agents
+  assert list.is_empty(completed_agent.pending_messages)
+  assert synthetic_call_present(
+    completed_agent.messages,
+    "team.receive_message",
+    "please review the diff",
+  )
+  assert completed_agent.round == 1
+  assert completed_agent.status == agent.Completed
+  remove_directory(root)
+}
+
+pub fn tool_call_injected_after_assistant_tail_gets_user_hint_test() {
+  let root = temporary_root("assistant-tail-inject-test")
+  let backend = local.new(local.config(root))
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+      100_000,
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let gate = process.new_subject()
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      gated_transport(gate, "handled"),
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/assistant-tail", [profile], 10, 100)
+  let inactive =
+    agent.State(
+      ..agent.state("agent", "model"),
+      messages: [
+        llm.Message(llm.User, [llm.Text("initial task")]),
+        llm.Message(llm.Assistant, [llm.Text("work complete")]),
+      ],
+      status: agent.Completed,
+    )
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("assistant-tail", "catalog", [inactive]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let group_monitor = process.monitor(agent_group.pid(group))
+
+  let assert Ok(Nil) =
+    agent_group.inject_tool_call(
+      group,
+      "agent",
+      "team.receive_message",
+      "{\"from\":\"lead\"}",
+      "one more thing",
+    )
+  let assert Ok(Started(release)) = process.receive(gate, within: 5000)
+  let assert Ok(injected) = agent_group.load(config)
+  let assert [injected_agent] = injected.agents
+  // The assistant tail must not directly abut the synthetic assistant call.
+  let assert [_, _, hint, call, result] = injected_agent.messages
+  let assert llm.Message(llm.User, [llm.Text(_)]) = hint
+  let assert llm.Message(
+    llm.Assistant,
+    [llm.ToolCall(_, "team.receive_message", _)],
+  ) = call
+  let assert llm.Message(llm.ToolRole, [llm.ToolResult(_, _, False)]) = result
+
+  process.send(release, Nil)
+  await_down(group_monitor)
+  remove_directory(root)
+}
+
+pub fn tool_call_injected_after_user_tail_needs_no_hint_test() {
+  let root = temporary_root("user-tail-inject-test")
+  let backend = local.new(local.config(root))
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+      100_000,
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let gate = process.new_subject()
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      gated_transport(gate, "handled"),
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/user-tail", [profile], 10, 100)
+  let inactive =
+    agent.State(
+      ..agent.state("agent", "model"),
+      messages: [llm.Message(llm.User, [llm.Text("initial task")])],
+      status: agent.Completed,
+    )
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("user-tail", "catalog", [inactive]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let group_monitor = process.monitor(agent_group.pid(group))
+
+  let assert Ok(Nil) =
+    agent_group.inject_tool_call(
+      group,
+      "agent",
+      "team.receive_message",
+      "{\"from\":\"lead\"}",
+      "follow-up",
+    )
+  let assert Ok(Started(release)) = process.receive(gate, within: 5000)
+  let assert Ok(injected) = agent_group.load(config)
+  let assert [injected_agent] = injected.agents
+  // The pair already follows a user message, so no hint is inserted.
+  let assert [_, call, result] = injected_agent.messages
+  let assert llm.Message(
+    llm.Assistant,
+    [llm.ToolCall(_, "team.receive_message", _)],
+  ) = call
+  let assert llm.Message(llm.ToolRole, [llm.ToolResult(_, _, False)]) = result
+
+  process.send(release, Nil)
+  await_down(group_monitor)
+  remove_directory(root)
+}
+
+pub fn tool_call_injected_into_active_agent_is_queued_test() {
+  let root = temporary_root("active-agent-inject-test")
+  let backend = local.new(local.config(root))
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+      100_000,
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let first_call = process.new_subject()
+  let second_call = process.new_subject()
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      let _ = case
+        synthetic_call_present(
+          request.messages,
+          "team.receive_message",
+          "mid-round",
+        )
+      {
+        False -> {
+          let release = process.new_subject()
+          process.send(first_call, Started(release))
+          let assert Ok(Nil) = process.receive(release, within: 5000)
+          let assert Ok(Nil) = consume(llm.MessageStart("first", "test-model"))
+          let assert Ok(Nil) = consume(llm.TextDelta(0, "first answer"))
+          let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+        }
+        True -> {
+          process.send(second_call, Nil)
+          let assert Ok(Nil) = consume(llm.MessageStart("second", "test-model"))
+          let assert Ok(Nil) = consume(llm.TextDelta(0, "second answer"))
+          let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+        }
+      }
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/active-inject", [profile], 10, 100)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("active-inject", "catalog", [
+        agent.state("agent", "model"),
+      ]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let group_monitor = process.monitor(agent_group.pid(group))
+  let assert Ok(Started(release)) = process.receive(first_call, within: 5000)
+
+  let assert Ok(Nil) =
+    agent_group.inject_tool_call(
+      group,
+      "agent",
+      "team.receive_message",
+      "{\"from\":\"lead\"}",
+      "mid-round",
+    )
+  let assert Ok(queued) = agent_group.load(config)
+  let assert [queued_agent] = queued.agents
+  // The in-flight round may end with a bare assistant message, so the queued
+  // pair gets a user hint in front of it.
+  let assert [hint, queued_call, queued_result] = queued_agent.pending_messages
+  let assert llm.Message(llm.User, [llm.Text(_)]) = hint
+  let assert llm.Message(
+    llm.Assistant,
+    [llm.ToolCall(_, "team.receive_message", _)],
+  ) = queued_call
+  let assert llm.Message(llm.ToolRole, [llm.ToolResult(_, _, False)]) =
+    queued_result
+  assert synthetic_call_present(
+    queued_agent.pending_messages,
+    "team.receive_message",
+    "mid-round",
+  )
+  assert !synthetic_call_present(
+    queued_agent.messages,
+    "team.receive_message",
+    "mid-round",
+  )
+
+  process.send(release, Nil)
+  let assert Ok(Nil) = process.receive(second_call, within: 5000)
+  await_down(group_monitor)
+  let assert Ok(completed) = agent_group.load(config)
+  let assert [completed_agent] = completed.agents
+  assert list.is_empty(completed_agent.pending_messages)
+  // The folded sequence preserves role alternation across the round boundary:
+  // assistant answer, user hint, synthetic call, its result, next answer.
+  let assert [first, folded_hint, folded_call, folded_result, _second] =
+    completed_agent.messages
+  let assert llm.Message(llm.Assistant, [llm.Text("first answer")]) = first
+  let assert llm.Message(llm.User, [llm.Text(_)]) = folded_hint
+  let assert llm.Message(
+    llm.Assistant,
+    [llm.ToolCall(_, "team.receive_message", _)],
+  ) = folded_call
+  let assert llm.Message(llm.ToolRole, [llm.ToolResult(_, _, False)]) =
+    folded_result
+  assert synthetic_call_present(
+    completed_agent.messages,
+    "team.receive_message",
+    "mid-round",
+  )
+  assert completed_agent.round == 2
+  assert completed_agent.status == agent.Completed
+  remove_directory(root)
+}
+
+pub fn tool_call_injection_validates_its_shape_test() {
+  let root = temporary_root("inject-validation-test")
+  let backend = local.new(local.config(root))
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+      100_000,
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let gate = process.new_subject()
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      gated_transport(gate, "never reached"),
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/inject-validation", [profile], 10, 100)
+  let inactive =
+    agent.State(..agent.state("agent", "model"), status: agent.Completed)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("inject-validation", "catalog", [inactive]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let group_monitor = process.monitor(agent_group.pid(group))
+
+  let assert Error(agent_group.InvalidMessage(_)) =
+    agent_group.inject_tool_call(group, "agent", "", "{}", "response")
+  let assert Error(agent_group.InvalidMessage(_)) =
+    agent_group.inject_tool_call(
+      group,
+      "agent",
+      "team.receive_message",
+      "{}",
+      "",
+    )
+  let assert Error(agent_group.InvalidMessage(_)) =
+    agent_group.inject_tool_call(
+      group,
+      "agent",
+      "team.receive_message",
+      "not json",
+      "response",
+    )
+  // Arguments must be a JSON object: provider APIs reject any other shape
+  // for tool-use input.
+  let assert Error(agent_group.InvalidMessage(_)) =
+    agent_group.inject_tool_call(
+      group,
+      "agent",
+      "team.receive_message",
+      "[1,2]",
+      "response",
+    )
+  let assert Error(agent_group.MissingAgent("nobody")) =
+    agent_group.inject_tool_call(
+      group,
+      "nobody",
+      "team.receive_message",
+      "{}",
+      "response",
+    )
+  let assert Ok(snapshot) = agent_group.snapshot(group)
+  let assert [unchanged] = snapshot.agents
+  assert list.is_empty(unchanged.messages)
+  assert list.is_empty(unchanged.pending_messages)
+
+  let assert Ok(Nil) = agent_group.stop(group)
+  await_down(group_monitor)
+  remove_directory(root)
+}
+
+pub fn second_tool_call_injection_is_queued_without_hint_test() {
+  let root = temporary_root("second-injection-test")
+  let backend = local.new(local.config(root))
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+      100_000,
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let first_call = process.new_subject()
+  let second_call = process.new_subject()
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      let _ = case
+        synthetic_call_present(
+          request.messages,
+          "team.receive_message",
+          "second update",
+        )
+      {
+        False -> {
+          let release = process.new_subject()
+          process.send(first_call, Started(release))
+          let assert Ok(Nil) = process.receive(release, within: 5000)
+          let assert Ok(Nil) = consume(llm.MessageStart("first", "test-model"))
+          let assert Ok(Nil) = consume(llm.TextDelta(0, "first answer"))
+          let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+        }
+        True -> {
+          process.send(second_call, Nil)
+          let assert Ok(Nil) = consume(llm.MessageStart("second", "test-model"))
+          let assert Ok(Nil) = consume(llm.TextDelta(0, "second answer"))
+          let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+        }
+      }
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/second-injection", [profile], 10, 100)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("second-injection", "catalog", [
+        agent.state("agent", "model"),
+      ]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let group_monitor = process.monitor(agent_group.pid(group))
+  let assert Ok(Started(release)) = process.receive(first_call, within: 5000)
+
+  let assert Ok(Nil) =
+    agent_group.inject_tool_call(
+      group,
+      "agent",
+      "team.receive_message",
+      "{\"from\":\"lead\"}",
+      "first update",
+    )
+  let assert Ok(Nil) =
+    agent_group.inject_tool_call(
+      group,
+      "agent",
+      "team.receive_message",
+      "{\"from\":\"researcher\"}",
+      "second update",
+    )
+  let assert Ok(queued) = agent_group.load(config)
+  let assert [queued_agent] = queued.agents
+  // Only the first injection gets the hint: the queued inbox already ends
+  // with a tool result, which never abuts the second pair's assistant call.
+  let assert [
+    hint,
+    first_call_msg,
+    first_result,
+    second_call_msg,
+    second_result,
+  ] = queued_agent.pending_messages
+  let assert llm.Message(llm.User, [llm.Text(_)]) = hint
+  let assert llm.Message(
+    llm.Assistant,
+    [llm.ToolCall(_, "team.receive_message", _)],
+  ) = first_call_msg
+  let assert llm.Message(
+    llm.ToolRole,
+    [llm.ToolResult(_, [llm.Text("first update")], False)],
+  ) = first_result
+  let assert llm.Message(
+    llm.Assistant,
+    [llm.ToolCall(_, "team.receive_message", _)],
+  ) = second_call_msg
+  let assert llm.Message(
+    llm.ToolRole,
+    [llm.ToolResult(_, [llm.Text("second update")], False)],
+  ) = second_result
+
+  process.send(release, Nil)
+  let assert Ok(Nil) = process.receive(second_call, within: 5000)
+  await_down(group_monitor)
+  let assert Ok(completed) = agent_group.load(config)
+  let assert [completed_agent] = completed.agents
+  assert list.is_empty(completed_agent.pending_messages)
+  assert synthetic_call_present(
+    completed_agent.messages,
+    "team.receive_message",
+    "first update",
+  )
+  assert synthetic_call_present(
+    completed_agent.messages,
+    "team.receive_message",
+    "second update",
+  )
+  assert completed_agent.round == 2
+  assert completed_agent.status == agent.Completed
+  remove_directory(root)
+}
+
+pub fn queued_tool_call_pair_folds_into_history_on_wake_after_crash_test() {
+  let root = temporary_root("crash-fold-inject-test")
+  let backend = local.new(local.config(root))
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+      100_000,
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let first_call = process.new_subject()
+  let replay_call = process.new_subject()
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      case
+        synthetic_call_present(
+          request.messages,
+          "team.receive_message",
+          "crash update",
+        )
+      {
+        False -> {
+          let release = process.new_subject()
+          process.send(first_call, Started(release))
+          let assert Ok(Nil) = process.receive(release, within: 5000)
+          panic as "intentional agent crash"
+        }
+        True -> {
+          let release = process.new_subject()
+          process.send(replay_call, Started(release))
+          let assert Ok(Nil) = process.receive(release, within: 5000)
+          let assert Ok(Nil) = consume(llm.MessageStart("replay", "test-model"))
+          let assert Ok(Nil) = consume(llm.TextDelta(0, "recovered"))
+          let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+          let assert Ok(Nil) = consume(llm.MessageStop)
+          Ok(Nil)
+        }
+      }
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  // One-second lease so the crashed claim expires quickly enough to re-wake.
+  let config =
+    agent_group.Config(backend, "groups/crash-fold", [profile], 1, 100)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("crash-fold", "catalog", [
+        agent.state("agent", "model"),
+      ]),
+    )
+  // Wake from an owner process: the crashing worker takes the whole linked
+  // process tree down with it.
+  let started = process.new_subject()
+  let owner =
+    process.spawn_unlinked(fn() {
+      process.send(started, agent_group.wake(loaded))
+      process.sleep_forever()
+    })
+  let assert Ok(Ok(group)) = process.receive(started, within: 5000)
+  let group_monitor = process.monitor(agent_group.pid(group))
+  let owner_monitor = process.monitor(owner)
+  let assert Ok(Started(crash)) = process.receive(first_call, within: 5000)
+
+  let assert Ok(Nil) =
+    agent_group.inject_tool_call(
+      group,
+      "agent",
+      "team.receive_message",
+      "{\"from\":\"lead\"}",
+      "crash update",
+    )
+  let assert Ok(queued) = agent_group.load(config)
+  let assert [queued_agent] = queued.agents
+  let assert [_, _, _] = queued_agent.pending_messages
+
+  process.send(crash, Nil)
+  await_down(group_monitor)
+  await_down(owner_monitor)
+
+  // The claim expires, the group is resumed, and claim-time injection folds
+  // the queued pair (with its hint) into the conversation before the round.
+  process.sleep(1100)
+  let assert Ok(resumed) = agent_group.resume(config)
+  let assert Ok(revived) = agent_group.wake(resumed)
+  let revived_monitor = process.monitor(agent_group.pid(revived))
+  let assert Ok(Started(replay)) = process.receive(replay_call, within: 5000)
+  let assert Ok(folded) = agent_group.load(config)
+  let assert [folded_agent] = folded.agents
+  assert list.is_empty(folded_agent.pending_messages)
+  let assert [hint, call, result] = folded_agent.messages
+  let assert llm.Message(llm.User, [llm.Text(_)]) = hint
+  let assert llm.Message(
+    llm.Assistant,
+    [llm.ToolCall(_, "team.receive_message", _)],
+  ) = call
+  let assert llm.Message(
+    llm.ToolRole,
+    [llm.ToolResult(_, [llm.Text("crash update")], False)],
+  ) = result
+
+  process.send(replay, Nil)
+  await_down(revived_monitor)
+  let assert Ok(completed) = agent_group.load(config)
+  let assert [completed_agent] = completed.agents
+  assert completed_agent.round == 1
+  assert completed_agent.status == agent.Completed
+  remove_directory(root)
+}
+
 pub fn plugin_callback_between_agents_test() {
   let root = temporary_root("cross-agent-callback-test")
   let storage = local.new(local.config(root))

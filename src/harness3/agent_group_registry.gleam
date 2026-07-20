@@ -20,6 +20,9 @@ pub type StopHandle =
 pub type MessageHandle =
   fn(String, String) -> Result(Nil, String)
 
+pub type InjectToolCallHandle =
+  fn(String, String, String, String) -> Result(Nil, String)
+
 pub type CompactionHandle =
   fn(String) -> Result(Int, String)
 
@@ -27,8 +30,19 @@ pub type Error {
   NotFound(id: String)
   StopFailed(reason: String)
   MessageFailed(reason: String)
+  InjectFailed(reason: String)
   CompactionFailed(reason: String)
 }
+
+type Entry =
+  #(
+    String,
+    Pid,
+    StopHandle,
+    MessageHandle,
+    InjectToolCallHandle,
+    CompactionHandle,
+  )
 
 /// Registers a running agent group in the node-wide registry.
 pub fn register(
@@ -36,6 +50,7 @@ pub fn register(
   pid: Pid,
   stop: StopHandle,
   send_message: MessageHandle,
+  inject_tool_call: InjectToolCallHandle,
   request_compaction: CompactionHandle,
 ) -> Nil {
   ensure_table()
@@ -46,12 +61,21 @@ pub fn register(
         pid,
         stop,
         send_message,
+        inject_tool_call,
         request_compaction,
       ))
     })
   {
     Ok(_) -> Nil
-    Error(_) -> register(id, pid, stop, send_message, request_compaction)
+    Error(_) ->
+      register(
+        id,
+        pid,
+        stop,
+        send_message,
+        inject_tool_call,
+        request_compaction,
+      )
   }
 }
 
@@ -59,7 +83,7 @@ pub fn register(
 pub fn unregister(id: String, pid: Pid) -> Nil {
   ensure_table()
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
-    Ok([#(_, registered_pid, _, _, _) as entry]) if registered_pid == pid -> {
+    Ok([#(_, registered_pid, _, _, _, _) as entry]) if registered_pid == pid -> {
       let _ =
         exception.rescue(fn() { ets_delete_object(Harness3AgentGroups, entry) })
       Nil
@@ -74,7 +98,7 @@ pub fn force_stop(id: String) -> Result(Nil, Error) {
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
     Error(_) -> force_stop(id)
     Ok([]) -> Error(NotFound(id))
-    Ok([#(_, pid, stop, _, _) as entry]) ->
+    Ok([#(_, pid, stop, _, _, _) as entry]) ->
       case process.is_alive(pid) {
         False -> {
           let _ = ets_delete_object(Harness3AgentGroups, entry)
@@ -100,7 +124,7 @@ pub fn send_message(
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
     Error(_) -> send_message(id, agent_id, message)
     Ok([]) -> Error(NotFound(id))
-    Ok([#(_, pid, _, send, _) as entry]) ->
+    Ok([#(_, pid, _, send, _, _) as entry]) ->
       case process.is_alive(pid) {
         False -> {
           let _ = ets_delete_object(Harness3AgentGroups, entry)
@@ -117,12 +141,45 @@ pub fn send_message(
   }
 }
 
+/// Injects a synthetic tool call and its result into a running group's agent.
+pub fn inject_tool_call(
+  id: String,
+  agent_id: String,
+  tool_name: String,
+  arguments: String,
+  response: String,
+) -> Result(Nil, Error) {
+  ensure_table()
+  case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
+    Error(_) -> inject_tool_call(id, agent_id, tool_name, arguments, response)
+    Ok([]) -> Error(NotFound(id))
+    Ok([#(_, pid, _, _, inject, _) as entry]) ->
+      case process.is_alive(pid) {
+        False -> {
+          let _ = ets_delete_object(Harness3AgentGroups, entry)
+          Error(NotFound(id))
+        }
+        True ->
+          case
+            exception.rescue(fn() {
+              inject(agent_id, tool_name, arguments, response)
+            })
+          {
+            Error(error) -> Error(InjectFailed(string.inspect(error)))
+            Ok(Error(reason)) -> Error(InjectFailed(reason))
+            Ok(Ok(Nil)) -> Ok(Nil)
+          }
+      }
+    Ok(_) -> Error(NotFound(id))
+  }
+}
+
 pub fn request_compaction(id: String, agent_id: String) -> Result(Int, Error) {
   ensure_table()
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
     Error(_) -> request_compaction(id, agent_id)
     Ok([]) -> Error(NotFound(id))
-    Ok([#(_, pid, _, _, compact) as entry]) ->
+    Ok([#(_, pid, _, _, _, compact) as entry]) ->
       case process.is_alive(pid) {
         False -> {
           let _ = ets_delete_object(Harness3AgentGroups, entry)
@@ -205,24 +262,13 @@ fn table_exists() -> Bool {
 fn ets_new(name: TableName, options: List(TableOption)) -> Dynamic
 
 @external(erlang, "ets", "insert")
-fn ets_insert(
-  table: TableName,
-  entry: #(String, Pid, StopHandle, MessageHandle, CompactionHandle),
-) -> Bool
+fn ets_insert(table: TableName, entry: Entry) -> Bool
 
 @external(erlang, "ets", "delete_object")
-fn ets_delete_object(
-  table: TableName,
-  entry: #(String, Pid, StopHandle, MessageHandle, CompactionHandle),
-) -> Bool
+fn ets_delete_object(table: TableName, entry: Entry) -> Bool
 
 @external(erlang, "ets", "lookup")
-fn lookup(
-  table: TableName,
-  id: String,
-) -> List(#(String, Pid, StopHandle, MessageHandle, CompactionHandle))
+fn lookup(table: TableName, id: String) -> List(Entry)
 
 @external(erlang, "ets", "tab2list")
-fn ets_entries(
-  table: TableName,
-) -> List(#(String, Pid, StopHandle, MessageHandle, CompactionHandle))
+fn ets_entries(table: TableName) -> List(Entry)
