@@ -172,7 +172,7 @@ function renderThread(forceScroll = false) {
   const visible = agent.messages.filter((message) => message.role !== "system" && message.role !== "developer");
   thread.innerHTML = visible.length
     ? visible.map((message) => messageHtml(message, agent.id)).join("") + failureHtml(agent)
-    : `<div class="thread-empty">This agent has no messages yet.</div>`;
+    : `<div class="thread-empty">Send the first message below to start ${escapeHtml(agent.id)}.</div>`;
   if (forceScroll || nearBottom) thread.scrollTop = thread.scrollHeight;
 }
 
@@ -228,7 +228,7 @@ function openNewSession() {
     return;
   }
   dialog.showModal();
-  setTimeout(() => $("#task-prompt").focus(), 30);
+  setTimeout(() => $("#workspace-input").focus(), 30);
 }
 
 async function createSession() {
@@ -239,7 +239,6 @@ async function createSession() {
     const session = await api("/api/sessions", {
       method: "POST",
       body: JSON.stringify({
-        prompt: $("#task-prompt").value,
         model_id: $("#model-select").value,
         workspace: $("#workspace-input").value,
         team_size: Number($("#team-size").value),
@@ -256,12 +255,13 @@ async function createSession() {
     emptyState.classList.add("hidden");
     workspace.classList.remove("hidden");
     renderCurrent(true);
-    toast("Coding team started.");
+    $("#message-input").focus();
+    toast("Session ready. Send the first message to start an agent.");
   } catch (error) {
     toast(error.message, true);
   } finally {
     button.disabled = false;
-    button.textContent = "Create & run";
+    button.textContent = "Create session";
   }
 }
 
@@ -280,6 +280,7 @@ async function sendMessage() {
     input.value = "";
     toast("Message queued durably.");
     await refreshCurrent(true);
+    await loadSessions(false);
   } catch (error) {
     toast(error.message, true);
   } finally {
@@ -316,7 +317,7 @@ function updateTeamPreview() {
   const roles = ["lead", "researcher", "implementer", "reviewer"];
   const size = Number($("#team-size").value || 3);
   $("#team-preview").innerHTML = roles.slice(0, size).map((role, index) =>
-    `<span>${index === 0 ? "● " : "○ "}${role}${index === 0 ? " · starts now" : " · on demand"}</span>`
+    `<span>○ ${role} · on demand</span>`
   ).join("");
 }
 

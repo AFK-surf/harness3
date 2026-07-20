@@ -13,7 +13,6 @@ import harness3/agent
 import harness3/agent_group
 import harness3/agent_group_registry
 import harness3/agent_profile
-import harness3/llm
 import harness3/model_catalog
 import harness3/plugin
 import harness3/storage.{type Storage}
@@ -59,12 +58,7 @@ pub type Session {
 }
 
 pub type CreateInput {
-  CreateInput(
-    prompt: String,
-    model_id: String,
-    workspace: String,
-    team_size: Int,
-  )
+  CreateInput(model_id: String, workspace: String, team_size: Int)
 }
 
 pub opaque type Service {
@@ -120,8 +114,8 @@ pub fn create_session(
   let metadata =
     SessionMetadata(
       id:,
-      title: title(input.prompt),
-      prompt: input.prompt,
+      title: "New coding session",
+      prompt: "",
       workspace:,
       model_id: input.model_id,
       created_at: system_time(Second),
@@ -148,18 +142,7 @@ pub fn create_session(
       let _ = storage.delete(service.storage, meta_key)
       Error("could not create agent group: " <> string.inspect(error))
     }
-    Ok(loaded) ->
-      case agent_group.wake(loaded) {
-        Error(error) ->
-          Error("could not start agent group: " <> string.inspect(error))
-        Ok(group) -> {
-          use snapshot <- result.try(
-            agent_group.snapshot(group)
-            |> result.map_error(fn(error) { string.inspect(error) }),
-          )
-          Ok(Session(metadata, snapshot))
-        }
-      }
+    Ok(loaded) -> Ok(Session(metadata, agent_group.loaded_state(loaded)))
   }
 }
 
@@ -199,8 +182,17 @@ pub fn send_message(
   agent_id: String,
   message: String,
 ) -> Result(Nil, String) {
+  use _ <- result.try(case string.trim(message) {
+    "" -> Error("message cannot be empty")
+    _ -> Ok(Nil)
+  })
   use metadata <- result.try(load_metadata(service, id))
   use _ <- result.try(validate_agent(metadata, agent_id))
+  use metadata <- result.try(initialize_session_metadata(
+    service,
+    metadata,
+    message,
+  ))
   case agent_group_registry.send_message(id, agent_id, message) {
     Ok(Nil) -> Ok(Nil)
     Error(agent_group_registry.NotFound(_)) -> {
@@ -269,14 +261,12 @@ fn validate_create(
   input: CreateInput,
 ) -> Result(Nil, String) {
   case
-    string.trim(input.prompt),
     list.any(service.models, fn(model) { model.id == input.model_id }),
     input.team_size >= 1 && input.team_size <= 4
   {
-    "", _, _ -> Error("prompt cannot be empty")
-    _, False, _ -> Error("unknown model: " <> input.model_id)
-    _, _, False -> Error("team_size must be between 1 and 4")
-    _, _, _ -> Ok(Nil)
+    False, _ -> Error("unknown model: " <> input.model_id)
+    _, False -> Error("team_size must be between 1 and 4")
+    _, _ -> Ok(Nil)
   }
 }
 
@@ -316,12 +306,60 @@ fn load_metadata_key(
     storage.get(service.storage, key)
     |> result.map_error(fn(error) { string.inspect(error) }),
   )
+  decode_metadata_body(object.body)
+}
+
+fn decode_metadata_body(body: BitArray) -> Result(SessionMetadata, String) {
   use body <- result.try(
-    bit_array.to_string(object.body)
+    bit_array.to_string(body)
     |> result.map_error(fn(_) { "session metadata is not UTF-8" }),
   )
   json.parse(body, metadata_decoder())
   |> result.map_error(fn(error) { string.inspect(error) })
+}
+
+fn initialize_session_metadata(
+  service: Service,
+  metadata: SessionMetadata,
+  first_message: String,
+) -> Result(SessionMetadata, String) {
+  case metadata.prompt {
+    "" -> {
+      let key = metadata_key(metadata.id)
+      use object <- result.try(
+        storage.get(service.storage, key)
+        |> result.map_error(fn(error) { string.inspect(error) }),
+      )
+      use current <- result.try(decode_metadata_body(object.body))
+      case current.prompt {
+        "" -> {
+          let updated =
+            SessionMetadata(
+              ..current,
+              title: title(first_message),
+              prompt: first_message,
+            )
+          case
+            storage.put(
+              service.storage,
+              key,
+              encode_metadata(updated)
+                |> json.to_string
+                |> bit_array.from_string,
+              storage.IfUnchanged(object.metadata.version),
+            )
+          {
+            Ok(_) -> Ok(updated)
+            Error(storage.PreconditionFailed(_)) ->
+              load_metadata(service, metadata.id)
+            Error(error) -> Error(string.inspect(error))
+          }
+        }
+        _ -> Ok(current)
+      }
+    }
+    _ -> Ok(metadata)
+  }
 }
 
 fn group_config(
@@ -363,25 +401,12 @@ fn group_config(
 
 fn initial_states(metadata: SessionMetadata) -> List(agent.State) {
   metadata.agents
-  |> list.index_map(fn(spec, index) {
+  |> list.map(fn(spec) {
     let base = agent.state(spec.id, metadata.model_id)
-    let introduction = case index {
-      0 ->
-        "Work on this coding task. Coordinate with your teammates when useful:\n\n"
-        <> metadata.prompt
-      _ ->
-        "Shared coding task:\n\n"
-        <> metadata.prompt
-        <> "\n\nYou begin dormant. When activated, focus on your assigned role and report useful results to the team."
-    }
     agent.State(
       ..base,
       profile_id: profile_id(metadata.id, spec.id),
-      messages: [llm.Message(llm.User, [llm.Text(introduction)])],
-      status: case index {
-        0 -> agent.Ready
-        _ -> agent.Waiting
-      },
+      status: agent.Waiting,
     )
   })
 }

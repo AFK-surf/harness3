@@ -75,16 +75,15 @@ Create request example:
 
 ```json
 {
-  "prompt": "Inspect the project, fix the failing tests, and verify the result.",
   "model_id": "provider/model",
-  "workspace": ".",
+  "workspace": "/absolute/path/to/project",
   "team_size": 3
 }
 ```
 
-Only the lead starts immediately. Specialist agents remain durable and dormant
-until the lead or a user messages them. Sending a message wakes the target and
-starts a new agent round.
+Creating a session opens its chat without starting a model call. Every agent is
+durable and dormant until messaged. The first message names the session, wakes
+its target, and starts that agent's first round.
 
 ## Test
 

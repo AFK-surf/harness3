@@ -83,7 +83,7 @@
                   <label for="target-agent">Send to</label>
                   <select id="target-agent"></select>
                 </div>
-                <textarea id="message-input" rows="3" placeholder="Give this agent a follow-up, activate a dormant teammate, or redirect the work…" required></textarea>
+                <textarea id="message-input" rows="3" placeholder="Describe the task, ask a follow-up, or activate a teammate…" required></textarea>
                 <div class="composer-actions">
                   <span><kbd>⌘</kbd><kbd>Enter</kbd> to send</span>
                   <button class="send-button" type="submit">Send message <span>↗</span></button>
@@ -121,15 +121,11 @@
         <div class="dialog-heading">
           <div>
             <p class="eyebrow">New coding session</p>
-            <h2>What should the team build?</h2>
+            <h2>Configure your coding team</h2>
           </div>
           <button class="icon-button" value="cancel" aria-label="Close dialog" type="submit">×</button>
         </div>
 
-        <label class="field">
-          <span>Task</span>
-          <textarea id="task-prompt" rows="7" placeholder="Describe the outcome, important constraints, and how the team should verify its work…" required></textarea>
-        </label>
         <div class="field-grid">
           <label class="field">
             <span>Model</span>
@@ -152,7 +148,7 @@
         <div class="team-preview" id="team-preview"></div>
         <div class="dialog-actions">
           <button class="ghost" value="cancel" type="submit">Cancel</button>
-          <button class="primary" id="create-button" value="default" type="submit">Create &amp; run</button>
+          <button class="primary" id="create-button" value="default" type="submit">Create session</button>
         </div>
       </form>
     </dialog>
