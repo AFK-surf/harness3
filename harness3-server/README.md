@@ -213,8 +213,10 @@ group with the update riding its claim), while roster or model changes stop the
 group first through the host-routed RPC and apply the new roster atomically
 with the next wake's claim. Surviving agents retain their durable history and
 plugin state, added agents start dormant, and removed agents are deleted.
-Existing agent IDs are immutable in the UI; replace an agent to give it a
-different ID.
+Because updates ride a wake, editing or renaming a session whose agents were
+interrupted mid-work (still in Ready status) resumes their execution; agents
+that completed or were never messaged stay dormant. Existing agent IDs are
+immutable in the UI; replace an agent to give it a different ID.
 
 A team of at least two uses the MCP researcher automatically when any enabled
 global configuration contains a server. The agent editor exposes one MCP

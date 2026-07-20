@@ -1856,18 +1856,22 @@ fn finish(state: CoordinatorState) -> Result(CoordinatorState, Error) {
   Ok(released)
 }
 
-/// Durably finalizes a group whose owner is gone: removes its stale
-/// running-index entries so recovery stops resurrecting it, and releases an
-/// expired claim by CAS. A dormant group only has its stale entries cleaned.
+/// Durably finalizes a group whose owner is gone: releases an expired claim
+/// by CAS, then removes its stale running-index entries so recovery stops
+/// resurrecting it. A dormant group only has its stale entries cleaned.
 /// Fails with `AlreadyClaimed` while the lease is unexpired — the owner may
 /// merely be behind a membership gap, and only lease expiry proves it gone.
 ///
-/// Index entries are removed *before* the release, and only entries at or
-/// below the epoch read from the group object: recovery resurrects from
-/// index entries, so a released-but-indexed group costs a spurious wake,
-/// while a concurrent fresh claim (which always takes a higher epoch) keeps
-/// its entry and wins the CAS race — surfacing here as
-/// `ConcurrentGroupUpdate` instead of being clobbered.
+/// The release CAS comes *first*, and index entries (only at or below the
+/// epoch read from the group object; a concurrent fresh claim always takes a
+/// higher epoch) are removed only after it succeeds. The opposite order is
+/// unsafe even though it looks tidier: an "expired" lease can belong to a
+/// still-live owner whose clock disagrees with ours, and its next commit
+/// CAS-extends the lease and beats our release — if we had already deleted
+/// its index entry, that running claimed group would be invisible to
+/// recovery forever. Losing the CAS proves someone is alive, and their
+/// entries must survive; a crash after the release merely leaves stale
+/// entries, which cost one spurious wake.
 pub fn release_abandoned(
   backend: Storage,
   object_key: String,
@@ -1882,42 +1886,34 @@ pub fn release_abandoned(
     Claimed(owner, _, expires, _) ->
       case expires > system_time(Second) {
         True -> Error(AlreadyClaimed(owner, expires))
-        False -> Ok(Nil)
+        False -> {
+          let epoch = execution_epoch(group.execution)
+          let execution = case list.all(group.agents, agent_is_terminal) {
+            True -> Completed(epoch)
+            False -> Idle(epoch)
+          }
+          let released =
+            AgentGroup(..group, revision: group.revision + 1, execution:)
+          let body =
+            encode_group(released) |> json.to_string |> bit_array.from_string
+          case
+            storage.put(
+              backend,
+              object_key,
+              body,
+              storage.IfUnchanged(object.metadata.version),
+            )
+          {
+            Ok(_) -> Ok(Nil)
+            Error(storage.PreconditionFailed(_)) ->
+              confirm_group_write(backend, object_key, body)
+              |> result.map(fn(_) { Nil })
+            Error(error) -> Error(storage_error(error))
+          }
+        }
       }
   })
-  use _ <- result.try(delete_index_entries(
-    backend,
-    group.id,
-    execution_epoch(group.execution),
-  ))
-  case group.execution {
-    Idle(_) | Completed(_) -> Ok(Nil)
-    Claimed(..) -> {
-      let epoch = execution_epoch(group.execution)
-      let execution = case list.all(group.agents, agent_is_terminal) {
-        True -> Completed(epoch)
-        False -> Idle(epoch)
-      }
-      let released =
-        AgentGroup(..group, revision: group.revision + 1, execution:)
-      let body =
-        encode_group(released) |> json.to_string |> bit_array.from_string
-      case
-        storage.put(
-          backend,
-          object_key,
-          body,
-          storage.IfUnchanged(object.metadata.version),
-        )
-      {
-        Ok(_) -> Ok(Nil)
-        Error(storage.PreconditionFailed(_)) ->
-          confirm_group_write(backend, object_key, body)
-          |> result.map(fn(_) { Nil })
-        Error(error) -> Error(storage_error(error))
-      }
-    }
-  }
+  delete_index_entries(backend, group.id, execution_epoch(group.execution))
 }
 
 /// Deletes this group's running-index entries whose epoch is at or below

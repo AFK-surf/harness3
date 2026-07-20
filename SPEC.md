@@ -74,12 +74,14 @@ through storage objects (CAS writes, leases) plus token-authenticated HTTP RPC.
 - The local backend serializes every operation on an `O_EXCL` lock file inside the root;
   condition check, generation bump, tmp-file write, and rename are atomic under it.
   A directory created for a nested key is never an object (`is_regular`, not
-  `is_file`). Each holder stamps a random token into the lock file; heartbeat
-  cleanup, transaction cleanup, and every destructive commit (object rename,
-  delete) verify the token first, so a holder that stalls past the staleness
-  horizon and loses the lock to a breaker fails its commit instead of silently
-  overwriting the new holder's writes (the residual window is the instant between
-  the verify and the following rename, not the whole transaction).
+  `is_file`). Each holder stamps a random token into the lock file; the
+  heartbeat refreshes only a lock still carrying its token (never recreating a
+  missing one), and heartbeat cleanup, transaction cleanup, and every
+  destructive commit — generation-record writes, object renames, deletes —
+  verify the token first, so a holder that stalls past the staleness horizon
+  and loses the lock to a breaker fails its commit instead of silently
+  overwriting the new holder's writes (the residual window is the instant
+  between a verify and its following write, not the whole transaction).
   Interrupted writes stamp sentinel mtimes so crashes invalidate outstanding version
   tokens conservatively (false CAS failures, never false successes). Deleting a key
   leaves a small permanent generation tombstone — required for token uniqueness,

@@ -227,8 +227,10 @@ fn break_stale_lock(path: String) -> Nil {
         False -> {
           // The lock was refreshed between the staleness check and the
           // rename, so we displaced a live holder. Restore the original file
-          // (hard link back is atomic and refuses to clobber a newer lock);
-          // the live holder's heartbeat re-creates it if this loses the race.
+          // (hard link back is atomic, preserves the holder's token, and
+          // refuses to clobber a newer lock). If this loses the race to a
+          // fresh acquirer, the displaced holder's token no longer matches
+          // and its commit-site verification makes it abort cleanly.
           let _ = simplifile.create_link(to: victim, from: path)
           let _ = simplifile.delete(victim)
           Nil
@@ -265,7 +267,25 @@ fn heartbeat_loop(
       release_owned_lock(path, token)
     }
     Error(_) -> {
-      let _ = simplifile.touch(at: path)
+      // Touch only a lock that still carries this holder's token. A blind
+      // touch inside a breaker's rename-aside window recreates the path as
+      // an *empty* file: the breaker's hard-link restore then refuses to
+      // clobber it, orphaning the token — every commit of the legitimate
+      // holder fails verification and an ownerless lock blocks all waiters
+      // until it goes stale. A missing or foreign lock means this holder has
+      // (at least momentarily) lost it; verification at the commit sites
+      // decides the outcome, not the heartbeat.
+      case file_read(path) {
+        Ok(content) ->
+          case content == bit_array.from_string(token) {
+            True -> {
+              let _ = simplifile.touch(at: path)
+              Nil
+            }
+            False -> Nil
+          }
+        Error(_) -> Nil
+      }
       heartbeat_loop(path, token, selector)
     }
   }
@@ -535,6 +555,10 @@ fn put_(
     use _ <- result.try(check_condition(config, condition, key, path))
     let #(_, stored_generation) = read_generation(config, key)
     let generation = stored_generation + 1
+    // The generation record is itself a destructive commit: writing it after
+    // losing the lock would roll the per-key counter back below what a new
+    // holder has already minted, resurrecting a retired version token.
+    use _ <- result.try(verify_lock(config, token))
     // Persist an invalid mtime first. If the VM stops between replacement and
     // the final metadata write, a later reader will conservatively mint a new
     // generation instead of accepting a stale conditional token.
@@ -729,6 +753,9 @@ fn stream_put_(
               use _ <- result.try(check_condition(config, condition, key, path))
               let #(_, stored_generation) = read_generation(config, key)
               let generation = stored_generation + 1
+              // As in `put_`: the generation write is destructive and must
+              // not happen after the lock was lost.
+              use _ <- result.try(verify_lock(config, token))
               use _ <- result.try(write_generation(config, key, -2, generation))
               use _ <- result.try(ensure_dir(path) |> status_result)
               use _ <- result.try(verify_lock(config, token))

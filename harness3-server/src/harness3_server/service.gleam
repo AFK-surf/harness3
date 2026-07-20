@@ -302,9 +302,12 @@ fn update_session_roster(
   // A declarative roster command: the wake applies it to the state it reads
   // under its claim CAS, so surviving agents' histories and any concurrently
   // delivered messages are preserved by the owner, not by a caller snapshot.
+  // Upsert only what this edit actually changes (the title). Carrying the
+  // whole attribute view would write back snapshot values — a first message
+  // that set the prompt between our read and this wake must not be reverted.
   let update =
     agent_group.GroupUpdate(
-      attributes: group_attributes(next_metadata),
+      attributes: dict.from_list([#(title_attribute, next_metadata.title)]),
       agent_attributes: dict.new(),
       roster: Some(
         list.map(next_metadata.agents, fn(spec) {

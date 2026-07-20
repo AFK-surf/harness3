@@ -230,7 +230,7 @@ export function App() {
     refreshSession(session);
     setEditGroupOpen(false);
     await loadSessions();
-    showToast("Agent group updated. New agents are ready to be messaged.");
+    showToast("Agent group updated. Interrupted agents resume; new agents await their first message.");
   }
 
   async function sendMessage(agentId: string, message: string): Promise<boolean> {
