@@ -390,6 +390,7 @@ pub fn encrypted_reasoning_state_round_trip_test() {
       compaction_requested: 2,
       compaction_completed: 1,
       last_compaction_error: Some("retry"),
+      attributes: dict.from_list([#("role", "lead engineer")]),
       status: agent.Ready,
     )
   let encoded = agent.encode_state(original) |> json.to_string
@@ -1892,7 +1893,7 @@ fn test_model() -> model_catalog.Model {
   )
 }
 
-pub fn dormant_group_reconfiguration_preserves_surviving_agents_test() {
+pub fn wake_applied_update_replaces_roster_and_preserves_survivors_test() {
   let root = temporary_root("reconfigure-agent-group-test")
   let backend = local.new(local.config(root))
   let other_model =
@@ -1957,13 +1958,6 @@ pub fn dormant_group_reconfiguration_preserves_surviving_agents_test() {
       original_config,
       agent_group.new("reconfigure", "catalog", [lead, removed]),
     )
-  let changed_lead = agent.State(..lead, model_id: "other-model")
-  let added =
-    agent.State(
-      ..agent.state("added", "model"),
-      profile_id: "added-profile",
-      status: agent.Waiting,
-    )
   let next_config =
     agent_group.Config(
       backend,
@@ -1972,22 +1966,159 @@ pub fn dormant_group_reconfiguration_preserves_surviving_agents_test() {
       10,
       100,
     )
-  let assert Ok(updated) =
-    agent_group.reconfigure(next_config, [changed_lead, added])
-  assert updated.revision == 1
-  assert updated.execution == agent_group.Idle(0)
-  let assert [survivor, newcomer] = updated.agents
+  // A declarative command: the surviving lead's state is preserved by the
+  // applier, not shipped by the caller.
+  let update =
+    agent_group.GroupUpdate(
+      attributes: dict.from_list([#("title", "Edited team")]),
+      agent_attributes: dict.new(),
+      roster: Some([
+        agent_group.RosterEntry(
+          "lead",
+          "lead-profile",
+          "other-model",
+          dict.new(),
+          agent.Waiting,
+        ),
+        agent_group.RosterEntry(
+          "added",
+          "added-profile",
+          "model",
+          dict.new(),
+          agent.Waiting,
+        ),
+      ]),
+    )
+  let assert Ok(loaded) = agent_group.resume(next_config)
+  let assert Ok(running) =
+    agent_group.wake_detached_updated(loaded, "owner-a", update, fn() { Nil })
+  let assert Ok(snapshot) = agent_group.snapshot(running)
+  let assert [survivor, newcomer] = snapshot.agents
   assert survivor.id == "lead"
   assert survivor.model_id == "other-model"
   assert survivor.messages == [historic]
   assert newcomer.id == "added"
   assert newcomer.status == agent.Waiting
+  assert dict.get(snapshot.attributes, "title") == Ok("Edited team")
 
-  let assert Ok(loaded) = agent_group.resume(next_config)
-  let assert Ok(running) = agent_group.wake(loaded)
+  // A claimed group rejects a second wake-applied update: the roster of a
+  // live group can only change after the owner releases it.
+  let assert Ok(reloaded) = agent_group.resume(next_config)
   let assert Error(agent_group.AlreadyClaimed(_, _)) =
-    agent_group.reconfigure(next_config, [changed_lead, added])
+    agent_group.wake_detached_updated(reloaded, "owner-b", update, fn() { Nil })
+
+  // Attribute upserts on the live group go through its coordinator instead.
+  let assert Ok(Nil) =
+    agent_group.update_group(
+      running,
+      agent_group.GroupUpdate(
+        attributes: dict.from_list([#("prompt", "hello")]),
+        agent_attributes: dict.from_list([
+          #("added", dict.from_list([#("role", "newcomer")])),
+        ]),
+        roster: None,
+      ),
+    )
+  let assert Error(agent_group.InvalidGroup(_)) =
+    agent_group.update_group(
+      running,
+      agent_group.GroupUpdate(
+        attributes: dict.new(),
+        agent_attributes: dict.new(),
+        roster: Some([
+          agent_group.RosterEntry(
+            "lead",
+            "lead-profile",
+            "model",
+            dict.new(),
+            agent.Waiting,
+          ),
+        ]),
+      ),
+    )
   let assert Ok(Nil) = agent_group.stop(running)
+
+  // The roster replacement and both attribute updates are durable.
+  let assert Ok(peeked) = agent_group.peek(backend, "groups/reconfigure")
+  assert list.map(peeked.agents, fn(state) { state.id }) == ["lead", "added"]
+  assert dict.get(peeked.attributes, "title") == Ok("Edited team")
+  assert dict.get(peeked.attributes, "prompt") == Ok("hello")
+  let assert [_, peeked_added] = peeked.agents
+  assert dict.get(peeked_added.attributes, "role") == Ok("newcomer")
+  remove_directory(root)
+}
+
+pub fn failed_wake_never_leaves_a_stranded_claim_test() {
+  let root = temporary_root("wake-claim-leak-test")
+  let backend = local.new(local.config(root))
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let transport = completing_transport("unused")
+
+  // A dormant agent with a queued inbox is promoted to Ready by the claim, so
+  // its unknown model must fail the wake *before* the claim CAS commits.
+  let assert Ok(empty_registry) = plugin.registry([])
+  let profile =
+    agent_profile.AgentProfile(
+      "leak-profile",
+      empty_registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let dormant =
+    agent.State(
+      ..agent.state("agent", "missing-model"),
+      profile_id: "leak-profile",
+      status: agent.Completed,
+      pending_messages: [llm.Message(llm.User, [llm.Text("revive")])],
+    )
+  let config = agent_group.Config(backend, "groups/leak", [profile], 10, 100)
+  let assert Ok(_) =
+    agent_group.create(config, agent_group.new("leak", "catalog", [dormant]))
+  let assert Ok(loaded) = agent_group.resume(config)
+  let assert Error(agent_group.UnknownModel("agent", "missing-model")) =
+    agent_group.wake_as(loaded, "owner-a")
+  let assert Ok(untouched) = agent_group.peek(backend, "groups/leak")
+  assert untouched.revision == 0
+  assert untouched.execution == agent_group.Idle(0)
+
+  // A failure after the claim CAS (here: a raising activation hook) must
+  // release the claim, or the group is unwakeable until the lease expires and
+  // invisible to recovery.
+  let failing =
+    plugin.new("boom", "{}")
+    |> plugin.on_activate(
+      plugin.activation_hook(fn(_, _) {
+        Error(plugin.HookFailed("boom", "activate", "always fails"))
+      }),
+    )
+  let assert Ok(failing_registry) = plugin.registry([failing])
+  let failing_profile =
+    agent_profile.AgentProfile(
+      "boom-profile",
+      failing_registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let ready =
+    agent.State(..agent.state("agent", "model"), profile_id: "boom-profile")
+  let failing_config =
+    agent_group.Config(backend, "groups/leak-boom", [failing_profile], 10, 100)
+  let assert Ok(_) =
+    agent_group.create(
+      failing_config,
+      agent_group.new("leak-boom", "catalog", [ready]),
+    )
+  let assert Ok(loaded) = agent_group.resume(failing_config)
+  let assert Error(agent_group.AgentActivationFailed("agent", _)) =
+    agent_group.wake_as(loaded, "owner-a")
+  let assert Ok(released) = agent_group.peek(backend, "groups/leak-boom")
+  assert released.execution == agent_group.Idle(1)
   remove_directory(root)
 }
 

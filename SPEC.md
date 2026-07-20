@@ -53,26 +53,33 @@ through storage objects (CAS writes, leases) plus token-authenticated HTTP RPC.
   `get` metadata comes from the media response's own headers so the version token is
   atomically bound to the returned body.
 - `list(prefix)` is a raw string-prefix match over keys (no delimiter semantics) and
-  must return every matching key. S3 and GCS backends paginate fully
-  (`IsTruncated`/`start-after`, `nextPageToken`); the local backend excludes its
-  internal bookkeeping files and sorts by key. Recovery correctness requires complete
+  must return every matching key. Both S3 and GCS paginate fully via the XML list
+  API (`IsTruncated`/`start-after`); the local backend excludes its entire internal
+  `.harness3*` namespace (generations, temporaries, the lock file and any leaked
+  lock-break files) and sorts by key. Recovery correctness requires complete
   listings.
 - Deleting a missing key succeeds on all backends. Operations retry transport errors
   and retryable HTTP statuses (408/421/425/429/5xx except 501/505) with jittered
-  exponential backoff (100 ms → 10 s), bounded at 8 attempts (~13 s of backoff) so a
-  persistent outage surfaces as an error instead of blocking the caller forever.
+  exponential backoff starting at 100 ms and doubling per attempt, bounded at 8
+  attempts (7 sleeps, 100 ms → 6.4 s, ~13 s of total backoff) so a persistent outage
+  surfaces as an error instead of blocking the caller forever.
   Conditional puts pass through the same retry path, so an ambiguous success can
   resurface as `PreconditionFailed`; every CAS caller that must not mistake its own
   applied write for a conflict compensates by exact-body read-back (group writes,
   group create and claim, running index, distributed lock, model catalog).
-- Known limitation: the vendored `aws4_request` signer canonicalizes query strings
-  with form encoding (`+` for space), so an S3 `list` whose pagination cursor
-  (`start-after`) contains a space or `+` would fail signing. Unreachable with the
-  key alphabets this system generates; the in-repo `s3_sign` signer used for
-  streaming canonicalizes queries with strict SigV4 encoding (unreserved-only,
-  uppercase hex), though no streaming caller currently sets a query.
+- All S3 requests, including lists and their pagination cursors, are signed by the
+  in-repo `s3_sign` signer, which canonicalizes queries with strict SigV4 encoding
+  (unreserved-only, uppercase hex). The vendored `aws4_request` package only derives
+  the credential material.
 - The local backend serializes every operation on an `O_EXCL` lock file inside the root;
   condition check, generation bump, tmp-file write, and rename are atomic under it.
+  A directory created for a nested key is never an object (`is_regular`, not
+  `is_file`). Each holder stamps a random token into the lock file; heartbeat
+  cleanup, transaction cleanup, and every destructive commit (object rename,
+  delete) verify the token first, so a holder that stalls past the staleness
+  horizon and loses the lock to a breaker fails its commit instead of silently
+  overwriting the new holder's writes (the residual window is the instant between
+  the verify and the following rename, not the whole transaction).
   Interrupted writes stamp sentinel mtimes so crashes invalidate outstanding version
   tokens conservatively (false CAS failures, never false successes). Deleting a key
   leaves a small permanent generation tombstone — required for token uniqueness,
@@ -120,6 +127,9 @@ Guarantees required of adapters, relied on by the agent accumulator:
   their previous value (`apply_usage`).
 - Repeated `MessageStart`/`MessageStop` must be tolerated (some OpenAI-compatible
   providers repeat them).
+- Adapters may repeat `ContentStart`/`ToolCallStart` on an already-open index (the
+  Chat Completions adapter emits a reasoning `ContentStart` on every reasoning
+  chunk); the accumulator merges rather than resets.
 
 `StreamDecoder` buffers arbitrary SSE chunks, splits frames on blank lines (normalizes
 CRLF), joins multi-`data:` lines, treats `[DONE]` as `MessageStop`, and retains an
@@ -256,6 +266,8 @@ group state (verified by test `wake_loads_the_model_catalog_on_demand_test`).
 `agent.State` = id, profile_id, revision, model_id, round, `messages`,
 `pending_messages` (durable inbox), token stats, per-plugin JSON states,
 `plugin_generation` (monotonic counter for plugin-state freshness),
+`attributes` (extended attributes: opaque application-owned string key/values,
+persisted verbatim and never interpreted by the harness),
 `last_catalog_revision`, status ∈ {Ready, Waiting, Completed, Failed(reason)}.
 (`Waiting` is not produced by the core library itself; consumers use it for agents
 that should not run until first messaged — harness3-server creates all session agents
@@ -273,12 +285,14 @@ include the synthesized system prompt.
    events are keyed by provider index, stored in stream order, and forwarded to the
    profile's `observe` hook.
 3. On stream end, parts become assistant content; tool-call arguments must parse as JSON
-   (`InvalidModelOutput` otherwise). `Finished(reason)` events are **ignored** — the
-   round's outcome is derived solely from whether tool calls are present.
+   (`InvalidModelOutput` otherwise). The finish reason is validated: `Stop`, `ToolUse`,
+   `Paused`, or none pass; `Length`, `ContentFilter`, `Cancelled`, `Failed`, and
+   `Other` fail the round with `InvalidModelOutput`.
 4. Tool calls execute sequentially through the plugin-host actor; each produces one
    ToolRole message. During a tool, cross-agent callbacks are dispatched through the
    group coordinator.
-5. Disposition: tool messages present → `Continue` (status Ready); none → `Complete`
+5. Disposition: `Paused` finish → `Continue` regardless of tool calls; otherwise tool
+   messages present → `Continue` (status Ready); none → `Complete`
    (status Completed). Round counter increments; plugin states/generation are
    re-snapshotted from the plugin host.
 
@@ -366,9 +380,13 @@ clears the session id so the next call re-initializes.
 ### 7.1 Durable object and execution states
 
 `AgentGroup` = id, model_catalog_key, monotonically increasing `revision`, agent states,
-and `execution` ∈ `Idle | Claimed(owner, epoch, lease_expires_at) | Completed`. The
-whole group is one JSON object; every mutation is a CAS (`IfUnchanged`) that bumps
-`revision` and (while owned) extends the lease. The epoch increments on every claim,
+group-level `attributes` (extended attributes: opaque application-owned string
+key/values, like the per-agent ones), and `execution` ∈ `Idle | Claimed(owner,
+epoch, lease_expires_at) | Completed`. The whole group is one JSON object; every
+mutation is a CAS (`IfUnchanged`) that bumps `revision` and (while owned)
+extends the lease. `peek` reads and decodes the object without profiles,
+validation, or claiming — how an application renders a view of a group, or
+reconstructs the profiles a `resume` needs from the group's own attributes. The epoch increments on every claim,
 is carried through `Idle`/`Completed` as well as `Claimed`, and is the fencing token
 in the running-index key — releasing a claim must not reset it, or a later claim
 could reuse a key a stale index entry still occupies. A claim takes its epoch from
@@ -384,11 +402,24 @@ match a concurrent same-owner claim from the same wall-clock second.
   processes, no registry entry, no index entry.
 - `resume` / `resume_registered` — load + validate; `resume_registered` reconstructs the
   profile list from the node's installed profiles (only for agents in Ready status).
-- `reconfigure` — requires a dormant group, validates the replacement roster,
-  profiles, and per-agent model IDs, then CAS-replaces the roster while advancing
-  the revision and retaining the execution epoch. Callers supply preserved state
-  for surviving agents and fresh state for additions; claimed groups fail with
-  `AlreadyClaimed` so an active coordinator cannot overwrite the edit.
+- **Updates (`GroupUpdate`)** — a durable update *command* for the roster
+  and/or extended attributes. Commands carry no agent state: attribute maps
+  are upserts, and a `Some` roster is a list of `RosterEntry(id, profile_id,
+  model_id, attributes, initial_status)` declaring the desired agent list. The
+  group's single writer applies a command to the state it authoritatively
+  holds — `wake_detached_updated` atomically with the claim CAS (validated
+  against the same profiles and catalog as the wake, fenced by the loaded
+  version), `update_group` through a live coordinator, serialized with commits
+  and lease renewal — so a stale caller snapshot can never overwrite
+  concurrent progress. An existing agent named by a roster entry keeps its
+  durable state (history, plugin state, inbox, status); a new id is created
+  from scratch with `initial_status`; changing an agent's model scrubs
+  provider-locked encrypted reasoning from its conversation. A live
+  coordinator rejects roster commands (`InvalidGroup`): roster changes stop
+  the group first and ride the next wake. Claimed groups fail a wake-applied
+  update with `AlreadyClaimed`, so an active coordinator cannot be
+  overwritten. Surviving agents' pending messages are folded in by the claim;
+  removed agents' pending messages are dropped with them.
 - `wake` (`wake_as…`) — re-reads the model catalog, validates models for Ready agents,
   requires the lease to be absent/expired (`AlreadyClaimed` otherwise), CAS-claims the
   group (epoch+1; queued `pending_messages` are folded into `messages` and agents made
@@ -529,17 +560,29 @@ that scan cycle.
   round with an empty inbox), a fixed user hint message is prepended — the two shapes
   providers reject. The hint can produce consecutive user messages, which every
   supported provider accepts. Never wakes a dormant group.
+- `update_agent_group(group_id, group_attributes, agent_attributes, visited)` —
+  host-routed extended-attribute upserts, applied through the owning
+  coordinator (same routing as `message_agent_group`). It never wakes a
+  dormant group: a caller updates a dormant group by waking it with the update
+  riding the claim CAS instead.
 - `force_stop_agent_group(group_id)` — local registry force-stop.
 - `stop_agent_group(group_id, visited)` — idempotent host-routed stop. A local live
   group is stopped directly; otherwise the newest running index and membership
-  locate its host and redirect with loop detection. A dormant or missing group is
-  already stopped and succeeds without waking it.
+  locate its host and redirect with loop detection. A group with no reachable live
+  host (crashed owner, or an index entry pointing at this node whose registry has
+  no such group) is durably finalized: its stale index entries are removed and an
+  expired claim is released, so recovery cannot resurrect a group the caller was
+  told is stopped. While the crashed owner's lease is unexpired the stop fails
+  with `still_leased` rather than reporting success it cannot deliver; storage
+  read failures propagate instead of masquerading as a completed stop. A dormant
+  group with no index entries is already stopped and succeeds without waking it.
 
 ### 8.5 Node-local registries
 
 `agent_group_registry` and `agent_profile` are public named ETS tables created lazily by
 a detached holder process. The group registry stores id → (pid, stop closure, send
-closure, inject closure, compaction closure); reads sweep entries whose pids died.
+closure, inject closure, compaction closure, attribute-update closure); reads
+sweep entries whose pids died.
 Registration of an id overwrites; unregistration only removes the exact (id, pid) pair.
 
 ---
@@ -565,7 +608,11 @@ Registration of an id overwrites; unregistration only removes the exact (id, pid
   for everything (collision-free); Chat Completions has no native blocks — each choice
   gets a disjoint range with base `choice × 1 000 000`: text and refusal at the base,
   reasoning at base + 1 (with an explicit `ContentStart`), tool calls at
-  base + 2 + call_index. Text emits no `ContentStart`/`ContentStop` (relies on the
+  base + 2 + call_index. When a tool-call delta omits its `index` the position in
+  that delta's list substitutes — exact for buffered responses and for streamed
+  single tool calls, but a streaming provider that omits `index` *and* emits
+  parallel tool calls would collapse them onto one index (known limitation; OpenAI
+  itself always sends `index`). Text emits no `ContentStart`/`ContentStop` (relies on the
   accumulator's auto-start).
 - **Lifecycle.** `MessageStop` comes from `[DONE]` (Chat), `message_stop` (Anthropic),
   or the terminal `response.*` event (Responses). Buffered (non-streaming) decodes

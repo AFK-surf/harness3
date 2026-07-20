@@ -255,7 +255,7 @@ type ListenerInfo {
 
 type Control {
   Refresh(subject: Subject(Control), reply: Option(Subject(Nil)))
-  Shutdown
+  Shutdown(reply: Subject(Nil))
 }
 
 type RefreshState {
@@ -381,7 +381,7 @@ pub fn start(config: Config) -> Result(Cluster, StartError) {
       |> result.map_error(string.inspect)
     })
     |> result.map_error(fn(error) {
-      process.send(refresh_subject, Shutdown)
+      process.call_forever(refresh_subject, Shutdown)
       process.send(refresh_proxy_subject, StopRefreshProxy)
       process.send_exit(listener_pid)
       RecoveryLeaderFailed(string.inspect(error))
@@ -408,8 +408,12 @@ pub fn stop(cluster: Cluster) -> Nil {
     recovery: recovery_handle,
     ..,
   ) = cluster
+  // Both stops are synchronous: after `stop` returns, neither the recovery
+  // component nor the refresher performs another storage write. An async
+  // shutdown would let a final lock-release or membership write race whatever
+  // the caller does next (such as removing the storage root).
   recovery.stop(recovery_handle)
-  process.send(refresher, Shutdown)
+  process.call_forever(refresher, Shutdown)
   process.send(refresh_proxy, StopRefreshProxy)
   process.send_exit(listener)
 }
@@ -608,8 +612,9 @@ fn handle_control(
       }
       actor.continue(state)
     }
-    Shutdown -> {
+    Shutdown(reply) -> {
       let _ = storage.delete(backend, key)
+      process.send(reply, Nil)
       actor.stop()
     }
   }

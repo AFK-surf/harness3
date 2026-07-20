@@ -97,6 +97,7 @@ pub fn message_agent_injects_synthetic_tool_call_test() {
       Ok(Nil)
     },
     fn(_) { Ok(0) },
+    fn(_, _) { Ok(Nil) },
   )
   use <- exception.defer(fn() {
     agent_group_registry.unregister(group_id, fake_group)
@@ -164,6 +165,7 @@ pub fn message_agent_reports_inject_failure_test() {
     fn(_, _) { Error("unused") },
     fn(_, _, _, _) { Error("target agent is wedged") },
     fn(_) { Ok(0) },
+    fn(_, _) { Ok(Nil) },
   )
   use <- exception.defer(fn() {
     agent_group_registry.unregister(group_id, fake_group)

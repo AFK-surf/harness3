@@ -46,7 +46,42 @@ pub type AgentGroup {
     model_catalog_key: String,
     revision: Int,
     agents: List(agent.State),
+    /// Extended attributes: opaque application-owned key/value metadata,
+    /// persisted with the group and never interpreted by the harness.
+    attributes: Dict(String, String),
     execution: ExecutionState,
+  )
+}
+
+/// A durable update command for a group's roster and extended attributes.
+/// Commands carry no agent state: the group's single writer applies them to
+/// the state it authoritatively holds — atomically with a wake's claim CAS
+/// (`wake_detached_updated`), or serialized through a live coordinator
+/// (`update_group`, attributes only) — so a stale caller snapshot can never
+/// overwrite concurrent progress. Attribute maps are upserts merged into the
+/// existing attributes; a `Some` roster declares the desired agent list
+/// (pending messages of surviving agents are folded in by the claim, those of
+/// removed agents are dropped with them).
+pub type GroupUpdate {
+  GroupUpdate(
+    attributes: Dict(String, String),
+    agent_attributes: Dict(String, Dict(String, String)),
+    roster: Option(List(RosterEntry)),
+  )
+}
+
+/// One agent in a declared roster. An existing agent with this id keeps its
+/// durable state (history, plugin state, inbox, status); a new id is created
+/// from scratch with `initial_status`. Changing an existing agent's model
+/// scrubs provider-locked encrypted reasoning from its conversation, since
+/// replaying foreign provider state is rejected by every adapter.
+pub type RosterEntry {
+  RosterEntry(
+    id: String,
+    profile_id: String,
+    model_id: String,
+    attributes: Dict(String, String),
+    initial_status: agent.Status,
   )
 }
 
@@ -66,7 +101,7 @@ pub fn new(
   model_catalog_key: String,
   agents: List(agent.State),
 ) -> AgentGroup {
-  AgentGroup(id, model_catalog_key, 0, agents, Idle(0))
+  AgentGroup(id, model_catalog_key, 0, agents, dict.new(), Idle(0))
 }
 
 pub type Config {
@@ -177,6 +212,7 @@ type Message {
     coordinator: Subject(Message),
     reply: Subject(Result(Int, Error)),
   )
+  UpdateGroup(update: GroupUpdate, reply: Subject(Result(Nil, Error)))
   Renew(subject: Subject(Message))
   Stop(reply: Subject(Result(Nil, Error)))
 }
@@ -303,14 +339,30 @@ pub fn wake_detached(
   owner: String,
   refresh_membership: fn() -> Nil,
 ) -> Result(Group, Error) {
+  detached(fn() {
+    wake_as_with_membership_refresh(loaded, owner, refresh_membership)
+  })
+}
+
+/// Like `wake_detached`, but applies a durable update to the group atomically
+/// with the claim CAS before the coordinator starts. This is the only way to
+/// replace the roster of a group: a dormant group has no other writer, and a
+/// claimed group must be stopped first (the wake fails with `AlreadyClaimed`
+/// otherwise), so the update can never race a live coordinator's commits.
+pub fn wake_detached_updated(
+  loaded: LoadedGroup,
+  owner: String,
+  update: GroupUpdate,
+  refresh_membership: fn() -> Nil,
+) -> Result(Group, Error) {
+  detached(fn() {
+    wake_with_update(loaded, owner, Some(update), refresh_membership)
+  })
+}
+
+fn detached(run: fn() -> Result(Group, Error)) -> Result(Group, Error) {
   let reply = process.new_subject()
-  let waker =
-    process.spawn_unlinked(fn() {
-      process.send(
-        reply,
-        wake_as_with_membership_refresh(loaded, owner, refresh_membership),
-      )
-    })
+  let waker = process.spawn_unlinked(fn() { process.send(reply, run()) })
   let monitor = process.monitor(waker)
   let outcome =
     process.new_selector()
@@ -330,13 +382,33 @@ pub fn wake_as_with_membership_refresh(
   owner: String,
   refresh_membership: fn() -> Nil,
 ) -> Result(Group, Error) {
+  wake_with_update(loaded, owner, None, refresh_membership)
+}
+
+fn wake_with_update(
+  loaded: LoadedGroup,
+  owner: String,
+  update: Option(GroupUpdate),
+  refresh_membership: fn() -> Nil,
+) -> Result(Group, Error) {
   let LoadedGroup(config:, group:, version:) = loaded
+  // The update is validated against the same profiles and catalog as the wake
+  // itself, then committed by the claim CAS below: one atomic write covers
+  // both, and `IfUnchanged(version)` fences out anything that changed the
+  // group since it was loaded.
+  use group <- result.try(case update {
+    None -> Ok(group)
+    Some(update) -> {
+      use updated <- result.try(apply_update(group, update))
+      use _ <- result.try(validate(config, updated))
+      Ok(updated)
+    }
+  })
   use catalog_session <- result.try(
     model_catalog.resume(config.storage, group.model_catalog_key)
     |> result.map_error(ModelCatalogFailed),
   )
   let catalog = model_catalog.catalog(catalog_session)
-  use _ <- result.try(validate_models(group, catalog))
   use _ <- result.try(ensure_claimable(group.execution))
   // Never derive the new epoch from the group object alone. A group written
   // before the epoch was carried through `Idle`/`Completed` decodes with epoch
@@ -347,6 +419,13 @@ pub fn wake_as_with_membership_refresh(
   let floor =
     int.max(execution_epoch(group.execution), indexed_epoch(config, group))
   let claimed = claim(group, owner, floor, config.lease_duration_seconds)
+  // Validate the *claimed* group, not the loaded one: the claim promotes
+  // agents with queued inbox messages to Ready, so a dormant agent whose
+  // profile is missing or whose model left the catalog must fail the wake
+  // here — before the claim CAS commits — rather than in `prepare_agents`
+  // afterwards, which would strand a durable claim.
+  use _ <- result.try(validate(config, claimed))
+  use _ <- result.try(validate_models(claimed, catalog))
   let claimed_body =
     encode_group(claimed) |> json.to_string |> bit_array.from_string
   use metadata <- result.try(
@@ -392,68 +471,106 @@ pub fn load(config: Config) -> Result(AgentGroup, Error) {
   Ok(group)
 }
 
-/// Replaces the durable roster of a dormant group while preserving the state
-/// supplied for surviving agents. A claimed group must be stopped first so a
-/// live coordinator cannot overwrite the edit with an in-flight commit.
-pub fn reconfigure(
-  config: Config,
-  agents: List(agent.State),
-) -> Result(AgentGroup, Error) {
+/// Reads and decodes the durable group object without profiles, validation,
+/// claiming, or process starts. This is how an application renders a view of
+/// a group — or reconstructs the profiles a full `resume` needs from the
+/// group's own extended attributes — before it can build a `Config`.
+pub fn peek(backend: Storage, object_key: String) -> Result(AgentGroup, Error) {
   use object <- result.try(
-    storage.get(config.storage, config.object_key)
+    storage.get(backend, object_key)
     |> result.map_error(StorageFailed),
   )
-  use current <- result.try(decode_group_body(object.body))
-  use _ <- result.try(case current.execution {
-    Claimed(owner, _, expires_at, _) -> Error(AlreadyClaimed(owner, expires_at))
-    Idle(_) | Completed(_) -> Ok(Nil)
-  })
-  let next =
-    AgentGroup(
-      ..current,
-      revision: current.revision + 1,
-      agents:,
-      execution: Idle(execution_epoch(current.execution)),
-    )
-  use _ <- result.try(validate(config, next))
-  use _ <- result.try(
-    next.agents
-    |> list.try_each(fn(state) {
-      find_profile(config.profiles, state.profile_id)
-      |> result.map(fn(_) { Nil })
-    }),
-  )
-  use catalog_session <- result.try(
-    model_catalog.resume(config.storage, next.model_catalog_key)
-    |> result.map_error(ModelCatalogFailed),
-  )
-  let catalog = model_catalog.catalog(catalog_session)
-  use _ <- result.try(
-    next.agents
-    |> list.try_each(fn(state) {
-      model_catalog.lookup(catalog, state.model_id)
-      |> result.map(fn(_) { Nil })
-      |> result.map_error(fn(_) { UnknownModel(state.id, state.model_id) })
-    }),
-  )
-  let body = encode_group(next) |> json.to_string |> bit_array.from_string
-  use _ <- result.try(
-    case
-      storage.put(
-        config.storage,
-        config.object_key,
-        body,
-        storage.IfUnchanged(object.metadata.version),
+  decode_group_body(object.body)
+}
+
+fn apply_update(
+  group: AgentGroup,
+  update: GroupUpdate,
+) -> Result(AgentGroup, Error) {
+  let GroupUpdate(attributes:, agent_attributes:, roster:) = update
+  let agents = case roster {
+    None -> group.agents
+    Some(entries) ->
+      list.map(entries, fn(entry) { apply_roster_entry(group.agents, entry) })
+  }
+  use agents <- result.try(
+    agent_attributes
+    |> dict.to_list
+    |> list.try_fold(agents, fn(agents, entry) {
+      let #(id, upserts) = entry
+      use _ <- result.try(find_agent(agents, id))
+      Ok(
+        list.map(agents, fn(state) {
+          case state.id == id {
+            True ->
+              agent.State(
+                ..state,
+                attributes: dict.merge(state.attributes, upserts),
+              )
+            False -> state
+          }
+        }),
       )
-    {
-      Ok(metadata) -> Ok(metadata)
-      Error(storage.PreconditionFailed(_)) ->
-        confirm_group_write(config.storage, config.object_key, body)
-      Error(error) -> Error(storage_error(error))
-    },
+    }),
   )
-  agent_profile.install(config.profiles)
-  Ok(next)
+  Ok(
+    AgentGroup(
+      ..group,
+      agents:,
+      attributes: dict.merge(group.attributes, attributes),
+    ),
+  )
+}
+
+fn apply_roster_entry(
+  current: List(agent.State),
+  entry: RosterEntry,
+) -> agent.State {
+  let RosterEntry(id:, profile_id:, model_id:, attributes:, initial_status:) =
+    entry
+  case list.find(current, fn(state) { state.id == id }) {
+    Error(_) ->
+      agent.State(
+        ..agent.state(id, model_id),
+        profile_id:,
+        attributes:,
+        status: initial_status,
+      )
+    Ok(state) -> {
+      let state = agent.State(..state, profile_id:, attributes:)
+      case state.model_id == model_id {
+        True -> state
+        False ->
+          agent.State(
+            ..state,
+            model_id:,
+            messages: scrub_encrypted_reasoning(state.messages),
+            context_messages: option.map(
+              state.context_messages,
+              scrub_encrypted_reasoning,
+            ),
+            pending_messages: scrub_encrypted_reasoning(state.pending_messages),
+            last_catalog_revision: None,
+            last_context_tokens: None,
+          )
+      }
+    }
+  }
+}
+
+fn scrub_encrypted_reasoning(messages: List(llm.Message)) -> List(llm.Message) {
+  list.map(messages, fn(message) {
+    llm.Message(..message, content: list.map(message.content, scrub_content))
+  })
+}
+
+fn scrub_content(content: llm.Content) -> llm.Content {
+  case content {
+    llm.Reasoning(summary, _) -> llm.Reasoning(summary, None)
+    llm.ToolResult(id, content, is_error) ->
+      llm.ToolResult(id, list.map(content, scrub_content), is_error)
+    content -> content
+  }
 }
 
 fn decode_group_body(body: BitArray) -> Result(AgentGroup, Error) {
@@ -474,7 +591,17 @@ fn start_coordinator(
   catalog: model_catalog.Catalog,
   refresh_membership: fn() -> Nil,
 ) -> Result(Group, Error) {
-  use prepared <- result.try(prepare_agents(config, group, catalog))
+  // From here on the claim CAS has already committed. Every failure before
+  // the running index is published must undo it, or the group stays durably
+  // `Claimed` with no coordinator and no index entry — rejecting every wake
+  // with `AlreadyClaimed` and invisible to recovery until the lease expires.
+  use prepared <- result.try(
+    prepare_agents(config, group, catalog)
+    |> result.map_error(fn(error) {
+      release_unpublished_claim(config, group, metadata)
+      error
+    }),
+  )
   let state =
     CoordinatorState(
       config.storage,
@@ -497,6 +624,7 @@ fn start_coordinator(
     |> actor.start
     |> result.map_error(fn(error) {
       discard_prepared(prepared)
+      release_unpublished_claim(config, group, metadata)
       ProcessStartFailed(string.inspect(error))
     }),
   )
@@ -515,6 +643,10 @@ fn start_coordinator(
     },
     fn(agent_id) {
       request_compaction(handle, agent_id)
+      |> result.map_error(string.inspect)
+    },
+    fn(attributes, agent_attributes) {
+      update_group(handle, GroupUpdate(attributes, agent_attributes, None))
       |> result.map_error(string.inspect)
     },
   )
@@ -788,6 +920,16 @@ pub fn inject_tool_call(
   })
 }
 
+/// Durably merges extended-attribute upserts into an awake group through its
+/// coordinator, serialized with commits and lease renewal. Roster commands
+/// (`roster: Some(..)`) are rejected: a live group's workers hold profiles and
+/// in-flight rounds for the current roster, so a roster change must stop the
+/// group and ride a wake instead (`wake_detached_updated`).
+pub fn update_group(group: Group, update: GroupUpdate) -> Result(Nil, Error) {
+  let Group(subject) = group
+  process.call_forever(subject, fn(reply) { UpdateGroup(update, reply) })
+}
+
 /// Durably requests context compaction for one agent in an awake group.
 pub fn request_compaction(
   group: Group,
@@ -1030,6 +1172,24 @@ fn handle_message(
         Ok(#(next, generation)) -> {
           process.send(reply, Ok(generation))
           actor.continue(next)
+        }
+      }
+    }
+    UpdateGroup(update, reply) -> {
+      case do_update_group(state, update) {
+        Ok(next) -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(next)
+        }
+        Error(error) -> {
+          process.send(reply, Error(error))
+          case error {
+            ConcurrentGroupUpdate | LostGroupOwnership -> {
+              abandon(state)
+              actor.stop()
+            }
+            _ -> actor.continue(state)
+          }
         }
       }
     }
@@ -1554,6 +1714,29 @@ fn do_commit_agent(
   ))
 }
 
+fn do_update_group(
+  state: CoordinatorState,
+  update: GroupUpdate,
+) -> Result(CoordinatorState, Error) {
+  use _ <- result.try(case state.owned {
+    True -> Ok(Nil)
+    False -> Error(LostGroupOwnership)
+  })
+  use _ <- result.try(case update.roster {
+    Some(_) -> Error(InvalidGroup("cannot replace the roster of a live group"))
+    None -> Ok(Nil)
+  })
+  use updated <- result.try(apply_update(state.group, update))
+  let group =
+    AgentGroup(
+      ..updated,
+      revision: state.group.revision + 1,
+      execution: extend_claim(state),
+    )
+  use metadata <- result.try(write_group(state, group))
+  Ok(CoordinatorState(..state, group:, metadata:))
+}
+
 fn do_commit_callback_states(
   state: CoordinatorState,
   target_id: String,
@@ -1671,6 +1854,111 @@ fn finish(state: CoordinatorState) -> Result(CoordinatorState, Error) {
     |> result.map_error(StorageFailed),
   )
   Ok(released)
+}
+
+/// Durably finalizes a group whose owner is gone: removes its stale
+/// running-index entries so recovery stops resurrecting it, and releases an
+/// expired claim by CAS. A dormant group only has its stale entries cleaned.
+/// Fails with `AlreadyClaimed` while the lease is unexpired — the owner may
+/// merely be behind a membership gap, and only lease expiry proves it gone.
+///
+/// Index entries are removed *before* the release, and only entries at or
+/// below the epoch read from the group object: recovery resurrects from
+/// index entries, so a released-but-indexed group costs a spurious wake,
+/// while a concurrent fresh claim (which always takes a higher epoch) keeps
+/// its entry and wins the CAS race — surfacing here as
+/// `ConcurrentGroupUpdate` instead of being clobbered.
+pub fn release_abandoned(
+  backend: Storage,
+  object_key: String,
+) -> Result(Nil, Error) {
+  use object <- result.try(
+    storage.get(backend, object_key)
+    |> result.map_error(StorageFailed),
+  )
+  use group <- result.try(decode_group_body(object.body))
+  use _ <- result.try(case group.execution {
+    Idle(_) | Completed(_) -> Ok(Nil)
+    Claimed(owner, _, expires, _) ->
+      case expires > system_time(Second) {
+        True -> Error(AlreadyClaimed(owner, expires))
+        False -> Ok(Nil)
+      }
+  })
+  use _ <- result.try(delete_index_entries(
+    backend,
+    group.id,
+    execution_epoch(group.execution),
+  ))
+  case group.execution {
+    Idle(_) | Completed(_) -> Ok(Nil)
+    Claimed(..) -> {
+      let epoch = execution_epoch(group.execution)
+      let execution = case list.all(group.agents, agent_is_terminal) {
+        True -> Completed(epoch)
+        False -> Idle(epoch)
+      }
+      let released =
+        AgentGroup(..group, revision: group.revision + 1, execution:)
+      let body =
+        encode_group(released) |> json.to_string |> bit_array.from_string
+      case
+        storage.put(
+          backend,
+          object_key,
+          body,
+          storage.IfUnchanged(object.metadata.version),
+        )
+      {
+        Ok(_) -> Ok(Nil)
+        Error(storage.PreconditionFailed(_)) ->
+          confirm_group_write(backend, object_key, body)
+          |> result.map(fn(_) { Nil })
+        Error(error) -> Error(storage_error(error))
+      }
+    }
+  }
+}
+
+/// Deletes this group's running-index entries whose epoch is at or below
+/// `up_to_epoch`. Entry epochs are part of the key, so no bodies are read;
+/// keys that do not parse are left alone.
+fn delete_index_entries(
+  backend: Storage,
+  group_id: String,
+  up_to_epoch: Int,
+) -> Result(Nil, Error) {
+  let prefix = running_index_prefix() <> uri.percent_encode(group_id) <> "/"
+  use entries <- result.try(
+    storage.list(backend, prefix)
+    |> result.map_error(StorageFailed),
+  )
+  entries
+  |> list.filter(fn(entry) {
+    case
+      entry.key
+      |> string.drop_start(string.length(prefix))
+      |> string.split_once("_")
+    {
+      Ok(#(epoch, _)) ->
+        case int.parse(epoch) {
+          Ok(epoch) -> epoch <= up_to_epoch
+          Error(_) -> False
+        }
+      Error(_) -> False
+    }
+  })
+  |> list.try_each(fn(entry) {
+    storage.delete(backend, entry.key)
+    |> result.try_recover(fn(error) {
+      case error {
+        storage.NotFound(_) -> Ok(Nil)
+        error -> Error(error)
+      }
+    })
+    |> result.map(fn(_) { Nil })
+    |> result.map_error(StorageFailed)
+  })
 }
 
 /// Prefix containing durable records of running or crashed group claims.
@@ -1987,6 +2275,7 @@ fn encode_group(group: AgentGroup) -> json.Json {
     #("model_catalog_key", json.string(group.model_catalog_key)),
     #("revision", json.int(group.revision)),
     #("agents", json.array(group.agents, agent.encode_state)),
+    #("attributes", json.dict(group.attributes, fn(key) { key }, json.string)),
     #("execution", encode_execution(group.execution)),
   ])
 }
@@ -2020,6 +2309,11 @@ fn group_decoder() -> decode.Decoder(AgentGroup) {
   use model_catalog_key <- decode.field("model_catalog_key", decode.string)
   use revision <- decode.field("revision", decode.int)
   use agents <- decode.field("agents", decode.list(of: agent.state_decoder()))
+  use attributes <- decode.optional_field(
+    "attributes",
+    dict.new(),
+    decode.dict(decode.string, decode.string),
+  )
   use execution <- decode.field("execution", execution_decoder())
   case schema {
     1 ->
@@ -2028,11 +2322,12 @@ fn group_decoder() -> decode.Decoder(AgentGroup) {
         model_catalog_key,
         revision,
         agents,
+        attributes,
         execution,
       ))
     _ ->
       decode.failure(
-        AgentGroup("", "", 0, [], Idle(0)),
+        AgentGroup("", "", 0, [], dict.new(), Idle(0)),
         "unsupported agent-group schema",
       )
   }

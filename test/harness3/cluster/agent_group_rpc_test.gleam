@@ -1,6 +1,7 @@
 import exception
 import gleam/bit_array
 import gleam/crypto
+import gleam/dict
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/erlang/process
@@ -128,6 +129,21 @@ pub fn wake_rpc_is_idempotent_and_precedes_routed_compaction_test() {
       decode.int,
     )
 
+  // Attribute upserts route to the owning coordinator the same way.
+  let assert Ok("ok") =
+    core.call(
+      entry_ip,
+      entry_port,
+      core.token(entry),
+      agent_group_rpc.update_method_name(),
+      agent_group_rpc.update_request(
+        "rpc-group",
+        dict.from_list([#("title", "Routed title")]),
+        dict.from_list([#("agent", dict.from_list([#("role", "solo")]))]),
+      ),
+      decode.string,
+    )
+
   let assert Ok("ok") =
     core.call(
       entry_ip,
@@ -138,6 +154,22 @@ pub fn wake_rpc_is_idempotent_and_precedes_routed_compaction_test() {
       decode.string,
     )
   assert !list.contains(agent_group_registry.alive_ids(), "rpc-group")
+
+  // Updates never wake a dormant group; the caller wakes it with the update
+  // riding the claim instead.
+  let assert Error(_) =
+    core.call(
+      entry_ip,
+      entry_port,
+      core.token(entry),
+      agent_group_rpc.update_method_name(),
+      agent_group_rpc.update_request(
+        "rpc-group",
+        dict.from_list([#("title", "dormant")]),
+        dict.new(),
+      ),
+      decode.string,
+    )
   let assert Ok(index) =
     storage.list(backend, agent_group.running_index_prefix())
   assert list.is_empty(index)
@@ -191,6 +223,106 @@ pub fn wake_rpc_is_idempotent_and_precedes_routed_compaction_test() {
   assert preserved.status == agent.Ready
   assert preserved.compaction_requested == 1
   assert preserved.compaction_completed == 0
+  // The routed attribute update survived the stop; the dormant update never
+  // landed.
+  assert dict.get(snapshot.attributes, "title") == Ok("Routed title")
+  assert dict.get(preserved.attributes, "role") == Ok("solo")
+}
+
+pub fn stop_rpc_finalizes_a_crashed_owner_group_test() {
+  let root = temporary_root()
+  let backend = local.new(local.config(root))
+  use <- exception.defer(fn() {
+    let _ = remove_directory(root)
+    Nil
+  })
+  let model =
+    model_catalog.Model(
+      "model",
+      "test-model",
+      "https://example.test",
+      model_catalog.OpenAIResponses,
+      model_catalog.api_key("secret"),
+      100_000,
+    )
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let transport =
+    agent.model_transport(fn(_, _, _) {
+      let blocked = process.new_subject()
+      let assert Ok(Nil) = process.receive(blocked, within: 60_000)
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "crashed-profile",
+      registry,
+      transport,
+      None,
+      None,
+      fn(_) { Ok(Nil) },
+    )
+  let state =
+    agent.State(
+      ..agent.state("agent", "model"),
+      profile_id: "crashed-profile",
+      messages: [llm.Message(llm.User, [llm.Text("keep working")])],
+    )
+  let config =
+    agent_group.Config(backend, "groups/crashed", [profile], 1, 60_000)
+  let assert Ok(_) =
+    agent_group.create(
+      config,
+      agent_group.new("crashed-group", "catalog", [state]),
+    )
+  let assert Ok(loaded) = agent_group.resume(config)
+  let assert Ok(running) =
+    agent_group.wake_detached(loaded, "dead-owner", fn() { Nil })
+
+  let assert Ok(node) =
+    core.config(backend, "127.0.0.1", 0)
+    |> core.with_rpc_plugin(agent_group_rpc.plugin(backend, 10))
+    |> core.start
+  use <- exception.defer(fn() { core.stop(node) })
+  let #(ip, port) = core.node(node)
+
+  // Kill the owner without any cleanup: the durable claim and its running
+  // index entry survive, exactly like a crashed node.
+  process.kill(agent_group.pid(running))
+  let assert Ok(index) =
+    storage.list(backend, agent_group.running_index_prefix())
+  assert list.length(index) == 1
+
+  // While the lease is unexpired the owner cannot be proven dead, so the
+  // stop refuses instead of reporting success it cannot deliver.
+  let assert Error(core.RemoteResponse(_, _)) =
+    core.call(
+      ip,
+      port,
+      core.token(node),
+      agent_group_rpc.stop_method_name(),
+      agent_group_rpc.stop_request("crashed-group"),
+      decode.string,
+    )
+
+  process.sleep(1600)
+  let assert Ok("ok") =
+    core.call(
+      ip,
+      port,
+      core.token(node),
+      agent_group_rpc.stop_method_name(),
+      agent_group_rpc.stop_request("crashed-group"),
+      decode.string,
+    )
+  // The stop is durable: the claim is released and the index entries are
+  // gone, so recovery has nothing to resurrect.
+  let assert Ok(remaining) =
+    storage.list(backend, agent_group.running_index_prefix())
+  assert list.is_empty(remaining)
+  let assert Ok(released) = agent_group.peek(backend, "groups/crashed")
+  assert released.execution == agent_group.Idle(1)
 }
 
 fn synthetic_call_pending(

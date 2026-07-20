@@ -94,6 +94,7 @@ pub fn membership_refresh_publishes_only_live_registered_agent_groups_test() {
     fn(_, _) { Ok(Nil) },
     fn(_, _, _, _) { Ok(Nil) },
     fn(_) { Ok(1) },
+    fn(_, _) { Ok(Nil) },
   )
   agent_group_registry.register(
     dead_id,
@@ -102,6 +103,7 @@ pub fn membership_refresh_publishes_only_live_registered_agent_groups_test() {
     fn(_, _) { Ok(Nil) },
     fn(_, _, _, _) { Ok(Nil) },
     fn(_) { Ok(1) },
+    fn(_, _) { Ok(Nil) },
   )
   use <- exception.defer(fn() {
     agent_group_registry.unregister(live_id, live)

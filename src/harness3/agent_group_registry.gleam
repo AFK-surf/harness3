@@ -1,4 +1,5 @@
 import exception
+import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process.{type Pid}
 import gleam/list
@@ -26,12 +27,18 @@ pub type InjectToolCallHandle =
 pub type CompactionHandle =
   fn(String) -> Result(Int, String)
 
+/// Merges extended-attribute upserts into the group and into named agents.
+pub type UpdateAttributesHandle =
+  fn(Dict(String, String), Dict(String, Dict(String, String))) ->
+    Result(Nil, String)
+
 pub type Error {
   NotFound(id: String)
   StopFailed(reason: String)
   MessageFailed(reason: String)
   InjectFailed(reason: String)
   CompactionFailed(reason: String)
+  UpdateFailed(reason: String)
 }
 
 type Entry =
@@ -42,6 +49,7 @@ type Entry =
     MessageHandle,
     InjectToolCallHandle,
     CompactionHandle,
+    UpdateAttributesHandle,
   )
 
 /// Registers a running agent group in the node-wide registry.
@@ -52,6 +60,7 @@ pub fn register(
   send_message: MessageHandle,
   inject_tool_call: InjectToolCallHandle,
   request_compaction: CompactionHandle,
+  update_attributes: UpdateAttributesHandle,
 ) -> Nil {
   ensure_table()
   case
@@ -63,6 +72,7 @@ pub fn register(
         send_message,
         inject_tool_call,
         request_compaction,
+        update_attributes,
       ))
     })
   {
@@ -75,6 +85,7 @@ pub fn register(
         send_message,
         inject_tool_call,
         request_compaction,
+        update_attributes,
       )
   }
 }
@@ -83,7 +94,9 @@ pub fn register(
 pub fn unregister(id: String, pid: Pid) -> Nil {
   ensure_table()
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
-    Ok([#(_, registered_pid, _, _, _, _) as entry]) if registered_pid == pid -> {
+    Ok([#(_, registered_pid, _, _, _, _, _) as entry])
+      if registered_pid == pid
+    -> {
       let _ =
         exception.rescue(fn() { ets_delete_object(Harness3AgentGroups, entry) })
       Nil
@@ -98,7 +111,7 @@ pub fn force_stop(id: String) -> Result(Nil, Error) {
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
     Error(_) -> force_stop(id)
     Ok([]) -> Error(NotFound(id))
-    Ok([#(_, pid, stop, _, _, _) as entry]) ->
+    Ok([#(_, pid, stop, _, _, _, _) as entry]) ->
       case process.is_alive(pid) {
         False -> {
           let _ = ets_delete_object(Harness3AgentGroups, entry)
@@ -124,7 +137,7 @@ pub fn send_message(
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
     Error(_) -> send_message(id, agent_id, message)
     Ok([]) -> Error(NotFound(id))
-    Ok([#(_, pid, _, send, _, _) as entry]) ->
+    Ok([#(_, pid, _, send, _, _, _) as entry]) ->
       case process.is_alive(pid) {
         False -> {
           let _ = ets_delete_object(Harness3AgentGroups, entry)
@@ -153,7 +166,7 @@ pub fn inject_tool_call(
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
     Error(_) -> inject_tool_call(id, agent_id, tool_name, arguments, response)
     Ok([]) -> Error(NotFound(id))
-    Ok([#(_, pid, _, _, inject, _) as entry]) ->
+    Ok([#(_, pid, _, _, inject, _, _) as entry]) ->
       case process.is_alive(pid) {
         False -> {
           let _ = ets_delete_object(Harness3AgentGroups, entry)
@@ -179,7 +192,7 @@ pub fn request_compaction(id: String, agent_id: String) -> Result(Int, Error) {
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
     Error(_) -> request_compaction(id, agent_id)
     Ok([]) -> Error(NotFound(id))
-    Ok([#(_, pid, _, _, _, compact) as entry]) ->
+    Ok([#(_, pid, _, _, _, compact, _) as entry]) ->
       case process.is_alive(pid) {
         False -> {
           let _ = ets_delete_object(Harness3AgentGroups, entry)
@@ -190,6 +203,35 @@ pub fn request_compaction(id: String, agent_id: String) -> Result(Int, Error) {
             Error(error) -> Error(CompactionFailed(string.inspect(error)))
             Ok(Error(reason)) -> Error(CompactionFailed(reason))
             Ok(Ok(generation)) -> Ok(generation)
+          }
+      }
+    Ok(_) -> Error(NotFound(id))
+  }
+}
+
+/// Merges extended-attribute upserts into a running group and its agents.
+pub fn update_attributes(
+  id: String,
+  group_attributes: Dict(String, String),
+  agent_attributes: Dict(String, Dict(String, String)),
+) -> Result(Nil, Error) {
+  ensure_table()
+  case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
+    Error(_) -> update_attributes(id, group_attributes, agent_attributes)
+    Ok([]) -> Error(NotFound(id))
+    Ok([#(_, pid, _, _, _, _, update) as entry]) ->
+      case process.is_alive(pid) {
+        False -> {
+          let _ = ets_delete_object(Harness3AgentGroups, entry)
+          Error(NotFound(id))
+        }
+        True ->
+          case
+            exception.rescue(fn() { update(group_attributes, agent_attributes) })
+          {
+            Error(error) -> Error(UpdateFailed(string.inspect(error)))
+            Ok(Error(reason)) -> Error(UpdateFailed(reason))
+            Ok(Ok(Nil)) -> Ok(Nil)
           }
       }
     Ok(_) -> Error(NotFound(id))

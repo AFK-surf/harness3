@@ -57,6 +57,24 @@ pub fn local_backend_breaks_stale_lock_test() {
   remove_directory(root)
 }
 
+pub fn local_backend_directories_are_not_objects_test() {
+  let root = "/tmp/harness3-local-dir-test-" <> int.to_string(unique_integer())
+  let backend = local.new(local.config(root))
+  let assert Ok(_) =
+    storage.put(backend, "docs/x", <<"nested":utf8>>, storage.IfAbsent)
+  // The directory created for `docs/x` is not an object named `docs`.
+  let assert Error(storage.NotFound("docs")) = storage.head(backend, "docs")
+  let assert Error(storage.NotFound("docs")) = storage.get(backend, "docs")
+  // A crashed lock-breaker's leftover `.break.` file is internal bookkeeping
+  // and must never surface as a listed key.
+  let leftover = root <> "/.harness3.lock.break.leftover"
+  let _ =
+    write_file(charlist.from_string(leftover), charlist.from_string("stale"))
+  let assert Ok(listed) = storage.list(backend, "")
+  assert list.map(listed, fn(item) { item.key }) == ["docs/x"]
+  remove_directory(root)
+}
+
 pub fn s3_backend_test() {
   case
     env("TEST_S3_ENDPOINT"),

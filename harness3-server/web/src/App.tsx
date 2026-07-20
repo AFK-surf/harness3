@@ -44,6 +44,29 @@ export function App() {
   const [toast, setToast] = useState<ToastState | null>(null);
   const toastSequence = useRef(0);
   const refreshTick = useRef(0);
+  const selectionEpoch = useRef(0);
+  const currentRef = useRef<Session | null>(null);
+
+  // Single writer for the displayed session: keeps the ref used by the
+  // staleness guards in sync and reconciles the agent selection.
+  const showSession = useCallback((session: Session) => {
+    currentRef.current = session;
+    setCurrent(session);
+    setSelectedAgentId((selected) => session.agents.some(
+      (agent) => agent.id === selected,
+    ) ? selected : session.agents[0]?.id ?? null);
+  }, []);
+
+  // Applies a fetched session only while it is still the one on screen and
+  // not older than what is already shown: a slow response or an in-flight
+  // poll must not revert a newer write (group revisions increase with every
+  // durable change) or reset the agent selection from a stale roster.
+  const refreshSession = useCallback((session: Session) => {
+    const existing = currentRef.current;
+    if (!existing || existing.id !== session.id) return;
+    if (session.revision < existing.revision) return;
+    showSession(session);
+  }, [showSession]);
 
   const showToast = useCallback((message: string, isError = false) => {
     toastSequence.current += 1;
@@ -105,10 +128,7 @@ export function App() {
         const loadedSessions = sessionResult.value.sessions;
         setSessions(loadedSessions);
         const first = loadedSessions[0];
-        if (first) {
-          setCurrent(first);
-          setSelectedAgentId(first.agents[0]?.id ?? null);
-        }
+        if (first) showSession(first);
       } else {
         showToast(errorMessage(sessionResult.reason), true);
       }
@@ -129,10 +149,7 @@ export function App() {
       void api<Session>(`/api/sessions/${encodeURIComponent(currentSessionId)}`)
         .then(async (session) => {
           if (!active) return;
-          setCurrent((existing) => existing?.id === currentSessionId ? session : existing);
-          setSelectedAgentId((selected) => session.agents.some(
-            (agent) => agent.id === selected,
-          ) ? selected : session.agents[0]?.id ?? null);
+          refreshSession(session);
           setConnection("online");
           refreshTick.current += 1;
           if (refreshTick.current % 4 === 0) await loadSessions();
@@ -173,14 +190,17 @@ export function App() {
   }, [openNewSession]);
 
   async function selectSession(id: string) {
+    // A slower response for an earlier click must not snap the view back:
+    // only the most recent selection may apply its result.
+    selectionEpoch.current += 1;
+    const epoch = selectionEpoch.current;
     try {
       const session = await api<Session>(`/api/sessions/${encodeURIComponent(id)}`);
-      setCurrent(session);
-      setSelectedAgentId((selected) => session.agents.some(
-        (agent) => agent.id === selected,
-      ) ? selected : session.agents[0]?.id ?? null);
+      if (selectionEpoch.current !== epoch) return;
+      showSession(session);
       setScrollRequest((request) => request + 1);
     } catch (error) {
+      if (selectionEpoch.current !== epoch) return;
       showToast(errorMessage(error), true);
     }
   }
@@ -191,8 +211,8 @@ export function App() {
       body: JSON.stringify(input),
     });
     setNewSessionOpen(false);
-    setCurrent(session);
-    setSelectedAgentId(session.agents[0]?.id ?? null);
+    selectionEpoch.current += 1;
+    showSession(session);
     setScrollRequest((request) => request + 1);
     await loadSessions();
     showToast("Session ready. Send the first message to start an agent.");
@@ -207,10 +227,7 @@ export function App() {
         body: JSON.stringify(input),
       },
     );
-    setCurrent(session);
-    setSelectedAgentId((selected) => session.agents.some(
-      (agent) => agent.id === selected,
-    ) ? selected : session.agents[0]?.id ?? null);
+    refreshSession(session);
     setEditGroupOpen(false);
     await loadSessions();
     showToast("Agent group updated. New agents are ready to be messaged.");
@@ -231,7 +248,7 @@ export function App() {
       const refreshed = await api<Session>(
         `/api/sessions/${encodeURIComponent(current.id)}`,
       );
-      setCurrent(refreshed);
+      refreshSession(refreshed);
       setScrollRequest((request) => request + 1);
       await loadSessions();
       return true;
@@ -256,7 +273,7 @@ export function App() {
       const refreshed = await api<Session>(
         `/api/sessions/${encodeURIComponent(current.id)}`,
       );
-      setCurrent(refreshed);
+      refreshSession(refreshed);
     } catch (error) {
       showToast(errorMessage(error), true);
     }
@@ -276,7 +293,7 @@ export function App() {
       const refreshed = await api<Session>(
         `/api/sessions/${encodeURIComponent(current.id)}`,
       );
-      setCurrent(refreshed);
+      refreshSession(refreshed);
     } catch (error) {
       showToast(errorMessage(error), true);
     } finally {

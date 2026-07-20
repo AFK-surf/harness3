@@ -40,7 +40,7 @@ type State {
 type Message {
   Elect(subject: Subject(Message))
   Candidates(reply: Subject(List(agent_group.RunningIndexEntry)))
-  Shutdown
+  Shutdown(reply: Subject(Nil))
 }
 
 type Membership {
@@ -77,9 +77,13 @@ pub fn candidates(handle: Handle) -> List(agent_group.RunningIndexEntry) {
   process.call_forever(subject, Candidates)
 }
 
+/// Stops the recovery component and returns only after any in-flight scan has
+/// finished and the leader lock (when held) has been released. A
+/// fire-and-forget stop would let scan writes and the final lock-release race
+/// whatever the caller does next — such as deleting the storage root.
 pub fn stop(handle: Handle) -> Nil {
   let Handle(subject) = handle
-  process.send(subject, Shutdown)
+  process.call_forever(subject, Shutdown)
 }
 
 fn handle_message(
@@ -96,7 +100,7 @@ fn handle_message(
       process.send(reply, state.candidates)
       actor.continue(state)
     }
-    Shutdown -> {
+    Shutdown(reply) -> {
       case state.lock {
         Some(lock) -> {
           let _ = distributed_lock.release(lock)
@@ -104,6 +108,7 @@ fn handle_message(
         }
         None -> Nil
       }
+      process.send(reply, Nil)
       actor.stop()
     }
   }

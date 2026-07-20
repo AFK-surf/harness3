@@ -1,10 +1,10 @@
 import filepath
 import gleam/bit_array
 import gleam/crypto
+import gleam/dict
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
-import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/order
@@ -16,14 +16,13 @@ import harness3/agent_group_registry
 import harness3/agent_profile
 import harness3/cluster/agent_group_rpc
 import harness3/cluster/core
-import harness3/llm
 import harness3/model_catalog
 import harness3/plugin
 import harness3/plugin/cloud_storage
 import harness3/plugin/mcp
 import harness3/plugin/mcp/catalog as mcp_catalog
 import harness3/plugin/mcp/configuration as mcp_configuration
-import harness3/storage.{type Storage, type VersionToken}
+import harness3/storage.{type Storage}
 import harness3_server/coding_plugin
 import harness3_server/config.{type ModelConfig}
 import harness3_server/storage_config
@@ -36,7 +35,21 @@ const mcp_catalog_key = "harness3-server/mcp-catalog"
 
 const all_mcp_configuration_id = "__harness3_server_all_mcp_servers__"
 
-const sessions_prefix = "harness3-server/sessions/"
+const groups_prefix = "harness3-server/groups/"
+
+// Extended-attribute keys through which a session is rendered as a view of
+// its agent group. The group object is the only durable record of a session.
+const title_attribute = "title"
+
+const prompt_attribute = "prompt"
+
+const workspace_attribute = "workspace"
+
+const created_at_attribute = "created_at"
+
+const role_attribute = "role"
+
+const kind_attribute = "kind"
 
 const lease_seconds = 30
 
@@ -59,6 +72,8 @@ pub type AgentSpec {
   AgentSpec(id: String, role: String, kind: AgentKind, model_id: String)
 }
 
+/// A session rendered from an agent group's extended attributes. This is a
+/// derived view, never persisted on its own.
 pub type SessionMetadata {
   SessionMetadata(
     id: String,
@@ -178,43 +193,39 @@ pub fn create_session(
       agents:,
     )
   use group_config <- result.try(group_config(service, metadata))
-  let meta_key = metadata_key(id)
-  use _ <- result.try(
-    storage.put(
-      service.storage,
-      meta_key,
-      encode_metadata(metadata) |> json.to_string |> bit_array.from_string,
-      storage.IfAbsent,
-    )
-    |> result.map_error(fn(error) {
-      "could not persist session metadata: " <> string.inspect(error)
-    }),
-  )
   let states = initial_states(metadata)
-  let created =
-    agent_group.create(group_config, agent_group.new(id, catalog_key, states))
-  case created {
-    Error(error) -> {
-      let _ = storage.delete(service.storage, meta_key)
+  let group =
+    agent_group.AgentGroup(
+      ..agent_group.new(id, catalog_key, states),
+      attributes: group_attributes(metadata),
+    )
+  case agent_group.create(group_config, group) {
+    Error(error) ->
       Error("could not create agent group: " <> string.inspect(error))
-    }
     Ok(loaded) -> Ok(Session(metadata, agent_group.loaded_state(loaded)))
   }
 }
 
+/// Lists sessions as views of the durable agent groups. A group that fails to
+/// decode or lacks the session attributes is skipped rather than poisoning
+/// the whole listing.
 pub fn list_sessions(service: Service) -> Result(List(Session), String) {
   use objects <- result.try(
-    storage.list(service.storage, sessions_prefix)
+    storage.list(service.storage, groups_prefix)
     |> result.map_error(fn(error) { string.inspect(error) }),
   )
-  use sessions <- result.try(
+  let sessions =
     objects
-    |> list.filter(fn(object) { string.ends_with(object.key, "/metadata") })
-    |> list.try_map(fn(object) {
-      use metadata <- result.try(load_metadata_key(service, object.key))
-      load_session(service, metadata)
-    }),
-  )
+    |> list.filter_map(fn(object) {
+      use group <- result.try(
+        agent_group.peek(service.storage, object.key)
+        |> result.map_error(fn(_) { Nil }),
+      )
+      case session_view(group) {
+        Ok(metadata) -> Ok(Session(metadata, group))
+        Error(_) -> Error(Nil)
+      }
+    })
   Ok(
     list.sort(sessions, fn(left, right) {
       let Session(metadata: left, ..) = left
@@ -228,49 +239,35 @@ pub fn list_sessions(service: Service) -> Result(List(Session), String) {
 }
 
 pub fn get_session(service: Service, id: String) -> Result(Session, String) {
-  use metadata <- result.try(load_metadata(service, id))
-  load_session(service, metadata)
+  load_group_view(service, id)
 }
 
-/// Replaces a session's durable name and agent roster. Roster changes stop
-/// running agents through the host-routed RPC first; surviving agent histories
-/// and plugin state are retained, while newly added agents start dormant. A
-/// name-only update does not interrupt a running group.
+/// Replaces a session's durable name and agent roster. All updates go through
+/// the group's single writer: a live coordinator applies attribute upserts via
+/// the host-routed update RPC, while roster changes stop the group and ride
+/// the next wake's claim CAS. Surviving agent histories and plugin state are
+/// retained; newly added agents start dormant.
 pub fn update_session(
   service: Service,
   id: String,
   input: UpdateInput,
 ) -> Result(Session, String) {
   use agents <- result.try(validate_update(service, input))
-  use metadata_object <- result.try(
-    storage.get(service.storage, metadata_key(id))
-    |> result.map_error(fn(error) { string.inspect(error) }),
-  )
-  use current_metadata <- result.try(decode_metadata_body(metadata_object.body))
+  use session <- result.try(load_group_view(service, id))
+  let Session(metadata: current_metadata, ..) = session
   let next_metadata =
     SessionMetadata(..current_metadata, title: string.trim(input.name), agents:)
-  let metadata_body =
-    encode_metadata(next_metadata) |> json.to_string |> bit_array.from_string
-  case agents == current_metadata.agents {
-    True -> {
-      use _ <- result.try(persist_metadata_update(
+  use _ <- result.try(case agents == current_metadata.agents {
+    True ->
+      apply_attribute_update(
         service,
-        id,
-        metadata_body,
-        metadata_object.metadata.version,
-      ))
-      load_session(service, next_metadata)
-    }
-    False ->
-      update_session_roster(
-        service,
-        id,
-        current_metadata,
         next_metadata,
-        metadata_body,
-        metadata_object.metadata.version,
+        dict.from_list([#(title_attribute, next_metadata.title)]),
+        dict.new(),
       )
-  }
+    False -> update_session_roster(service, id, current_metadata, next_metadata)
+  })
+  load_group_view(service, id)
 }
 
 fn update_session_roster(
@@ -278,88 +275,131 @@ fn update_session_roster(
   id: String,
   current_metadata: SessionMetadata,
   next_metadata: SessionMetadata,
-  metadata_body: BitArray,
-  metadata_version: VersionToken,
-) -> Result(Session, String) {
+) -> Result(Nil, String) {
   // Construct every profile before stopping anything. A missing MCP
   // configuration or invalid plugin graph must leave the live team untouched.
   use next_config <- result.try(group_config(service, next_metadata))
-  use _ <- result.try(stop_session(service, id))
   use current_config <- result.try(group_config(service, current_metadata))
-  use current_group <- result.try(
-    agent_group.load(current_config)
+  use _ <- result.try(stop_session(service, id))
+  // Profiles for agents the edit removes are still needed to resume the
+  // pre-edit group; survivors and additions use the post-edit profiles.
+  let next_ids = list.map(next_config.profiles, fn(profile) { profile.id })
+  let removed_profiles =
+    list.filter(current_config.profiles, fn(profile) {
+      !list.contains(next_ids, profile.id)
+    })
+  let config =
+    agent_group.Config(
+      ..next_config,
+      profiles: list.append(next_config.profiles, removed_profiles),
+    )
+  use loaded <- result.try(
+    agent_group.resume(config)
     |> result.map_error(fn(error) {
       "could not load stopped agent group: " <> string.inspect(error)
     }),
   )
-  let next_states = reconcile_agents(current_group.agents, next_metadata)
-  use next_group <- result.try(
-    agent_group.reconfigure(next_config, next_states)
-    |> result.map_error(fn(error) {
-      "could not update agent group: " <> string.inspect(error)
-    }),
-  )
-  case persist_metadata_update(service, id, metadata_body, metadata_version) {
-    Ok(Nil) -> {
-      let retained_ids =
-        list.map(next_metadata.agents, fn(spec) { profile_id(id, spec.id) })
-      current_metadata.agents
-      |> list.map(fn(spec) { profile_id(id, spec.id) })
-      |> list.filter(fn(profile) { !list.contains(retained_ids, profile) })
-      |> agent_profile.uninstall
-      Ok(Session(next_metadata, next_group))
-    }
-    Error(error) -> {
-      let rollback =
-        agent_group.reconfigure(current_config, current_group.agents)
-      case rollback {
-        Ok(_) -> {
-          let previous_ids =
-            list.map(current_metadata.agents, fn(spec) {
-              profile_id(id, spec.id)
-            })
-          next_metadata.agents
-          |> list.map(fn(spec) { profile_id(id, spec.id) })
-          |> list.filter(fn(profile) { !list.contains(previous_ids, profile) })
-          |> agent_profile.uninstall
-          Error("could not persist updated session metadata: " <> error)
-        }
-        Error(rollback_error) ->
-          Error(
-            "could not persist updated session metadata: "
-            <> error
-            <> "; agent-group rollback also failed: "
-            <> string.inspect(rollback_error),
+  // A declarative roster command: the wake applies it to the state it reads
+  // under its claim CAS, so surviving agents' histories and any concurrently
+  // delivered messages are preserved by the owner, not by a caller snapshot.
+  let update =
+    agent_group.GroupUpdate(
+      attributes: group_attributes(next_metadata),
+      agent_attributes: dict.new(),
+      roster: Some(
+        list.map(next_metadata.agents, fn(spec) {
+          agent_group.RosterEntry(
+            id: spec.id,
+            profile_id: profile_id(id, spec.id),
+            model_id: spec.model_id,
+            attributes: agent_attributes(spec),
+            initial_status: agent.Waiting,
           )
-      }
+        }),
+      ),
+    )
+  // The roster replacement rides the wake's claim CAS: one atomic write,
+  // fenced by the loaded version, so a concurrent claim or edit surfaces as
+  // AlreadyClaimed/ConcurrentGroupUpdate instead of being overwritten.
+  case
+    agent_group.wake_detached_updated(
+      loaded,
+      core.token(service.cluster),
+      update,
+      fn() { core.refresh(service.cluster) },
+    )
+  {
+    Ok(_) -> {
+      removed_profiles
+      |> list.map(fn(profile) { profile.id })
+      |> agent_profile.uninstall
+      Ok(Nil)
     }
+    Error(error) ->
+      Error("could not update agent group: " <> string.inspect(error))
   }
 }
 
-fn persist_metadata_update(
+/// Applies extended-attribute upserts through the group's owner: the
+/// host-routed update RPC reaches a live coordinator wherever it runs, and a
+/// dormant group is woken with the update riding its claim CAS.
+fn apply_attribute_update(
   service: Service,
-  id: String,
-  intended_body: BitArray,
-  version: VersionToken,
+  metadata: SessionMetadata,
+  group_attributes: dict.Dict(String, String),
+  agent_attributes: dict.Dict(String, dict.Dict(String, String)),
 ) -> Result(Nil, String) {
-  let key = metadata_key(id)
-  case
-    storage.put(
-      service.storage,
-      key,
-      intended_body,
-      storage.IfUnchanged(version),
+  let update_call = fn() {
+    cluster_call(
+      service,
+      agent_group_rpc.update_method_name(),
+      agent_group_rpc.update_request(
+        metadata.id,
+        group_attributes,
+        agent_attributes,
+      ),
+      decode.string,
     )
-  {
-    Ok(_) -> Ok(Nil)
-    Error(storage.PreconditionFailed(_)) ->
-      case storage.get(service.storage, key) {
-        Ok(object) if object.body == intended_body -> Ok(Nil)
-        Ok(_) | Error(storage.PreconditionFailed(_)) ->
-          Error("session metadata changed concurrently")
-        Error(error) -> Error(string.inspect(error))
+    |> result.map(fn(_) { Nil })
+  }
+  case update_call() {
+    Ok(Nil) -> Ok(Nil)
+    // Not awake anywhere: wake it locally with the update riding the claim.
+    Error(_) -> {
+      use config <- result.try(group_config(service, metadata))
+      use loaded <- result.try(
+        agent_group.resume(config)
+        |> result.map_error(fn(error) {
+          "could not resume session: " <> string.inspect(error)
+        }),
+      )
+      case
+        agent_group.wake_detached_updated(
+          loaded,
+          core.token(service.cluster),
+          agent_group.GroupUpdate(
+            attributes: group_attributes,
+            agent_attributes: agent_attributes,
+            roster: None,
+          ),
+          fn() { core.refresh(service.cluster) },
+        )
+      {
+        Ok(_) -> Ok(Nil)
+        // A concurrent wake claimed the group first; it is live now, so the
+        // host-routed update applies through its coordinator.
+        Error(agent_group.AlreadyClaimed(_, _))
+        | Error(agent_group.ConcurrentGroupUpdate) ->
+          update_call()
+          |> result.map_error(fn(error) {
+            "could not update session attributes: " <> error
+          })
+        Error(error) ->
+          Error(
+            "could not update session attributes: " <> string.inspect(error),
+          )
       }
-    Error(error) -> Error(string.inspect(error))
+    }
   }
 }
 
@@ -373,9 +413,10 @@ pub fn send_message(
     "" -> Error("message cannot be empty")
     _ -> Ok(Nil)
   })
-  use metadata <- result.try(load_metadata(service, id))
+  use session <- result.try(load_group_view(service, id))
+  let Session(metadata:, ..) = session
   use _ <- result.try(validate_agent(metadata, agent_id))
-  use metadata <- result.try(initialize_session_metadata(
+  use metadata <- result.try(initialize_session_attributes(
     service,
     metadata,
     message,
@@ -422,7 +463,8 @@ pub fn request_compaction(
   id: String,
   agent_id: String,
 ) -> Result(Int, String) {
-  use metadata <- result.try(load_metadata(service, id))
+  use session <- result.try(load_group_view(service, id))
+  let Session(metadata:, ..) = session
   use _ <- result.try(validate_agent(metadata, agent_id))
   // Install this session's profiles before the wake RPC may choose this node.
   // Resuming is read-only and leaves the group dormant.
@@ -482,9 +524,8 @@ fn deliver_registered(
 }
 
 pub fn stop_session(service: Service, id: String) -> Result(Nil, String) {
-  use metadata <- result.try(load_metadata(service, id))
-  use session <- result.try(load_session(service, metadata))
-  let Session(group:, ..) = session
+  use session <- result.try(load_group_view(service, id))
+  let Session(metadata:, group:) = session
   use _ <- result.try(case group.execution {
     agent_group.Claimed(..) ->
       cluster_call(
@@ -899,85 +940,79 @@ pub fn resolve_workspace(requested: String) -> Result(String, String) {
   }
 }
 
-fn load_session(
-  service: Service,
-  metadata: SessionMetadata,
-) -> Result(Session, String) {
-  use group_config <- result.try(group_config(service, metadata))
-  agent_group.load(group_config)
-  |> result.map(fn(group) { Session(metadata, group) })
-  |> result.map_error(fn(error) { string.inspect(error) })
-}
-
-fn load_metadata(
-  service: Service,
-  id: String,
-) -> Result(SessionMetadata, String) {
-  load_metadata_key(service, metadata_key(id))
-}
-
-fn load_metadata_key(
-  service: Service,
-  key: String,
-) -> Result(SessionMetadata, String) {
-  use object <- result.try(
-    storage.get(service.storage, key)
+/// Renders the durable group object as a session. The group is the single
+/// source of truth; no separate session record exists.
+fn load_group_view(service: Service, id: String) -> Result(Session, String) {
+  use group <- result.try(
+    agent_group.peek(service.storage, group_key(id))
     |> result.map_error(fn(error) { string.inspect(error) }),
   )
-  decode_metadata_body(object.body)
+  use metadata <- result.try(session_view(group))
+  Ok(Session(metadata, group))
 }
 
-fn decode_metadata_body(body: BitArray) -> Result(SessionMetadata, String) {
-  use body <- result.try(
-    bit_array.to_string(body)
-    |> result.map_error(fn(_) { "session metadata is not UTF-8" }),
+fn session_view(
+  group: agent_group.AgentGroup,
+) -> Result(SessionMetadata, String) {
+  use workspace <- result.try(
+    dict.get(group.attributes, workspace_attribute)
+    |> result.map_error(fn(_) {
+      "agent group has no workspace attribute: " <> group.id
+    }),
   )
-  json.parse(body, metadata_decoder())
-  |> result.map_error(fn(error) { string.inspect(error) })
+  use agents <- result.try(
+    list.try_map(group.agents, fn(state) {
+      use kind <- result.try(
+        dict.get(state.attributes, kind_attribute)
+        |> result.map_error(fn(_) {
+          "agent has no kind attribute: " <> state.id
+        }),
+      )
+      use kind <- result.try(parse_kind(kind))
+      let role = dict.get(state.attributes, role_attribute) |> result.unwrap("")
+      Ok(AgentSpec(state.id, role, kind, state.model_id))
+    }),
+  )
+  Ok(SessionMetadata(
+    id: group.id,
+    title: dict.get(group.attributes, title_attribute) |> result.unwrap(""),
+    prompt: dict.get(group.attributes, prompt_attribute) |> result.unwrap(""),
+    workspace:,
+    created_at: dict.get(group.attributes, created_at_attribute)
+      |> result.try(int.parse)
+      |> result.unwrap(0),
+    agents:,
+  ))
 }
 
-fn initialize_session_metadata(
+/// Durably records the first message as the session prompt (and derives a
+/// title) in the group's extended attributes, through the group's owner.
+fn initialize_session_attributes(
   service: Service,
   metadata: SessionMetadata,
   first_message: String,
 ) -> Result(SessionMetadata, String) {
   case metadata.prompt {
     "" -> {
-      let key = metadata_key(metadata.id)
-      use object <- result.try(
-        storage.get(service.storage, key)
-        |> result.map_error(fn(error) { string.inspect(error) }),
-      )
-      use current <- result.try(decode_metadata_body(object.body))
-      case current.prompt {
-        "" -> {
-          let updated =
-            SessionMetadata(
-              ..current,
-              title: case current.title {
-                "New coding session" -> title(first_message)
-                title -> title
-              },
-              prompt: first_message,
-            )
-          case
-            storage.put(
-              service.storage,
-              key,
-              encode_metadata(updated)
-                |> json.to_string
-                |> bit_array.from_string,
-              storage.IfUnchanged(object.metadata.version),
-            )
-          {
-            Ok(_) -> Ok(updated)
-            Error(storage.PreconditionFailed(_)) ->
-              load_metadata(service, metadata.id)
-            Error(error) -> Error(string.inspect(error))
-          }
-        }
-        _ -> Ok(current)
-      }
+      let updated =
+        SessionMetadata(
+          ..metadata,
+          title: case metadata.title {
+            "New coding session" -> title(first_message)
+            title -> title
+          },
+          prompt: first_message,
+        )
+      use _ <- result.try(apply_attribute_update(
+        service,
+        updated,
+        dict.from_list([
+          #(title_attribute, updated.title),
+          #(prompt_attribute, updated.prompt),
+        ]),
+        dict.new(),
+      ))
+      Ok(updated)
     }
     _ -> Ok(metadata)
   }
@@ -1062,6 +1097,39 @@ fn capability_instructions(kind: AgentKind) -> String {
   }
 }
 
+fn group_attributes(metadata: SessionMetadata) -> dict.Dict(String, String) {
+  dict.from_list([
+    #(title_attribute, metadata.title),
+    #(prompt_attribute, metadata.prompt),
+    #(workspace_attribute, metadata.workspace),
+    #(created_at_attribute, int.to_string(metadata.created_at)),
+  ])
+}
+
+fn agent_attributes(spec: AgentSpec) -> dict.Dict(String, String) {
+  dict.from_list([
+    #(role_attribute, spec.role),
+    #(kind_attribute, kind_name(spec.kind)),
+  ])
+}
+
+fn kind_name(kind: AgentKind) -> String {
+  case kind {
+    CodingAgent -> "coding"
+    ResearchAgent -> "researcher"
+    McpSpecialist -> "mcp"
+  }
+}
+
+fn parse_kind(name: String) -> Result(AgentKind, String) {
+  case name {
+    "coding" -> Ok(CodingAgent)
+    "researcher" -> Ok(ResearchAgent)
+    "mcp" -> Ok(McpSpecialist)
+    _ -> Error("unknown agent kind attribute: " <> name)
+  }
+}
+
 fn initial_states(metadata: SessionMetadata) -> List(agent.State) {
   metadata.agents
   |> list.map(fn(spec) {
@@ -1069,59 +1137,10 @@ fn initial_states(metadata: SessionMetadata) -> List(agent.State) {
     agent.State(
       ..base,
       profile_id: profile_id(metadata.id, spec.id),
+      attributes: agent_attributes(spec),
       status: agent.Waiting,
     )
   })
-}
-
-fn reconcile_agents(
-  current: List(agent.State),
-  metadata: SessionMetadata,
-) -> List(agent.State) {
-  metadata.agents
-  |> list.map(fn(spec) {
-    case list.find(current, fn(state) { state.id == spec.id }) {
-      Error(_) -> {
-        let base = agent.state(spec.id, spec.model_id)
-        agent.State(
-          ..base,
-          profile_id: profile_id(metadata.id, spec.id),
-          status: agent.Waiting,
-        )
-      }
-      Ok(state) if state.model_id == spec.model_id ->
-        agent.State(..state, profile_id: profile_id(metadata.id, spec.id))
-      Ok(state) ->
-        agent.State(
-          ..state,
-          profile_id: profile_id(metadata.id, spec.id),
-          model_id: spec.model_id,
-          messages: sanitize_messages(state.messages),
-          context_messages: option.map(
-            state.context_messages,
-            sanitize_messages,
-          ),
-          pending_messages: sanitize_messages(state.pending_messages),
-          last_catalog_revision: None,
-          last_context_tokens: None,
-        )
-    }
-  })
-}
-
-fn sanitize_messages(messages: List(llm.Message)) -> List(llm.Message) {
-  list.map(messages, fn(message) {
-    llm.Message(..message, content: list.map(message.content, sanitize_content))
-  })
-}
-
-fn sanitize_content(content: llm.Content) -> llm.Content {
-  case content {
-    llm.Reasoning(summary, _) -> llm.Reasoning(summary, None)
-    llm.ToolResult(id, content, is_error) ->
-      llm.ToolResult(id, list.map(content, sanitize_content), is_error)
-    content -> content
-  }
 }
 
 fn validate_agent(
@@ -1186,77 +1205,6 @@ fn profile_id(session_id: String, agent_id: String) -> String {
   session_id <> ":" <> agent_id
 }
 
-fn metadata_key(id: String) -> String {
-  sessions_prefix <> id <> "/metadata"
-}
-
 fn group_key(id: String) -> String {
-  sessions_prefix <> id <> "/group"
-}
-
-fn encode_metadata(metadata: SessionMetadata) -> json.Json {
-  json.object([
-    #("schema_version", json.int(4)),
-    #("id", json.string(metadata.id)),
-    #("title", json.string(metadata.title)),
-    #("prompt", json.string(metadata.prompt)),
-    #("workspace", json.string(metadata.workspace)),
-    #("created_at", json.int(metadata.created_at)),
-    #(
-      "agents",
-      json.array(metadata.agents, fn(agent) {
-        let kind = case agent.kind {
-          CodingAgent -> "coding"
-          ResearchAgent -> "researcher"
-          McpSpecialist -> "mcp"
-        }
-        json.object([
-          #("id", json.string(agent.id)),
-          #("role", json.string(agent.role)),
-          #("kind", json.string(kind)),
-          #("model_id", json.string(agent.model_id)),
-        ])
-      }),
-    ),
-  ])
-}
-
-fn metadata_decoder() -> decode.Decoder(SessionMetadata) {
-  use schema <- decode.field("schema_version", decode.int)
-  use id <- decode.field("id", decode.string)
-  use title <- decode.field("title", decode.string)
-  use prompt <- decode.field("prompt", decode.string)
-  use workspace <- decode.field("workspace", decode.string)
-  use created_at <- decode.field("created_at", decode.int)
-  use agents <- decode.field("agents", decode.list(of: agent_spec_decoder()))
-  case schema {
-    4 ->
-      decode.success(SessionMetadata(
-        id,
-        title,
-        prompt,
-        workspace,
-        created_at,
-        agents,
-      ))
-    _ ->
-      decode.failure(
-        SessionMetadata("", "", "", "", 0, []),
-        "unsupported session metadata schema",
-      )
-  }
-}
-
-fn agent_spec_decoder() -> decode.Decoder(AgentSpec) {
-  use id <- decode.field("id", decode.string)
-  use role <- decode.field("role", decode.string)
-  use kind <- decode.field("kind", decode.string)
-  use model_id <- decode.field("model_id", decode.string)
-  case kind {
-    "coding" -> decode.success(AgentSpec(id, role, CodingAgent, model_id))
-    "researcher" -> decode.success(AgentSpec(id, role, ResearchAgent, model_id))
-    "mcp" -> decode.success(AgentSpec(id, role, McpSpecialist, model_id))
-    _ ->
-      decode.failure(AgentSpec("", "", ResearchAgent, ""), "unknown agent kind")
-  }
+  groups_prefix <> id
 }

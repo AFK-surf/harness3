@@ -43,6 +43,9 @@ pub type State {
     stats: llm.Stats,
     plugin_states: Dict(String, String),
     plugin_generation: Int,
+    /// Extended attributes: opaque application-owned key/value metadata,
+    /// persisted with the agent and never interpreted by the harness.
+    attributes: Dict(String, String),
     last_catalog_revision: Option(Int),
     last_context_tokens: Option(Int),
     compaction_requested: Int,
@@ -65,6 +68,7 @@ pub fn state(id: String, model_id: String) -> State {
     stats: llm.empty_stats(),
     plugin_states: plugin.empty_states(),
     plugin_generation: 0,
+    attributes: dict.new(),
     last_catalog_revision: None,
     last_context_tokens: None,
     compaction_requested: 0,
@@ -1151,6 +1155,7 @@ pub fn encode_state(state: State) -> Json {
       }),
     ),
     #("plugin_generation", json.int(state.plugin_generation)),
+    #("attributes", json.dict(state.attributes, fn(key) { key }, json.string)),
     #(
       "last_catalog_revision",
       json.nullable(state.last_catalog_revision, json.int),
@@ -1196,6 +1201,11 @@ pub fn state_decoder() -> decode.Decoder(State) {
     0,
     decode.int,
   )
+  use attributes <- decode.optional_field(
+    "attributes",
+    dict.new(),
+    decode.dict(decode.string, decode.string),
+  )
   use last_catalog_revision <- decode.optional_field(
     "last_catalog_revision",
     None,
@@ -1234,6 +1244,7 @@ pub fn state_decoder() -> decode.Decoder(State) {
     stats,
     dict.from_list(plugin_states),
     plugin_generation,
+    attributes,
     last_catalog_revision,
     last_context_tokens,
     compaction_requested,

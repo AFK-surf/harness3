@@ -313,7 +313,9 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let assert [edited_lead, _, edited_verifier] = edited.agents
   assert edited_lead.model_id == "test/model-2"
   assert edited_verifier.id == "verifier"
-  assert edited_group.execution == agent_group.Idle(1)
+  // The roster replacement rides a wake's claim CAS, so the edited group is
+  // claimed by this node until its coordinator settles idle.
+  let assert agent_group.Claimed(..) = edited_group.execution
   let assert [lead_state, _, verifier_state] = edited_group.agents
   assert lead_state.id == "lead"
   assert lead_state.model_id == "test/model-2"

@@ -104,8 +104,8 @@ local filesystem or shell tools. Every agent receives `cloud_storage.read`,
 while keeping different sessions isolated. The lead, implementer, and reviewer
 retain the coding tools and do not receive MCP
 access. Plugin state references the stable aggregate configuration ID, while
-session metadata only records the MCP resource profile and the global catalog
-owns the actual server settings. The lead can message every
+the group's agent attributes only record the MCP resource profile and the
+global catalog owns the actual server settings. The lead can message every
 subagent; subagents can message only the lead, so there is no direct
 subagent-to-subagent communication path.
 
@@ -204,11 +204,17 @@ Update request example:
 ```
 
 The **Edit team** button changes the group name, each agent's model and resource
-profile, and adds or removes agents. A name-only edit does not interrupt a live
-group. Roster or model changes stop the group first through the host-routed RPC;
-surviving agents retain their durable history and plugin state, added agents
-start dormant, and removed agents are deleted. Existing agent IDs are immutable
-in the UI; replace an agent to give it a different ID.
+profile, and adds or removes agents. Sessions have no storage record of their
+own: a session is a view of its durable agent group, whose extended attributes
+carry the title, prompt, workspace, creation time, and each agent's role and
+kind. Every update goes through the group's single writer — a name-only edit
+reaches a live coordinator via the host-routed update RPC (waking a dormant
+group with the update riding its claim), while roster or model changes stop the
+group first through the host-routed RPC and apply the new roster atomically
+with the next wake's claim. Surviving agents retain their durable history and
+plugin state, added agents start dormant, and removed agents are deleted.
+Existing agent IDs are immutable in the UI; replace an agent to give it a
+different ID.
 
 A team of at least two uses the MCP researcher automatically when any enabled
 global configuration contains a server. The agent editor exposes one MCP

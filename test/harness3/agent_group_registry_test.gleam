@@ -26,6 +26,7 @@ pub fn live_entries_force_stop_and_dead_entries_are_swept_test() {
     fn(_, _) { Ok(Nil) },
     fn(_, _, _, _) { Ok(Nil) },
     fn(_) { Ok(1) },
+    fn(_, _) { Ok(Nil) },
   )
   assert list.contains(agent_group_registry.alive_ids(), live_id)
   assert agent_group_registry.force_stop(live_id) == Ok(Nil)
@@ -44,6 +45,7 @@ pub fn live_entries_force_stop_and_dead_entries_are_swept_test() {
     fn(_, _) { Ok(Nil) },
     fn(_, _, _, _) { Ok(Nil) },
     fn(_) { Ok(1) },
+    fn(_, _) { Ok(Nil) },
   )
 
   let alive = agent_group_registry.alive_ids()

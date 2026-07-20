@@ -94,7 +94,11 @@ fn file_delete(path: String) -> FileStatus
 @external(erlang, "filelib", "ensure_dir")
 fn ensure_dir(path: String) -> FileStatus
 
-@external(erlang, "filelib", "is_file")
+// `filelib:is_regular`, not `filelib:is_file`: the latter is true for
+// directories, so with keys `docs/x` and `docs` the directory created for the
+// former would read as an existing object named `docs` — false `IfAbsent`
+// conflicts, `head` hits for nothing, and `eisdir` from `get`.
+@external(erlang, "filelib", "is_regular")
 fn is_file(path: String) -> Bool
 
 @external(erlang, "filelib", "is_dir")
@@ -154,10 +158,24 @@ fn lock_path(config: Config) -> String {
   join_path(root(config), ".harness3.lock")
 }
 
-fn acquire_lock(path: String, attempts: Int) -> Result(Nil, Error) {
+/// Acquires the lock and stamps the holder's random token into the lock
+/// file, so commits and cleanup can verify the lock was not broken and
+/// re-acquired by someone else mid-transaction.
+fn acquire_lock(path: String, attempts: Int) -> Result(String, Error) {
   use _ <- result.try(ensure_dir(path) |> status_result)
   case file_open(path, [Write, Raw, Exclusive]) {
-    Ok(file) -> file_close(file) |> status_result
+    Ok(file) -> {
+      use _ <- result.try(file_close(file) |> status_result)
+      let token =
+        crypto.strong_random_bytes(12) |> bit_array.base64_url_encode(False)
+      // Only the holder writes here: everyone else backs off while the file
+      // exists, and a fresh lock is never broken.
+      use _ <- result.try(
+        file_write(path, bit_array.from_string(token), [Raw, Binary, Sync])
+        |> status_result,
+      )
+      Ok(token)
+    }
     Error(reason) ->
       case string.inspect(reason), attempts > 0 {
         "Eexist", True -> {
@@ -221,6 +239,7 @@ fn break_stale_lock(path: String) -> Nil {
 
 fn keep_lock_alive(
   path: String,
+  token: String,
   stop: process.Subject(process.Subject(Nil)),
   holder: process.Monitor,
 ) -> Nil {
@@ -228,11 +247,12 @@ fn keep_lock_alive(
     process.new_selector()
     |> process.select_map(stop, HeartbeatStop)
     |> process.select_specific_monitor(holder, fn(_) { HolderExited })
-  heartbeat_loop(path, selector)
+  heartbeat_loop(path, token, selector)
 }
 
 fn heartbeat_loop(
   path: String,
+  token: String,
   selector: process.Selector(HeartbeatEvent),
 ) -> Nil {
   case process.selector_receive(selector, lock_heartbeat_ms) {
@@ -242,22 +262,39 @@ fn heartbeat_loop(
       // brutally killed mid-transaction). Release the lock on its behalf;
       // interrupted writes already invalidated their version tokens via the
       // sentinel-mtime protocol, so letting the next waiter in is safe.
-      let _ = file_delete(path)
-      Nil
+      release_owned_lock(path, token)
     }
     Error(_) -> {
       let _ = simplifile.touch(at: path)
-      heartbeat_loop(path, selector)
+      heartbeat_loop(path, token, selector)
     }
+  }
+}
+
+/// Deletes the lock only while it still carries this holder's token. After a
+/// stall long enough for a breaker to steal the lock, the file belongs to a
+/// new holder — deleting it blindly would let a third holder in while the
+/// second is mid-transaction.
+fn release_owned_lock(path: String, token: String) -> Nil {
+  case file_read(path) {
+    Ok(content) ->
+      case content == bit_array.from_string(token) {
+        True -> {
+          let _ = file_delete(path)
+          Nil
+        }
+        False -> Nil
+      }
+    Error(_) -> Nil
   }
 }
 
 fn with_lock(
   config: Config,
-  transaction: fn() -> Result(a, Error),
+  transaction: fn(String) -> Result(a, Error),
 ) -> Result(a, Error) {
   let path = lock_path(config)
-  use _ <- result.try(acquire_lock(path, lock_attempts))
+  use token <- result.try(acquire_lock(path, lock_attempts))
   let holder = process.self()
   let heartbeat_ready = process.new_subject()
   let _ =
@@ -265,7 +302,7 @@ fn with_lock(
       let stop = process.new_subject()
       let monitor = process.monitor(holder)
       process.send(heartbeat_ready, stop)
-      keep_lock_alive(path, stop, monitor)
+      keep_lock_alive(path, token, stop, monitor)
     })
   let assert Ok(heartbeat) = process.receive(heartbeat_ready, within: 5000)
   exception.defer(
@@ -275,11 +312,30 @@ fn with_lock(
       let ack = process.new_subject()
       process.send(heartbeat, ack)
       let _ = process.receive(ack, within: 5000)
-      let _ = file_delete(path)
-      Nil
+      release_owned_lock(path, token)
     },
-    transaction,
+    fn() { transaction(token) },
   )
+}
+
+/// Confirms the lock file still carries this holder's token, immediately
+/// before a destructive commit. A holder stalled past the staleness horizon
+/// loses the lock to a breaker, and its commit must then fail instead of
+/// silently overwriting the new holder's writes (a false CAS success).
+/// Advisory: a steal between this check and the following operation remains
+/// possible, but the window shrinks from the whole transaction to
+/// microseconds.
+fn verify_lock(config: Config, token: String) -> Result(Nil, Error) {
+  case file_read(lock_path(config)) {
+    Ok(content) ->
+      case content == bit_array.from_string(token) {
+        True -> Ok(Nil)
+        False ->
+          Error(Backend(0, "local storage lock was broken mid-transaction"))
+      }
+    Error(_) ->
+      Error(Backend(0, "local storage lock was broken mid-transaction"))
+  }
 }
 
 fn root(config: Config) -> String {
@@ -428,7 +484,7 @@ fn status_result(status: FileStatus) -> Result(Nil, Error) {
 
 fn get_(config: Config, key: String) -> Result(Object, Error) {
   use path <- result.try(path_for(config, key))
-  with_lock(config, fn() {
+  with_lock(config, fn(_token) {
     use metadata <- result.try(metadata_locked(config, key, path))
     file_read(path)
     |> result.map(fn(body) { Object(metadata, body) })
@@ -438,7 +494,7 @@ fn get_(config: Config, key: String) -> Result(Object, Error) {
 
 fn head_(config: Config, key: String) -> Result(Metadata, Error) {
   use path <- result.try(path_for(config, key))
-  with_lock(config, fn() { metadata_locked(config, key, path) })
+  with_lock(config, fn(_token) { metadata_locked(config, key, path) })
 }
 
 fn check_condition(
@@ -475,7 +531,7 @@ fn put_(
   condition: PutCondition,
 ) -> Result(Metadata, Error) {
   use path <- result.try(path_for(config, key))
-  with_lock(config, fn() {
+  with_lock(config, fn(token) {
     use _ <- result.try(check_condition(config, condition, key, path))
     let #(_, stored_generation) = read_generation(config, key)
     let generation = stored_generation + 1
@@ -498,6 +554,7 @@ fn put_(
       file_write(temporary, body, [Raw, Binary, Sync])
       |> status_result,
     )
+    use _ <- result.try(verify_lock(config, token))
     case file_rename(temporary, path) |> status_result {
       Error(error) -> {
         let _ = file_delete(temporary)
@@ -523,7 +580,7 @@ fn list_(config: Config, prefix: String) -> Result(List(Metadata), Error) {
     "/" -> "/"
     _ -> base <> "/"
   }
-  with_lock(config, fn() {
+  with_lock(config, fn(_token) {
     let paths = case is_dir(base) {
       False -> []
       True ->
@@ -539,9 +596,11 @@ fn list_(config: Config, prefix: String) -> Result(List(Metadata), Error) {
       paths
       |> list.filter(fn(path) {
         let key = string.drop_start(path, string.length(base_prefix))
-        !string.starts_with(key, ".harness3/")
-        && key != ".harness3.lock"
-        && string.starts_with(key, prefix)
+        // The whole `.harness3*` namespace is internal bookkeeping —
+        // generations, temporaries, the lock file, and any `.break.` files a
+        // crashed lock-breaker left behind. `path_for` rejects such keys, so
+        // no legitimate object can be excluded here.
+        !string.starts_with(key, ".harness3") && string.starts_with(key, prefix)
       })
     use metadata <- result.try(
       paths
@@ -563,10 +622,11 @@ fn list_(config: Config, prefix: String) -> Result(List(Metadata), Error) {
 
 fn delete_(config: Config, key: String) -> Result(Nil, Error) {
   use path <- result.try(path_for(config, key))
-  with_lock(config, fn() {
+  with_lock(config, fn(token) {
     case is_file(path) {
       False -> Ok(Nil)
       True -> {
+        use _ <- result.try(verify_lock(config, token))
         // The bumped tombstone must always survive the delete. Garbage
         // collecting it when the object's mtime second has passed was tried
         // and is unsound: object mtimes are not monotonic (stream_put commits
@@ -596,7 +656,7 @@ fn stream_get_(
 ) -> Result(Metadata, Error) {
   use path <- result.try(path_for(config, key))
   use opened <- result.try(
-    with_lock(config, fn() {
+    with_lock(config, fn(_token) {
       use metadata <- result.try(metadata_locked(config, key, path))
       use file <- result.try(
         file_open(path, [Read, Raw, Binary]) |> result.map_error(dynamic_error),
@@ -665,12 +725,13 @@ fn stream_put_(
         }
         Ok(Nil) -> {
           let committed =
-            with_lock(config, fn() {
+            with_lock(config, fn(token) {
               use _ <- result.try(check_condition(config, condition, key, path))
               let #(_, stored_generation) = read_generation(config, key)
               let generation = stored_generation + 1
               use _ <- result.try(write_generation(config, key, -2, generation))
               use _ <- result.try(ensure_dir(path) |> status_result)
+              use _ <- result.try(verify_lock(config, token))
               case file_rename(temporary, path) |> status_result {
                 Error(error) -> {
                   let _ = file_delete(temporary)

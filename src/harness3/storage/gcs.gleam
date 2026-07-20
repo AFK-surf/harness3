@@ -235,7 +235,15 @@ fn put_(
     }),
   )
   case response.status {
-    200 -> Ok(response_metadata(response, key, bit_array.byte_size(body)))
+    // A PUT response's `content-length` describes its own (empty) response
+    // body, not the stored object; the size written is authoritative.
+    200 ->
+      Ok(
+        Metadata(
+          ..response_metadata(response, key, 0),
+          size: bit_array.byte_size(body),
+        ),
+      )
     _ -> Error(status_error(response, key))
   }
 }
@@ -390,7 +398,9 @@ fn stream_put_(
       let http_stream.StreamingResponse(status:, headers:, ..) = response
       use response_body <- result.try(http_stream.collect(response))
       case status {
-        200 -> Ok(metadata_from_headers(headers, key, size))
+        // As in `put_`: the PUT response's `content-length` is not the
+        // object size; the streamed byte count is.
+        200 -> Ok(Metadata(..metadata_from_headers(headers, key, 0), size:))
         _ -> Error(status_error(Response(status, [], response_body), key))
       }
     }

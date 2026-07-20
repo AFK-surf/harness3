@@ -1,10 +1,13 @@
 import gleam/bit_array
+import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import gleam/uri
 import harness3/agent_group
 import harness3/agent_group_registry
 import harness3/cluster/core
@@ -99,6 +102,21 @@ pub fn plugin(storage: Storage, lease_duration_seconds: Int) -> core.RpcPlugin {
       },
     ),
     core.contextual_method(
+      update_method_name(),
+      update_decoder(),
+      fn(context, request) {
+        let #(group_id, group_attributes, agent_attributes, visited) = request
+        route_update(
+          storage,
+          context,
+          group_id,
+          group_attributes,
+          agent_attributes,
+          visited,
+        )
+      },
+    ),
+    core.contextual_method(
       stop_method_name(),
       stop_decoder(),
       fn(context, request) {
@@ -157,6 +175,24 @@ pub fn stop_request(group_id: String) -> #(String, List(String)) {
   #(group_id, [])
 }
 
+/// Builds an awake-only, host-routed extended-attribute update request. The
+/// upserts merge into the group's and named agents' attributes through the
+/// owning coordinator. It never wakes a dormant group: the caller wakes it
+/// with the update riding the claim (`agent_group.wake_detached_updated`)
+/// instead.
+pub fn update_request(
+  group_id: String,
+  group_attributes: Dict(String, String),
+  agent_attributes: Dict(String, Dict(String, String)),
+) -> #(
+  String,
+  Dict(String, String),
+  Dict(String, Dict(String, String)),
+  List(String),
+) {
+  #(group_id, group_attributes, agent_attributes, [])
+}
+
 fn load_group(
   backend: Storage,
   group_key: String,
@@ -182,18 +218,19 @@ fn route_wake(
   case leader.token == current {
     False -> redirect_wake(leader, current, group_id, group_key, visited)
     True -> {
-      let running = running_owner(backend, group_id)
-      case running {
-        Ok(owner) ->
+      use entry <- result.try(newest_group_entry(backend, group_id))
+      case entry {
+        Some(entry) ->
           case
             list.any(nodes, fn(node) {
-              node.token == owner && list.contains(node.agent_groups, group_id)
+              node.token == entry.owner
+              && list.contains(node.agent_groups, group_id)
             })
           {
             True -> Ok("ok")
             False -> dispatch_wake(nodes |> list.shuffle, group_key)
           }
-        Error(_) -> dispatch_wake(nodes |> list.shuffle, group_key)
+        None -> dispatch_wake(nodes |> list.shuffle, group_key)
       }
     }
   }
@@ -289,10 +326,11 @@ fn route_to_group_host(
     Ok(response) -> Ok(response)
     Error(agent_group_registry.NotFound(_)) -> {
       use nodes <- result.try(alive_memberships(backend))
-      use host <- result.try(
-        group_host(backend, group_id, nodes)
-        |> result.map_error(fn(_) { sleeping_error(sleeping, "anywhere") }),
-      )
+      use host <- result.try(group_host(backend, group_id, nodes))
+      use host <- result.try(case host {
+        Some(host) -> Ok(host)
+        None -> Error(sleeping_error(sleeping, "anywhere"))
+      })
       use _ <- result.try(case host.token == current {
         True -> Error(sleeping_error(sleeping, "on its indexed node"))
         False -> check_redirect(host.token, visited)
@@ -418,6 +456,39 @@ fn route_compaction(
   )
 }
 
+fn route_update(
+  backend: Storage,
+  context: core.RpcContext,
+  group_id: String,
+  group_attributes: Dict(String, String),
+  agent_attributes: Dict(String, Dict(String, String)),
+  visited: List(String),
+) -> Result(String, core.RpcError) {
+  route_to_group_host(
+    backend,
+    context,
+    group_id,
+    visited,
+    HostRoutedCall(
+      local: fn() {
+        agent_group_registry.update_attributes(
+          group_id,
+          group_attributes,
+          agent_attributes,
+        )
+        |> result.map(fn(_) { "ok" })
+      },
+      method_name: update_method_name(),
+      payload: fn(next_visited) {
+        #(group_id, group_attributes, agent_attributes, next_visited)
+      },
+      response_decoder: decode.string,
+      sleeping: NotAwake,
+      error_prefix: "update",
+    ),
+  )
+}
+
 fn route_stop(
   backend: Storage,
   context: core.RpcContext,
@@ -433,10 +504,9 @@ fn route_stop(
     }
     Error(agent_group_registry.NotFound(_)) -> {
       use nodes <- result.try(alive_memberships(backend))
-      case group_host(backend, group_id, nodes) {
-        Error(_) -> Ok("ok")
-        Ok(host) if host.token == current -> Ok("ok")
-        Ok(host) -> {
+      use host <- result.try(group_host(backend, group_id, nodes))
+      case host {
+        Some(host) if host.token != current -> {
           use _ <- result.try(check_redirect(host.token, visited))
           core.call(
             host.ip,
@@ -450,6 +520,32 @@ fn route_stop(
             core.HandlerError("stop_redirect_failed", string.inspect(error))
           })
         }
+        // No reachable live host — or the index points at this node, whose
+        // registry has no such group, so its coordinator is already gone. A
+        // crashed owner leaves a durable claim and index entries that
+        // recovery would use to resurrect the "stopped" group; finalize them
+        // durably instead of reporting success for a stop that did nothing.
+        Some(_) | None -> {
+          use entry <- result.try(newest_group_entry(backend, group_id))
+          case entry {
+            None -> Ok("ok")
+            Some(entry) ->
+              agent_group.release_abandoned(backend, entry.group_key)
+              |> result.map(fn(_) { "ok" })
+              |> result.map_error(fn(error) {
+                case error {
+                  agent_group.AlreadyClaimed(_, expires) ->
+                    core.HandlerError(
+                      "still_leased",
+                      "the owner's lease has not expired; expires at "
+                        <> int.to_string(expires),
+                    )
+                  error ->
+                    core.HandlerError("stop_failed", string.inspect(error))
+                }
+              })
+          }
+        }
       }
     }
     Error(error) ->
@@ -457,28 +553,41 @@ fn route_stop(
   }
 }
 
+/// The node currently hosting a group, or `None` when no alive node hosts
+/// it. Storage failures propagate: reporting an unreadable index as "not
+/// hosted" would let callers mistake an unknown state for a stopped group.
 fn group_host(
   backend: Storage,
   group_id: String,
   nodes: List(Endpoint),
-) -> Result(Endpoint, Nil) {
-  let indexed = case running_owner(backend, group_id) {
-    Ok(owner) -> list.find(nodes, fn(node) { node.token == owner })
-    Error(_) -> Error(Nil)
+) -> Result(Option(Endpoint), core.RpcError) {
+  use entry <- result.try(newest_group_entry(backend, group_id))
+  let indexed = case entry {
+    Some(entry) ->
+      list.find(nodes, fn(node) { node.token == entry.owner })
+      |> option.from_result
+    None -> None
   }
   case indexed {
-    Ok(node) -> Ok(node)
-    Error(_) ->
-      list.find(nodes, fn(node) { list.contains(node.agent_groups, group_id) })
+    Some(node) -> Ok(Some(node))
+    None ->
+      Ok(
+        list.find(nodes, fn(node) { list.contains(node.agent_groups, group_id) })
+        |> option.from_result,
+      )
   }
 }
 
-fn running_owner(
+/// The group's highest-epoch running-index entry — the latest claim, live or
+/// crashed — or `None` when the group has no index entry at all.
+fn newest_group_entry(
   backend: Storage,
   group_id: String,
-) -> Result(String, core.RpcError) {
+) -> Result(Option(agent_group.RunningIndexEntry), core.RpcError) {
+  let prefix =
+    agent_group.running_index_prefix() <> uri.percent_encode(group_id) <> "/"
   use metadata <- result.try(
-    storage.list(backend, agent_group.running_index_prefix())
+    storage.list(backend, prefix)
     |> result.map_error(storage_rpc_error),
   )
   use entries <- result.try(
@@ -497,10 +606,8 @@ fn running_owner(
   entries
   |> list.sort(fn(a, b) { int.compare(b.epoch, a.epoch) })
   |> list.first
-  |> result.map(fn(entry) { entry.owner })
-  |> result.map_error(fn(_) {
-    core.HandlerError("not_running", "agent group is not running anywhere")
-  })
+  |> option.from_result
+  |> Ok
 }
 
 fn recovery_leader(
@@ -665,6 +772,32 @@ fn compaction_decoder() -> decode.Decoder(#(String, String, List(String))) {
   })
 }
 
+fn update_decoder() -> decode.Decoder(
+  #(
+    String,
+    Dict(String, String),
+    Dict(String, Dict(String, String)),
+    List(String),
+  ),
+) {
+  decode.at([0], decode.string)
+  |> decode.then(fn(group_id) {
+    decode.at([1], decode.dict(decode.string, decode.string))
+    |> decode.then(fn(group_attributes) {
+      decode.at(
+        [2],
+        decode.dict(decode.string, decode.dict(decode.string, decode.string)),
+      )
+      |> decode.then(fn(agent_attributes) {
+        decode.at([3], decode.list(of: decode.string))
+        |> decode.map(fn(visited) {
+          #(group_id, group_attributes, agent_attributes, visited)
+        })
+      })
+    })
+  })
+}
+
 fn stop_decoder() -> decode.Decoder(#(String, List(String))) {
   decode.at([0], decode.string)
   |> decode.then(fn(group_id) {
@@ -706,6 +839,13 @@ pub fn inject_method_name() -> String {
 /// wakes or resumes a dormant group.
 pub fn compaction_method_name() -> String {
   "compact_agent_group"
+}
+
+/// RPC that merges extended-attribute upserts through the owning coordinator
+/// on the current host, or forwards to the host. It never wakes or resumes a
+/// dormant group.
+pub fn update_method_name() -> String {
+  "update_agent_group"
 }
 
 type TimeUnit {

@@ -128,7 +128,28 @@ fn update_session(
   use input <- body_decoded(body, update_input_decoder())
   case service.update_session(service, id, input) {
     Ok(session) -> json_response(200, session_json(session))
-    Error(error) -> error_response(409, error)
+    Error(error) -> error_response(update_error_status(error), error)
+  }
+}
+
+/// Service errors are strings, so status mapping is by content: a missing
+/// session is 404, a concurrency conflict (claimed group, concurrent edit,
+/// unexpired crashed-owner lease) is 409, and anything else is a 400
+/// validation failure — instead of the blanket 409 this endpoint used to
+/// return for all three.
+fn update_error_status(error: String) -> Int {
+  case string.contains(error, "NotFound") {
+    True -> 404
+    False ->
+      case
+        string.contains(error, "AlreadyClaimed")
+        || string.contains(error, "Concurrent")
+        || string.contains(error, "still_leased")
+        || string.contains(error, "changed concurrently")
+      {
+        True -> 409
+        False -> 400
+      }
   }
 }
 
