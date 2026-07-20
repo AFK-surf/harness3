@@ -392,6 +392,70 @@ pub fn load(config: Config) -> Result(AgentGroup, Error) {
   Ok(group)
 }
 
+/// Replaces the durable roster of a dormant group while preserving the state
+/// supplied for surviving agents. A claimed group must be stopped first so a
+/// live coordinator cannot overwrite the edit with an in-flight commit.
+pub fn reconfigure(
+  config: Config,
+  agents: List(agent.State),
+) -> Result(AgentGroup, Error) {
+  use object <- result.try(
+    storage.get(config.storage, config.object_key)
+    |> result.map_error(StorageFailed),
+  )
+  use current <- result.try(decode_group_body(object.body))
+  use _ <- result.try(case current.execution {
+    Claimed(owner, _, expires_at, _) -> Error(AlreadyClaimed(owner, expires_at))
+    Idle(_) | Completed(_) -> Ok(Nil)
+  })
+  let next =
+    AgentGroup(
+      ..current,
+      revision: current.revision + 1,
+      agents:,
+      execution: Idle(execution_epoch(current.execution)),
+    )
+  use _ <- result.try(validate(config, next))
+  use _ <- result.try(
+    next.agents
+    |> list.try_each(fn(state) {
+      find_profile(config.profiles, state.profile_id)
+      |> result.map(fn(_) { Nil })
+    }),
+  )
+  use catalog_session <- result.try(
+    model_catalog.resume(config.storage, next.model_catalog_key)
+    |> result.map_error(ModelCatalogFailed),
+  )
+  let catalog = model_catalog.catalog(catalog_session)
+  use _ <- result.try(
+    next.agents
+    |> list.try_each(fn(state) {
+      model_catalog.lookup(catalog, state.model_id)
+      |> result.map(fn(_) { Nil })
+      |> result.map_error(fn(_) { UnknownModel(state.id, state.model_id) })
+    }),
+  )
+  let body = encode_group(next) |> json.to_string |> bit_array.from_string
+  use _ <- result.try(
+    case
+      storage.put(
+        config.storage,
+        config.object_key,
+        body,
+        storage.IfUnchanged(object.metadata.version),
+      )
+    {
+      Ok(metadata) -> Ok(metadata)
+      Error(storage.PreconditionFailed(_)) ->
+        confirm_group_write(config.storage, config.object_key, body)
+      Error(error) -> Error(storage_error(error))
+    },
+  )
+  agent_profile.install(config.profiles)
+  Ok(next)
+}
+
 fn decode_group_body(body: BitArray) -> Result(AgentGroup, Error) {
   use body <- result.try(
     bit_array.to_string(body)

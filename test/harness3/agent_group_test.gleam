@@ -1892,6 +1892,105 @@ fn test_model() -> model_catalog.Model {
   )
 }
 
+pub fn dormant_group_reconfiguration_preserves_surviving_agents_test() {
+  let root = temporary_root("reconfigure-agent-group-test")
+  let backend = local.new(local.config(root))
+  let other_model =
+    model_catalog.Model(..test_model(), id: "other-model", name: "other")
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(catalog) = model_catalog.put_model(catalog, other_model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let transport = completing_transport("unused")
+  let lead_profile =
+    agent_profile.AgentProfile(
+      "lead-profile",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let removed_profile =
+    agent_profile.AgentProfile(
+      "removed-profile",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let added_profile =
+    agent_profile.AgentProfile(
+      "added-profile",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let historic = llm.Message(llm.User, [llm.Text("preserve this")])
+  let lead =
+    agent.State(
+      ..agent.state("lead", "model"),
+      profile_id: "lead-profile",
+      messages: [historic],
+      status: agent.Waiting,
+    )
+  let removed =
+    agent.State(
+      ..agent.state("removed", "model"),
+      profile_id: "removed-profile",
+      status: agent.Waiting,
+    )
+  let original_config =
+    agent_group.Config(
+      backend,
+      "groups/reconfigure",
+      [lead_profile, removed_profile],
+      10,
+      100,
+    )
+  let assert Ok(_) =
+    agent_group.create(
+      original_config,
+      agent_group.new("reconfigure", "catalog", [lead, removed]),
+    )
+  let changed_lead = agent.State(..lead, model_id: "other-model")
+  let added =
+    agent.State(
+      ..agent.state("added", "model"),
+      profile_id: "added-profile",
+      status: agent.Waiting,
+    )
+  let next_config =
+    agent_group.Config(
+      backend,
+      "groups/reconfigure",
+      [lead_profile, added_profile],
+      10,
+      100,
+    )
+  let assert Ok(updated) =
+    agent_group.reconfigure(next_config, [changed_lead, added])
+  assert updated.revision == 1
+  assert updated.execution == agent_group.Idle(0)
+  let assert [survivor, newcomer] = updated.agents
+  assert survivor.id == "lead"
+  assert survivor.model_id == "other-model"
+  assert survivor.messages == [historic]
+  assert newcomer.id == "added"
+  assert newcomer.status == agent.Waiting
+
+  let assert Ok(loaded) = agent_group.resume(next_config)
+  let assert Ok(running) = agent_group.wake(loaded)
+  let assert Error(agent_group.AlreadyClaimed(_, _)) =
+    agent_group.reconfigure(next_config, [changed_lead, added])
+  let assert Ok(Nil) = agent_group.stop(running)
+  remove_directory(root)
+}
+
 fn completing_transport(text: String) -> agent.ModelTransport {
   agent.model_transport(fn(_, _, consume) {
     let assert Ok(Nil) = consume(llm.MessageStart("message", "test-model"))

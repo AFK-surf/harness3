@@ -93,6 +93,8 @@ fn handle(
         Ok(session) -> json_response(200, session_json(session))
         Error(error) -> error_response(404, error)
       }
+    http.Put, ["api", "sessions", id] ->
+      update_session(service, id, request.body)
     http.Post, ["api", "sessions", id, "messages"] ->
       send_message(service, id, request.body)
     http.Post, ["api", "sessions", id, "agents", agent_id, "compact"] ->
@@ -112,6 +114,18 @@ fn create_session(service: Service, body: BitArray) -> Response(ResponseData) {
   case service.create_session(service, input) {
     Ok(session) -> json_response(201, session_json(session))
     Error(error) -> error_response(400, error)
+  }
+}
+
+fn update_session(
+  service: Service,
+  id: String,
+  body: BitArray,
+) -> Response(ResponseData) {
+  use input <- body_decoded(body, update_input_decoder())
+  case service.update_session(service, id, input) {
+    Ok(session) -> json_response(200, session_json(session))
+    Error(error) -> error_response(409, error)
   }
 }
 
@@ -289,7 +303,6 @@ fn session_json(session: Session) -> json.Json {
     #("title", json.string(metadata.title)),
     #("prompt", json.string(metadata.prompt)),
     #("workspace", json.string(metadata.workspace)),
-    #("model_id", json.string(metadata.model_id)),
     #("created_at", json.int(metadata.created_at)),
     #("revision", json.int(group.revision)),
     #("execution", execution_json(group.execution)),
@@ -492,6 +505,52 @@ fn create_input_decoder() -> decode.Decoder(service.CreateInput) {
     team_size,
     mcp_configuration_id,
   ))
+}
+
+fn update_input_decoder() -> decode.Decoder(service.UpdateInput) {
+  use name <- decode.field("name", decode.string)
+  use agents <- decode.field("agents", decode.list(of: edit_agent_decoder()))
+  decode.success(service.UpdateInput(name, agents))
+}
+
+fn edit_agent_decoder() -> decode.Decoder(service.AgentSpec) {
+  use id <- decode.field("id", decode.string)
+  use role <- decode.field("role", decode.string)
+  use kind <- decode.field("kind", decode.string)
+  use model_id <- decode.field("model_id", decode.string)
+  use mcp_configuration_id <- decode.optional_field(
+    "mcp_configuration_id",
+    None,
+    decode.optional(decode.string),
+  )
+  case kind, mcp_configuration_id {
+    "coding", _ ->
+      decode.success(service.AgentSpec(id, role, service.CodingAgent, model_id))
+    "researcher", _ ->
+      decode.success(service.AgentSpec(
+        id,
+        role,
+        service.ResearchAgent,
+        model_id,
+      ))
+    "mcp", Some(configuration_id) ->
+      decode.success(service.AgentSpec(
+        id,
+        role,
+        service.McpSpecialist(configuration_id),
+        model_id,
+      ))
+    "mcp", None ->
+      decode.failure(
+        service.AgentSpec("", "", service.ResearchAgent, ""),
+        "MCP agent is missing mcp_configuration_id",
+      )
+    _, _ ->
+      decode.failure(
+        service.AgentSpec("", "", service.ResearchAgent, ""),
+        "unknown agent kind",
+      )
+  }
 }
 
 fn mcp_configuration_json(

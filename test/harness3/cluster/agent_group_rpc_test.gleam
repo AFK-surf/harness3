@@ -130,11 +130,11 @@ pub fn wake_rpc_is_idempotent_and_precedes_routed_compaction_test() {
 
   let assert Ok("ok") =
     core.call(
-      host_ip,
-      host_port,
-      core.token(host),
-      agent_group_rpc.force_stop_method_name(),
-      "rpc-group",
+      entry_ip,
+      entry_port,
+      core.token(entry),
+      agent_group_rpc.stop_method_name(),
+      agent_group_rpc.stop_request("rpc-group"),
       decode.string,
     )
   assert !list.contains(agent_group_registry.alive_ids(), "rpc-group")
@@ -169,8 +169,18 @@ pub fn wake_rpc_is_idempotent_and_precedes_routed_compaction_test() {
       entry_ip,
       entry_port,
       core.token(entry),
-      agent_group_rpc.force_stop_method_name(),
-      "rpc-group",
+      agent_group_rpc.stop_method_name(),
+      agent_group_rpc.stop_request("rpc-group"),
+      decode.string,
+    )
+  // Stopping an already dormant group is idempotent and does not wake it.
+  let assert Ok("ok") =
+    core.call(
+      entry_ip,
+      entry_port,
+      core.token(entry),
+      agent_group_rpc.stop_method_name(),
+      agent_group_rpc.stop_request("rpc-group"),
       decode.string,
     )
   let assert Ok(snapshot) = agent_group.load(config)

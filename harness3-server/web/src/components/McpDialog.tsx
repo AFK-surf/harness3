@@ -7,6 +7,21 @@ import type {
   McpConfiguration,
   McpServer,
 } from "../types";
+import {
+  control,
+  dangerIconButton,
+  dialogActions,
+  dialogCard,
+  dialogHeading,
+  dialogTopline,
+  emptyPanel,
+  eyebrow,
+  field,
+  iconButton,
+  primaryButton,
+  sectionLabel,
+  smallGhostButton,
+} from "../ui";
 import { Modal } from "./Modal";
 
 interface McpDialogProps {
@@ -161,16 +176,16 @@ export function McpDialog({
   );
 
   return (
-    <Modal open={open} className="mcp-dialog" onClose={onClose}>
-      <div className="dialog-card">
-        <div className="dialog-topline" />
-        <div className="dialog-heading">
+    <Modal open={open} className="max-w-[980px]" onClose={onClose}>
+      <div className={dialogCard}>
+        <div className={dialogTopline} />
+        <div className={dialogHeading}>
           <div>
-            <p className="eyebrow">Global configuration</p>
+            <p className={eyebrow}>Global configuration</p>
             <h2>Manage MCP servers</h2>
           </div>
           <button
-            className="icon-button"
+            className={iconButton}
             aria-label="Close dialog"
             type="button"
             onClick={onClose}
@@ -179,22 +194,22 @@ export function McpDialog({
           </button>
         </div>
 
-        <div className="mcp-manager-layout">
-          <section className="mcp-installed-panel">
-            <div className="mcp-section-heading">
+        <div className="grid grid-cols-[minmax(0,.9fr)_minmax(0,1.1fr)] gap-6 max-[520px]:grid-cols-1">
+          <section className="min-w-0 border-r border-line-soft pr-[22px] max-[520px]:border-r-0 max-[520px]:border-b max-[520px]:pr-0 max-[520px]:pb-5">
+            <div className="mb-3 flex min-h-[42px] items-start justify-between">
               <div>
-                <span className="sidebar-label">Installed</span>
-                <p>Servers are discovered when an MCP specialist activates.</p>
+                <span className={sectionLabel}>Installed</span>
+                <p className="mt-1.5 mb-0 text-[10px] leading-normal text-faint">Servers are discovered when an MCP specialist activates.</p>
               </div>
             </div>
-            <div className="mcp-server-list">
+            <div className="flex max-h-[590px] flex-col gap-[10px] overflow-y-auto">
               {serverCount === 0 ? (
-                <div className="mcp-empty">No MCP servers installed yet.</div>
+                <div className={emptyPanel}>No MCP servers installed yet.</div>
               ) : configurations.map((configuration) => configuration.servers.length > 0 && (
-                <div className="mcp-configuration-card" key={configuration.id}>
-                  <div className="mcp-configuration-title">
-                    <strong>{configuration.label}</strong>
-                    <span>{configuration.id}</span>
+                <div className="overflow-hidden rounded-[10px] border border-line bg-[#0f1214]" key={configuration.id}>
+                  <div className="flex items-baseline justify-between gap-[10px] border-b border-line-soft bg-[#14181a] px-[11px] py-[9px]">
+                    <strong className="truncate text-[11px]">{configuration.label}</strong>
+                    <span className="font-mono text-[9px] text-faint">{configuration.id}</span>
                   </div>
                   {configuration.servers.map((server) => (
                     <McpServerRow
@@ -208,17 +223,17 @@ export function McpDialog({
             </div>
           </section>
 
-          <form className="mcp-add-form" onSubmit={(event) => void submit(event)}>
-            <div className="mcp-section-heading">
+          <form onSubmit={(event) => void submit(event)}>
+            <div className="mb-3 flex min-h-[42px] items-start justify-between">
               <div>
-                <span className="sidebar-label">Add server</span>
-                <p>Settings are stored globally and survive restarts.</p>
+                <span className={sectionLabel}>Add server</span>
+                <p className="mt-1.5 mb-0 text-[10px] leading-normal text-faint">Settings are stored globally and survive restarts.</p>
               </div>
             </div>
 
-            <label className="field">
+            <label className={field}>
               <span>Configuration</span>
-              <select
+              <select className={control}
                 value={selectedConfiguration}
                 onChange={(event) => chooseConfiguration(event.target.value)}
               >
@@ -230,10 +245,10 @@ export function McpDialog({
                 <option value="">＋ New configuration</option>
               </select>
             </label>
-            <div className="field-grid compact-grid">
-              <label className="field">
+            <div className="grid grid-cols-2 gap-3 max-[520px]:grid-cols-1 max-[520px]:gap-0">
+              <label className={field}>
                 <span>Configuration ID</span>
-                <input
+                <input className={control}
                   value={configurationId}
                   onChange={(event) => setConfigurationId(event.target.value)}
                   readOnly={Boolean(existingConfiguration)}
@@ -242,9 +257,9 @@ export function McpDialog({
                   required
                 />
               </label>
-              <label className="field">
+              <label className={field}>
                 <span>Configuration label</span>
-                <input
+                <input className={control}
                   value={configurationLabel}
                   onChange={(event) => setConfigurationLabel(event.target.value)}
                   readOnly={Boolean(existingConfiguration)}
@@ -253,10 +268,10 @@ export function McpDialog({
                 />
               </label>
             </div>
-            <div className="field-grid compact-grid">
-              <label className="field">
+            <div className="grid grid-cols-2 gap-3 max-[520px]:grid-cols-1 max-[520px]:gap-0">
+              <label className={field}>
                 <span>Server ID</span>
-                <input
+                <input className={control}
                   value={serverId}
                   onChange={(event) => setServerId(event.target.value)}
                   pattern="[A-Za-z0-9_-]+"
@@ -264,9 +279,9 @@ export function McpDialog({
                   required
                 />
               </label>
-              <label className="field">
+              <label className={field}>
                 <span>Timeout <small>milliseconds</small></span>
-                <input
+                <input className={control}
                   type="number"
                   min={1}
                   max={300_000}
@@ -276,9 +291,9 @@ export function McpDialog({
                 />
               </label>
             </div>
-            <label className="field">
+            <label className={field}>
               <span>Transport</span>
-              <select
+              <select className={control}
                 value={transportType}
                 onChange={(event) => setTransportType(
                   event.target.value as "streamable_http" | "stdio",
@@ -290,9 +305,9 @@ export function McpDialog({
             </label>
 
             {transportType === "streamable_http" ? (
-              <label className="field">
+              <label className={field}>
                 <span>Endpoint <small>absolute HTTP(S) URL</small></span>
-                <input
+                <input className={control}
                   type="url"
                   value={endpoint}
                   onChange={(event) => setEndpoint(event.target.value)}
@@ -302,26 +317,26 @@ export function McpDialog({
               </label>
             ) : (
               <>
-                <label className="field">
+                <label className={field}>
                   <span>Executable <small>absolute path</small></span>
-                  <input
+                  <input className={control}
                     value={executable}
                     onChange={(event) => setExecutable(event.target.value)}
                     placeholder="/usr/bin/node"
                     required
                   />
                 </label>
-                <label className="field">
+                <label className={field}>
                   <span>Arguments <small>JSON string array</small></span>
-                  <input
+                  <input className={control}
                     value={argumentsJson}
                     onChange={(event) => setArgumentsJson(event.target.value)}
                     placeholder='["/absolute/server.js"]'
                   />
                 </label>
-                <label className="field">
+                <label className={field}>
                   <span>Working directory <small>optional absolute path</small></span>
-                  <input
+                  <input className={control}
                     value={workingDirectory}
                     onChange={(event) => setWorkingDirectory(event.target.value)}
                     placeholder="/absolute/path"
@@ -330,13 +345,13 @@ export function McpDialog({
               </>
             )}
 
-            <div className="binding-heading">
+            <div className="mt-[5px] mb-2 flex items-center justify-between gap-3 text-[10px] font-semibold tracking-[.08em] text-muted uppercase">
               <span>{transportType === "streamable_http" ? "HTTP headers" : "Process environment"}</span>
-              <button className="ghost small" type="button" onClick={addBinding}>
+              <button className={smallGhostButton} type="button" onClick={addBinding}>
                 ＋ Add binding
               </button>
             </div>
-            <div className="binding-list">
+            <div className="flex flex-col gap-[7px]">
               {bindings.map((binding) => (
                 <BindingRow
                   key={binding.key}
@@ -348,13 +363,13 @@ export function McpDialog({
                 />
               ))}
             </div>
-            <p className="field-note">
+            <p className="mt-[9px] mb-[15px] text-[9px] leading-normal text-faint">
               Use an environment-variable binding for secrets when possible.
               Literal values are stored in plaintext and are never returned by the API.
             </p>
 
-            <div className="dialog-actions">
-              <button className="primary" type="submit" disabled={submitting}>
+            <div className={dialogActions}>
+              <button className={primaryButton} type="submit" disabled={submitting}>
                 {submitting ? "Adding…" : "Add server"}
               </button>
             </div>
@@ -377,17 +392,17 @@ function McpServerRow({ server, onRemove }: { server: McpServer; onRemove: () =>
     ? ` · ${server.transport.binding_count} binding${server.transport.binding_count === 1 ? "" : "s"}`
     : "";
   return (
-    <div className="mcp-server-row">
-      <div>
-        <strong>{server.id}</strong>
-        <small>
+    <div className="flex items-start justify-between gap-[10px] p-[11px] not-first:border-t not-first:border-line-soft">
+      <div className="min-w-0">
+        <strong className="block text-[11px]">{server.id}</strong>
+        <small className="mt-1 block text-[9px] text-faint">
           {kind} · {new Intl.NumberFormat().format(server.timeout_milliseconds)} ms
           {argumentCount}{bindingCount}
         </small>
-        <code title={location}>{location}</code>
+        <code className="mt-[7px] block truncate text-[9px] text-muted" title={location}>{location}</code>
       </div>
       <button
-        className="icon-button danger"
+        className={`${dangerIconButton} size-[26px] text-base`}
         type="button"
         aria-label={`Remove ${server.id}`}
         onClick={onRemove}
@@ -415,8 +430,9 @@ function BindingRow({
   }
 
   return (
-    <div className="binding-row">
+    <div className="grid grid-cols-[minmax(0,.8fr)_minmax(0,1fr)_minmax(0,1fr)_30px] gap-1.5 max-[520px]:grid-cols-[1fr_1fr_30px]">
       <input
+        className={`${control} min-w-0 p-2 text-[10px]`}
         aria-label="Binding name"
         value={binding.name}
         onChange={(event) => onChange((current) => ({
@@ -427,6 +443,7 @@ function BindingRow({
         required
       />
       <select
+        className={`${control} min-w-0 p-2 text-[10px]`}
         aria-label="Binding source"
         value={binding.value.type}
         onChange={(event) => updateValue({
@@ -437,6 +454,7 @@ function BindingRow({
         <option value="literal">Literal value</option>
       </select>
       <input
+        className={`${control} min-w-0 p-2 text-[10px] max-[520px]:col-span-full max-[520px]:row-start-2`}
         aria-label="Binding value"
         type={binding.value.type === "literal" ? "password" : "text"}
         value={binding.value.value}
@@ -447,7 +465,7 @@ function BindingRow({
         required
       />
       <button
-        className="icon-button"
+        className={`${iconButton} text-base`}
         type="button"
         aria-label="Remove binding"
         onClick={onRemove}

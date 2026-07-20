@@ -20,7 +20,7 @@ export function Modal({ open, className, onClose, children }: ModalProps) {
   return (
     <dialog
       ref={dialogRef}
-      className={className}
+      className={`w-[calc(100%-28px)] max-w-[680px] rounded-[15px] border border-[#333c40] bg-[#111518] p-0 text-ink shadow-[0_28px_100px_rgba(0,0,0,.65)] ${className ?? ""}`}
       onCancel={(event) => {
         event.preventDefault();
         onClose();

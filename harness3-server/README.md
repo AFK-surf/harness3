@@ -153,6 +153,7 @@ authentication and isolation.
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `GET /api/sessions/:id`
+- `PUT /api/sessions/:id`
 - `POST /api/sessions/:id/messages`
 - `POST /api/sessions/:id/agents/:agent_id/compact`
 - `POST /api/sessions/:id/stop`
@@ -167,6 +168,37 @@ Create request example:
   "mcp_configuration_id": "research"
 }
 ```
+
+Update request example:
+
+```json
+{
+  "name": "Release team",
+  "agents": [
+    {
+      "id": "lead",
+      "role": "Lead engineer with coding workspace access.",
+      "kind": "coding",
+      "model_id": "provider/model",
+      "mcp_configuration_id": null
+    },
+    {
+      "id": "researcher",
+      "role": "MCP research specialist that reports to the lead.",
+      "kind": "mcp",
+      "model_id": "provider/other-model",
+      "mcp_configuration_id": "research"
+    }
+  ]
+}
+```
+
+The **Edit team** button changes the group name, each agent's model and resource
+profile, and adds or removes agents. A name-only edit does not interrupt a live
+group. Roster or model changes stop the group first through the host-routed RPC;
+surviving agents retain their durable history and plugin state, added agents
+start dormant, and removed agents are deleted. Existing agent IDs are immutable
+in the UI; replace an agent to give it a different ID.
 
 `mcp_configuration_id` is optional. If omitted or `null` for a team of at least
 two, the first enabled configuration is selected. A lead-only team,
@@ -191,7 +223,8 @@ woken automatically, while an already-active team is left running in place.
 ## Web UI development
 
 The UI source is a lightweight React and TypeScript application under `web/`,
-built with Vite. It has no separate production runtime: `npm run build` writes
+built with Vite and Tailwind CSS. It has no separate production runtime:
+`npm run build` writes
 fixed `app.js`, `styles.css`, and `index.html` assets to `priv/static/` for the
 Gleam server to serve. These generated files are intentionally ignored; build
 or packaging workflows must generate them before compiling or releasing the

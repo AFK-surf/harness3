@@ -25,7 +25,7 @@ fn temporary_root(label: String) -> String {
 }
 
 fn models_json() -> String {
-  "{\"providers\":{\"test\":{\"name\":\"Test Provider\",\"baseUrl\":\"https://example.test/api/v3\",\"api\":\"openai-completions\",\"apiKey\":\"test-secret\",\"models\":[{\"id\":\"model-1\",\"name\":\"Model One\",\"contextWindow\":32768,\"maxTokens\":4096}]}}}"
+  "{\"providers\":{\"test\":{\"name\":\"Test Provider\",\"baseUrl\":\"https://example.test/api/v3\",\"api\":\"openai-completions\",\"apiKey\":\"test-secret\",\"models\":[{\"id\":\"model-1\",\"name\":\"Model One\",\"contextWindow\":32768,\"maxTokens\":4096},{\"id\":\"model-2\",\"name\":\"Model Two\",\"contextWindow\":65536,\"maxTokens\":8192}]}}}"
 }
 
 fn mcp_server_script() -> String {
@@ -120,12 +120,14 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     simplifile.write(to: mcp_path, contents: mcp_config_json())
 
   let assert Ok(models) = config.load_models(models_path)
-  let assert [model] = models
+  let assert [model, second_model] = models
   assert model.id == "test/model-1"
   assert model.remote_id == "model-1"
   assert model.display_name == "Model One · Test Provider"
   assert model.model_type == model_catalog.OpenAIChatCompletions
   assert model.context_window_tokens == 32_768
+  assert second_model.id == "test/model-2"
+  assert second_model.context_window_tokens == 65_536
 
   envoy.set("HARNESS3_MODELS_PATH", models_path)
   envoy.set("HARNESS3_DATA_DIR", data_path)
@@ -137,7 +139,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   envoy.set("HARNESS3_MCP_CONFIG_PATH", mcp_path)
   let assert Ok(first) = service.start()
   let assert Ok(second) = service.start()
-  assert list.length(service.models(first)) == 1
+  assert list.length(service.models(first)) == 2
   assert service.workspace_root(second) == workspace
   let assert [mcp_configuration] = service.mcp_configurations(second)
   assert mcp_configuration.id == "research"
@@ -175,6 +177,15 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let assert Error(unknown_compaction_agent) =
     service.request_compaction(second, metadata.id, "missing")
   assert string.contains(unknown_compaction_agent, "unknown agent")
+  let assert Ok(service.Session(metadata: renamed, group: renamed_group)) =
+    service.update_session(
+      second,
+      metadata.id,
+      service.UpdateInput("Named while active", metadata.agents),
+    )
+  assert renamed.title == "Named while active"
+  let assert agent_group.Claimed(..) = renamed_group.execution
+  assert list.contains(agent_group_registry.alive_ids(), metadata.id)
 
   let assert Ok([lead_profile, researcher_profile, implementer_profile]) =
     agent_profile.profiles([
@@ -249,6 +260,45 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
       ),
     )
 
+  let assert [lead_spec, researcher_spec, _implementer_spec] = metadata.agents
+  let desired_agents = [
+    service.AgentSpec(..lead_spec, model_id: "test/model-2"),
+    researcher_spec,
+    service.AgentSpec(
+      id: "verifier",
+      role: "Verification specialist with coding workspace access.",
+      kind: service.CodingAgent,
+      model_id: "test/model-2",
+    ),
+  ]
+  let assert Error(unknown_model) =
+    service.update_session(
+      second,
+      metadata.id,
+      service.UpdateInput("Edited coding team", [
+        service.AgentSpec(..lead_spec, model_id: "missing/model"),
+      ]),
+    )
+  assert string.contains(unknown_model, "unknown model")
+  let assert Ok(service.Session(metadata: edited, group: edited_group)) =
+    service.update_session(
+      second,
+      metadata.id,
+      service.UpdateInput("Edited coding team", desired_agents),
+    )
+  assert edited.title == "Edited coding team"
+  let assert [edited_lead, _, edited_verifier] = edited.agents
+  assert edited_lead.model_id == "test/model-2"
+  assert edited_verifier.id == "verifier"
+  assert edited_group.execution == agent_group.Idle(1)
+  let assert [lead_state, _, verifier_state] = edited_group.agents
+  assert lead_state.id == "lead"
+  assert lead_state.model_id == "test/model-2"
+  assert verifier_state.id == "verifier"
+  assert verifier_state.status == agent.Waiting
+  let assert Ok([_]) = agent_profile.profiles([metadata.id <> ":verifier"])
+  let assert Error(_) = agent_profile.profiles([metadata.id <> ":implementer"])
+
   let assert Ok(Nil) = service.stop_session(second, metadata.id)
   let seeded_ui_server =
     mcp_configuration.Server(
@@ -268,6 +318,14 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let assert [after_seed_configuration] =
     service.mcp_configurations(after_seed_restart)
   assert list.contains(after_seed_configuration.servers, seeded_ui_server)
+  let assert Ok(service.Session(
+    metadata: persisted_edit,
+    group: persisted_group,
+  )) = service.get_session(after_seed_restart, metadata.id)
+  assert persisted_edit.title == "Edited coding team"
+  let assert [persisted_lead, _, persisted_verifier] = persisted_group.agents
+  assert persisted_lead.model_id == "test/model-2"
+  assert persisted_verifier.id == "verifier"
   service.stop(after_seed_restart)
 
   envoy.unset("HARNESS3_MCP_CONFIG_PATH")

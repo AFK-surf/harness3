@@ -29,7 +29,7 @@ through storage objects (CAS writes, leases) plus token-authenticated HTTP RPC.
 | `cluster/core` | Per-node HTTP RPC listener (Erlang-term-over-HTTP), membership publication, recovery bootstrap |
 | `cluster/distributed_lock` | Lease-based lock built on storage CAS |
 | `cluster/recovery` | Leader-elected scanner that re-dispatches orphaned groups |
-| `cluster/agent_group_rpc` | RPC methods: resume/wake/message/force-stop agent groups, routing between nodes |
+| `cluster/agent_group_rpc` | RPC methods: resume/wake/message/stop/force-stop agent groups, routing between nodes |
 
 ---
 
@@ -379,6 +379,11 @@ match a concurrent same-owner claim from the same wall-clock second.
   processes, no registry entry, no index entry.
 - `resume` / `resume_registered` — load + validate; `resume_registered` reconstructs the
   profile list from the node's installed profiles (only for agents in Ready status).
+- `reconfigure` — requires a dormant group, validates the replacement roster,
+  profiles, and per-agent model IDs, then CAS-replaces the roster while advancing
+  the revision and retaining the execution epoch. Callers supply preserved state
+  for surviving agents and fresh state for additions; claimed groups fail with
+  `AlreadyClaimed` so an active coordinator cannot overwrite the edit.
 - `wake` (`wake_as…`) — re-reads the model catalog, validates models for Ready agents,
   requires the lease to be absent/expired (`AlreadyClaimed` otherwise), CAS-claims the
   group (epoch+1; queued `pending_messages` are folded into `messages` and agents made
@@ -520,6 +525,10 @@ that scan cycle.
   providers reject. The hint can produce consecutive user messages, which every
   supported provider accepts. Never wakes a dormant group.
 - `force_stop_agent_group(group_id)` — local registry force-stop.
+- `stop_agent_group(group_id, visited)` — idempotent host-routed stop. A local live
+  group is stopped directly; otherwise the newest running index and membership
+  locate its host and redirect with loop detection. A dormant or missing group is
+  already stopped and succeeds without waking it.
 
 ### 8.5 Node-local registries
 

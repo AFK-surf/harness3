@@ -16,13 +16,14 @@ import harness3/agent_group_registry
 import harness3/agent_profile
 import harness3/cluster/agent_group_rpc
 import harness3/cluster/core
+import harness3/llm
 import harness3/model_catalog
 import harness3/plugin
 import harness3/plugin/cloud_storage
 import harness3/plugin/mcp
 import harness3/plugin/mcp/catalog as mcp_catalog
 import harness3/plugin/mcp/configuration as mcp_configuration
-import harness3/storage.{type Storage}
+import harness3/storage.{type Storage, type VersionToken}
 import harness3_server/coding_plugin
 import harness3_server/config.{type ModelConfig}
 import harness3_server/storage_config
@@ -53,7 +54,7 @@ pub type AgentKind {
 }
 
 pub type AgentSpec {
-  AgentSpec(id: String, role: String, kind: AgentKind)
+  AgentSpec(id: String, role: String, kind: AgentKind, model_id: String)
 }
 
 pub type SessionMetadata {
@@ -62,7 +63,6 @@ pub type SessionMetadata {
     title: String,
     prompt: String,
     workspace: String,
-    model_id: String,
     created_at: Int,
     agents: List(AgentSpec),
   )
@@ -79,6 +79,10 @@ pub type CreateInput {
     team_size: Int,
     mcp_configuration_id: Option(String),
   )
+}
+
+pub type UpdateInput {
+  UpdateInput(name: String, agents: List(AgentSpec))
 }
 
 pub opaque type Service {
@@ -167,14 +171,13 @@ pub fn create_session(
     |> result.map_error(simplifile.describe_error),
   )
   let id = new_id()
-  let agents = team(input.team_size, mcp_configuration_id)
+  let agents = team(input.team_size, mcp_configuration_id, input.model_id)
   let metadata =
     SessionMetadata(
       id:,
       title: "New coding session",
       prompt: "",
       workspace:,
-      model_id: input.model_id,
       created_at: system_time(Second),
       agents:,
     )
@@ -231,6 +234,137 @@ pub fn list_sessions(service: Service) -> Result(List(Session), String) {
 pub fn get_session(service: Service, id: String) -> Result(Session, String) {
   use metadata <- result.try(load_metadata(service, id))
   load_session(service, metadata)
+}
+
+/// Replaces a session's durable name and agent roster. Roster changes stop
+/// running agents through the host-routed RPC first; surviving agent histories
+/// and plugin state are retained, while newly added agents start dormant. A
+/// name-only update does not interrupt a running group.
+pub fn update_session(
+  service: Service,
+  id: String,
+  input: UpdateInput,
+) -> Result(Session, String) {
+  use agents <- result.try(validate_update(service, input))
+  use metadata_object <- result.try(
+    storage.get(service.storage, metadata_key(id))
+    |> result.map_error(fn(error) { string.inspect(error) }),
+  )
+  use current_metadata <- result.try(decode_metadata_body(metadata_object.body))
+  let next_metadata =
+    SessionMetadata(..current_metadata, title: string.trim(input.name), agents:)
+  let metadata_body =
+    encode_metadata(next_metadata) |> json.to_string |> bit_array.from_string
+  case agents == current_metadata.agents {
+    True -> {
+      use _ <- result.try(persist_metadata_update(
+        service,
+        id,
+        metadata_body,
+        metadata_object.metadata.version,
+      ))
+      load_session(service, next_metadata)
+    }
+    False ->
+      update_session_roster(
+        service,
+        id,
+        current_metadata,
+        next_metadata,
+        metadata_body,
+        metadata_object.metadata.version,
+      )
+  }
+}
+
+fn update_session_roster(
+  service: Service,
+  id: String,
+  current_metadata: SessionMetadata,
+  next_metadata: SessionMetadata,
+  metadata_body: BitArray,
+  metadata_version: VersionToken,
+) -> Result(Session, String) {
+  // Construct every profile before stopping anything. A missing MCP
+  // configuration or invalid plugin graph must leave the live team untouched.
+  use next_config <- result.try(group_config(service, next_metadata))
+  use _ <- result.try(stop_session(service, id))
+  use current_config <- result.try(group_config(service, current_metadata))
+  use current_group <- result.try(
+    agent_group.load(current_config)
+    |> result.map_error(fn(error) {
+      "could not load stopped agent group: " <> string.inspect(error)
+    }),
+  )
+  let next_states = reconcile_agents(current_group.agents, next_metadata)
+  use next_group <- result.try(
+    agent_group.reconfigure(next_config, next_states)
+    |> result.map_error(fn(error) {
+      "could not update agent group: " <> string.inspect(error)
+    }),
+  )
+  case persist_metadata_update(service, id, metadata_body, metadata_version) {
+    Ok(Nil) -> {
+      let retained_ids =
+        list.map(next_metadata.agents, fn(spec) { profile_id(id, spec.id) })
+      current_metadata.agents
+      |> list.map(fn(spec) { profile_id(id, spec.id) })
+      |> list.filter(fn(profile) { !list.contains(retained_ids, profile) })
+      |> agent_profile.uninstall
+      Ok(Session(next_metadata, next_group))
+    }
+    Error(error) -> {
+      let rollback =
+        agent_group.reconfigure(current_config, current_group.agents)
+      case rollback {
+        Ok(_) -> {
+          let previous_ids =
+            list.map(current_metadata.agents, fn(spec) {
+              profile_id(id, spec.id)
+            })
+          next_metadata.agents
+          |> list.map(fn(spec) { profile_id(id, spec.id) })
+          |> list.filter(fn(profile) { !list.contains(previous_ids, profile) })
+          |> agent_profile.uninstall
+          Error("could not persist updated session metadata: " <> error)
+        }
+        Error(rollback_error) ->
+          Error(
+            "could not persist updated session metadata: "
+            <> error
+            <> "; agent-group rollback also failed: "
+            <> string.inspect(rollback_error),
+          )
+      }
+    }
+  }
+}
+
+fn persist_metadata_update(
+  service: Service,
+  id: String,
+  intended_body: BitArray,
+  version: VersionToken,
+) -> Result(Nil, String) {
+  let key = metadata_key(id)
+  case
+    storage.put(
+      service.storage,
+      key,
+      intended_body,
+      storage.IfUnchanged(version),
+    )
+  {
+    Ok(_) -> Ok(Nil)
+    Error(storage.PreconditionFailed(_)) ->
+      case storage.get(service.storage, key) {
+        Ok(object) if object.body == intended_body -> Ok(Nil)
+        Ok(_) | Error(storage.PreconditionFailed(_)) ->
+          Error("session metadata changed concurrently")
+        Error(error) -> Error(string.inspect(error))
+      }
+    Error(error) -> Error(string.inspect(error))
+  }
 }
 
 pub fn send_message(
@@ -353,17 +487,26 @@ fn deliver_registered(
 
 pub fn stop_session(service: Service, id: String) -> Result(Nil, String) {
   use metadata <- result.try(load_metadata(service, id))
-  case agent_group_registry.force_stop(id) {
-    Ok(Nil) | Error(agent_group_registry.NotFound(_)) -> {
-      // Per-session profiles are node-global ETS entries; a later resume
-      // re-installs them, so drop them now instead of growing forever.
-      agent_profile.uninstall(
-        list.map(metadata.agents, fn(spec) { profile_id(metadata.id, spec.id) }),
+  use session <- result.try(load_session(service, metadata))
+  let Session(group:, ..) = session
+  use _ <- result.try(case group.execution {
+    agent_group.Claimed(..) ->
+      cluster_call(
+        service,
+        agent_group_rpc.stop_method_name(),
+        agent_group_rpc.stop_request(id),
+        decode.string,
       )
-      Ok(Nil)
-    }
-    Error(error) -> Error(string.inspect(error))
-  }
+      |> result.map(fn(_) { Nil })
+      |> result.map_error(fn(error) { "could not stop session: " <> error })
+    agent_group.Idle(_) | agent_group.Completed(_) -> Ok(Nil)
+  })
+  // Per-session profiles are node-global ETS entries; a later resume
+  // re-installs them, so drop them now instead of growing forever.
+  agent_profile.uninstall(
+    list.map(metadata.agents, fn(spec) { profile_id(metadata.id, spec.id) }),
+  )
+  Ok(Nil)
 }
 
 fn resolve_workspace_root() -> Result(String, String) {
@@ -583,6 +726,55 @@ fn validate_create(
   }
 }
 
+fn validate_update(
+  service: Service,
+  input: UpdateInput,
+) -> Result(List(AgentSpec), String) {
+  use _ <- result.try(case string.trim(input.name) {
+    "" -> Error("agent group name cannot be empty")
+    _ -> Ok(Nil)
+  })
+  use _ <- result.try(case input.agents {
+    [] -> Error("agent group must contain at least one agent")
+    _ -> Ok(Nil)
+  })
+  input.agents
+  |> list.try_fold([], fn(validated: List(AgentSpec), spec) {
+    let normalized =
+      AgentSpec(..spec, id: string.trim(spec.id), role: string.trim(spec.role))
+    use _ <- result.try(case normalized.id {
+      "" -> Error("agent id cannot be empty")
+      _ -> Ok(Nil)
+    })
+    use _ <- result.try(case normalized.role {
+      "" -> Error("agent role cannot be empty: " <> normalized.id)
+      _ -> Ok(Nil)
+    })
+    use _ <- result.try(
+      case list.any(validated, fn(agent) { agent.id == normalized.id }) {
+        True -> Error("duplicate agent id: " <> normalized.id)
+        False -> Ok(Nil)
+      },
+    )
+    use _ <- result.try(
+      case
+        list.any(service.models, fn(model) { model.id == normalized.model_id })
+      {
+        True -> Ok(Nil)
+        False -> Error("unknown model: " <> normalized.model_id)
+      },
+    )
+    use _ <- result.try(case normalized.kind {
+      CodingAgent | ResearchAgent -> Ok(Nil)
+      McpSpecialist(configuration_id) ->
+        mcp.configuration(service.mcp_runtime, configuration_id)
+        |> result.map(fn(_) { Nil })
+    })
+    Ok([normalized, ..validated])
+  })
+  |> result.map(list.reverse)
+}
+
 fn select_mcp_configuration(
   service: Service,
   input: CreateInput,
@@ -674,7 +866,10 @@ fn initialize_session_metadata(
           let updated =
             SessionMetadata(
               ..current,
-              title: title(first_message),
+              title: case current.title {
+                "New coding session" -> title(first_message)
+                title -> title
+              },
               prompt: first_message,
             )
           case
@@ -784,13 +979,63 @@ fn capability_instructions(kind: AgentKind) -> String {
 fn initial_states(metadata: SessionMetadata) -> List(agent.State) {
   metadata.agents
   |> list.map(fn(spec) {
-    let base = agent.state(spec.id, metadata.model_id)
+    let base = agent.state(spec.id, spec.model_id)
     agent.State(
       ..base,
       profile_id: profile_id(metadata.id, spec.id),
       status: agent.Waiting,
     )
   })
+}
+
+fn reconcile_agents(
+  current: List(agent.State),
+  metadata: SessionMetadata,
+) -> List(agent.State) {
+  metadata.agents
+  |> list.map(fn(spec) {
+    case list.find(current, fn(state) { state.id == spec.id }) {
+      Error(_) -> {
+        let base = agent.state(spec.id, spec.model_id)
+        agent.State(
+          ..base,
+          profile_id: profile_id(metadata.id, spec.id),
+          status: agent.Waiting,
+        )
+      }
+      Ok(state) if state.model_id == spec.model_id ->
+        agent.State(..state, profile_id: profile_id(metadata.id, spec.id))
+      Ok(state) ->
+        agent.State(
+          ..state,
+          profile_id: profile_id(metadata.id, spec.id),
+          model_id: spec.model_id,
+          messages: sanitize_messages(state.messages),
+          context_messages: option.map(
+            state.context_messages,
+            sanitize_messages,
+          ),
+          pending_messages: sanitize_messages(state.pending_messages),
+          last_catalog_revision: None,
+          last_context_tokens: None,
+        )
+    }
+  })
+}
+
+fn sanitize_messages(messages: List(llm.Message)) -> List(llm.Message) {
+  list.map(messages, fn(message) {
+    llm.Message(..message, content: list.map(message.content, sanitize_content))
+  })
+}
+
+fn sanitize_content(content: llm.Content) -> llm.Content {
+  case content {
+    llm.Reasoning(summary, _) -> llm.Reasoning(summary, None)
+    llm.ToolResult(id, content, is_error) ->
+      llm.ToolResult(id, list.map(content, sanitize_content), is_error)
+    content -> content
+  }
 }
 
 fn validate_agent(
@@ -803,7 +1048,11 @@ fn validate_agent(
   }
 }
 
-fn team(size: Int, mcp_configuration_id: Option(String)) -> List(AgentSpec) {
+fn team(
+  size: Int,
+  mcp_configuration_id: Option(String),
+  model_id: String,
+) -> List(AgentSpec) {
   let #(researcher_kind, researcher_role) = case mcp_configuration_id {
     Some(id) -> #(
       McpSpecialist(id),
@@ -821,17 +1070,20 @@ fn team(size: Int, mcp_configuration_id: Option(String)) -> List(AgentSpec) {
       "lead",
       "Lead engineer. Has `coding.read`, `coding.write`, and `coding.exec` access to the selected workspace, `cloud_storage.*` access to shared durable objects, and `team.message_agent` access to every subagent; owns implementation, delegation, and verification.",
       CodingAgent,
+      model_id,
     ),
-    AgentSpec("researcher", researcher_role, researcher_kind),
+    AgentSpec("researcher", researcher_role, researcher_kind, model_id),
     AgentSpec(
       "implementer",
       "Implementation specialist. Has `coding.read`, `coding.write`, and `coding.exec` access to the selected workspace and `cloud_storage.*` access to shared durable objects; `team.message_agent` can target only the lead agent.",
       CodingAgent,
+      model_id,
     ),
     AgentSpec(
       "reviewer",
       "Reviewer and test engineer. Has `coding.read`, `coding.write`, and `coding.exec` access to the selected workspace and `cloud_storage.*` access to shared durable objects; `team.message_agent` can target only the lead agent.",
       CodingAgent,
+      model_id,
     ),
   ]
   |> list.take(size)
@@ -864,12 +1116,11 @@ fn group_key(id: String) -> String {
 
 fn encode_metadata(metadata: SessionMetadata) -> json.Json {
   json.object([
-    #("schema_version", json.int(2)),
+    #("schema_version", json.int(3)),
     #("id", json.string(metadata.id)),
     #("title", json.string(metadata.title)),
     #("prompt", json.string(metadata.prompt)),
     #("workspace", json.string(metadata.workspace)),
-    #("model_id", json.string(metadata.model_id)),
     #("created_at", json.int(metadata.created_at)),
     #(
       "agents",
@@ -883,6 +1134,7 @@ fn encode_metadata(metadata: SessionMetadata) -> json.Json {
           #("id", json.string(agent.id)),
           #("role", json.string(agent.role)),
           #("kind", json.string(kind)),
+          #("model_id", json.string(agent.model_id)),
           #(
             "mcp_configuration_id",
             json.nullable(mcp_configuration_id, json.string),
@@ -899,23 +1151,21 @@ fn metadata_decoder() -> decode.Decoder(SessionMetadata) {
   use title <- decode.field("title", decode.string)
   use prompt <- decode.field("prompt", decode.string)
   use workspace <- decode.field("workspace", decode.string)
-  use model_id <- decode.field("model_id", decode.string)
   use created_at <- decode.field("created_at", decode.int)
   use agents <- decode.field("agents", decode.list(of: agent_spec_decoder()))
   case schema {
-    2 ->
+    3 ->
       decode.success(SessionMetadata(
         id,
         title,
         prompt,
         workspace,
-        model_id,
         created_at,
         agents,
       ))
     _ ->
       decode.failure(
-        SessionMetadata("", "", "", "", "", 0, []),
+        SessionMetadata("", "", "", "", 0, []),
         "unsupported session metadata schema",
       )
   }
@@ -925,22 +1175,29 @@ fn agent_spec_decoder() -> decode.Decoder(AgentSpec) {
   use id <- decode.field("id", decode.string)
   use role <- decode.field("role", decode.string)
   use kind <- decode.field("kind", decode.string)
+  use model_id <- decode.field("model_id", decode.string)
   use mcp_configuration_id <- decode.optional_field(
     "mcp_configuration_id",
     None,
     decode.optional(decode.string),
   )
   case kind, mcp_configuration_id {
-    "coding", _ -> decode.success(AgentSpec(id, role, CodingAgent))
-    "researcher", _ -> decode.success(AgentSpec(id, role, ResearchAgent))
+    "coding", _ -> decode.success(AgentSpec(id, role, CodingAgent, model_id))
+    "researcher", _ ->
+      decode.success(AgentSpec(id, role, ResearchAgent, model_id))
     "mcp", Some(configuration_id) ->
-      decode.success(AgentSpec(id, role, McpSpecialist(configuration_id)))
+      decode.success(AgentSpec(
+        id,
+        role,
+        McpSpecialist(configuration_id),
+        model_id,
+      ))
     "mcp", None ->
       decode.failure(
-        AgentSpec("", "", ResearchAgent),
+        AgentSpec("", "", ResearchAgent, ""),
         "MCP agent is missing mcp_configuration_id",
       )
     _, _ ->
-      decode.failure(AgentSpec("", "", ResearchAgent), "unknown agent kind")
+      decode.failure(AgentSpec("", "", ResearchAgent, ""), "unknown agent kind")
   }
 }

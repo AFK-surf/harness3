@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, errorMessage } from "./api";
+import { EditGroupDialog } from "./components/EditGroupDialog";
 import { EmptyState } from "./components/EmptyState";
 import { McpDialog } from "./components/McpDialog";
 import { NewSessionDialog } from "./components/NewSessionDialog";
@@ -16,6 +17,7 @@ import type {
   ModelsResponse,
   Session,
   SessionsResponse,
+  UpdateSessionInput,
 } from "./types";
 
 interface ToastState {
@@ -34,6 +36,7 @@ export function App() {
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [mcpOpen, setMcpOpen] = useState(false);
+  const [editGroupOpen, setEditGroupOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const [compactionRequesting, setCompactionRequesting] = useState(false);
   const [scrollRequest, setScrollRequest] = useState(0);
@@ -194,6 +197,24 @@ export function App() {
     showToast("Session ready. Send the first message to start an agent.");
   }
 
+  async function updateSession(input: UpdateSessionInput) {
+    if (!current) return;
+    const session = await api<Session>(
+      `/api/sessions/${encodeURIComponent(current.id)}`,
+      {
+        method: "PUT",
+        body: JSON.stringify(input),
+      },
+    );
+    setCurrent(session);
+    setSelectedAgentId((selected) => session.agents.some(
+      (agent) => agent.id === selected,
+    ) ? selected : session.agents[0]?.id ?? null);
+    setEditGroupOpen(false);
+    await loadSessions();
+    showToast("Agent group updated. New agents are ready to be messaged.");
+  }
+
   async function sendMessage(agentId: string, message: string): Promise<boolean> {
     if (!current || sending) return false;
     setSending(true);
@@ -282,7 +303,7 @@ export function App() {
 
   return (
     <>
-      <div className="shell">
+      <div className="grid h-screen grid-cols-[274px_minmax(0,1fr)] max-[1020px]:grid-cols-[224px_minmax(0,1fr)] max-[780px]:block max-[780px]:h-auto max-[780px]:min-h-screen">
         <Sidebar
           sessions={sessions}
           selectedSessionId={current?.id ?? null}
@@ -292,7 +313,7 @@ export function App() {
           onManageMcp={() => setMcpOpen(true)}
           onSelectSession={(id) => void selectSession(id)}
         />
-        <main className="main">
+        <main className="min-h-0 min-w-0 max-[780px]:min-h-[calc(100vh-66px)]">
           {current ? (
             <SessionWorkspace
               session={current}
@@ -306,6 +327,7 @@ export function App() {
                 setScrollRequest((request) => request + 1);
               }}
               onSendMessage={sendMessage}
+              onEdit={() => setEditGroupOpen(true)}
               onStop={() => void stopSession()}
               onCompact={() => void compactSelectedAgent()}
             />
@@ -330,9 +352,20 @@ export function App() {
         onRemove={removeMcpServer}
         onError={(message) => showToast(message, true)}
       />
+      {current ? (
+        <EditGroupDialog
+          open={editGroupOpen}
+          session={current}
+          models={models}
+          configurations={mcpConfigurations}
+          onClose={() => setEditGroupOpen(false)}
+          onSave={updateSession}
+          onError={(message) => showToast(message, true)}
+        />
+      ) : null}
 
       <div
-        className={`toast${toast ? " visible" : ""}${toast?.error ? " error" : ""}`}
+        className={`pointer-events-none fixed right-[22px] bottom-[22px] z-20 max-w-[390px] rounded-[9px] border px-[14px] py-[11px] text-[11px] text-ink shadow-[0_14px_45px_rgba(0,0,0,.4)] transition duration-200 ${toast ? "translate-y-0 opacity-100" : "translate-y-5 opacity-0"} ${toast?.error ? "border-[#623a36] bg-[#241615]" : "border-[#48573d] bg-[#192015]"}`}
         role="status"
       >
         {toast?.message}

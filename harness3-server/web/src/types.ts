@@ -157,7 +157,6 @@ export interface Session {
   title: string;
   prompt: string;
   workspace: string;
-  model_id: string;
   created_at: number;
   revision: number;
   execution: Execution;
@@ -173,6 +172,19 @@ export interface CreateSessionInput {
   workspace: string;
   team_size: number;
   mcp_configuration_id: string | null;
+}
+
+export interface UpdateAgentInput {
+  id: string;
+  role: string;
+  kind: Agent["kind"];
+  mcp_configuration_id: string | null;
+  model_id: string;
+}
+
+export interface UpdateSessionInput {
+  name: string;
+  agents: UpdateAgentInput[];
 }
 
 export type AddMcpTransport =

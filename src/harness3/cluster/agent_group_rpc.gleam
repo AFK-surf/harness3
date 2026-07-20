@@ -98,6 +98,14 @@ pub fn plugin(storage: Storage, lease_duration_seconds: Int) -> core.RpcPlugin {
         route_compaction(storage, context, group_id, agent_id, visited)
       },
     ),
+    core.contextual_method(
+      stop_method_name(),
+      stop_decoder(),
+      fn(context, request) {
+        let #(group_id, visited) = request
+        route_stop(storage, context, group_id, visited)
+      },
+    ),
     core.method(force_stop_method_name(), decode.string, fn(group_id) {
       agent_group_registry.force_stop(group_id)
       |> result.map(fn(_) { "ok" })
@@ -141,6 +149,12 @@ pub fn compaction_request(
   agent_id: String,
 ) -> #(String, String, List(String)) {
   #(group_id, agent_id, [])
+}
+
+/// Builds a host-routed stop request. Stopping an already dormant group is
+/// idempotent and succeeds without waking it.
+pub fn stop_request(group_id: String) -> #(String, List(String)) {
+  #(group_id, [])
 }
 
 fn load_group(
@@ -404,6 +418,45 @@ fn route_compaction(
   )
 }
 
+fn route_stop(
+  backend: Storage,
+  context: core.RpcContext,
+  group_id: String,
+  visited: List(String),
+) -> Result(String, core.RpcError) {
+  let current = core.context_token(context)
+  use _ <- result.try(check_loop(current, visited))
+  case agent_group_registry.force_stop(group_id) {
+    Ok(Nil) -> {
+      core.context_refresh_membership(context)
+      Ok("ok")
+    }
+    Error(agent_group_registry.NotFound(_)) -> {
+      use nodes <- result.try(alive_memberships(backend))
+      case group_host(backend, group_id, nodes) {
+        Error(_) -> Ok("ok")
+        Ok(host) if host.token == current -> Ok("ok")
+        Ok(host) -> {
+          use _ <- result.try(check_redirect(host.token, visited))
+          core.call(
+            host.ip,
+            host.port,
+            host.token,
+            stop_method_name(),
+            #(group_id, [current, ..visited]),
+            decode.string,
+          )
+          |> result.map_error(fn(error) {
+            core.HandlerError("stop_redirect_failed", string.inspect(error))
+          })
+        }
+      }
+    }
+    Error(error) ->
+      Error(core.HandlerError("stop_failed", string.inspect(error)))
+  }
+}
+
 fn group_host(
   backend: Storage,
   group_id: String,
@@ -612,8 +665,21 @@ fn compaction_decoder() -> decode.Decoder(#(String, String, List(String))) {
   })
 }
 
+fn stop_decoder() -> decode.Decoder(#(String, List(String))) {
+  decode.at([0], decode.string)
+  |> decode.then(fn(group_id) {
+    decode.at([1], decode.list(of: decode.string))
+    |> decode.map(fn(visited) { #(group_id, visited) })
+  })
+}
+
 pub fn force_stop_method_name() -> String {
   "force_stop_agent_group"
+}
+
+/// Host-routed idempotent stop RPC. It never wakes a dormant group.
+pub fn stop_method_name() -> String {
+  "stop_agent_group"
 }
 
 /// Internal RPC used by the recovery leader to place a group on a node.

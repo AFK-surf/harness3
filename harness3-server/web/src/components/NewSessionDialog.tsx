@@ -5,6 +5,18 @@ import type {
   McpConfiguration,
   Model,
 } from "../types";
+import {
+  control,
+  dialogActions,
+  dialogCard,
+  dialogHeading,
+  dialogTopline,
+  eyebrow,
+  field,
+  ghostButton,
+  iconButton,
+  primaryButton,
+} from "../ui";
 import { Modal } from "./Modal";
 
 interface NewSessionDialogProps {
@@ -76,15 +88,15 @@ export function NewSessionDialog({
 
   return (
     <Modal open={open} onClose={onClose}>
-      <form className="dialog-card" onSubmit={(event) => void submit(event)}>
-        <div className="dialog-topline" />
-        <div className="dialog-heading">
+      <form className={dialogCard} onSubmit={(event) => void submit(event)}>
+        <div className={dialogTopline} />
+        <div className={dialogHeading}>
           <div>
-            <p className="eyebrow">New coding session</p>
+            <p className={eyebrow}>New coding session</p>
             <h2>Configure your coding team</h2>
           </div>
           <button
-            className="icon-button"
+            className={iconButton}
             aria-label="Close dialog"
             type="button"
             onClick={onClose}
@@ -93,10 +105,10 @@ export function NewSessionDialog({
           </button>
         </div>
 
-        <div className="field-grid">
-          <label className="field">
+        <div className="grid grid-cols-[1.5fr_1fr] gap-3 max-[520px]:grid-cols-1 max-[520px]:gap-0">
+          <label className={field}>
             <span>Model</span>
-            <select
+            <select className={control}
               value={modelId}
               onChange={(event) => setModelId(event.target.value)}
               required
@@ -106,9 +118,9 @@ export function NewSessionDialog({
               ))}
             </select>
           </label>
-          <label className="field">
+          <label className={field}>
             <span>Team size</span>
-            <select
+            <select className={control}
               value={teamSize}
               onChange={(event) => setTeamSize(Number(event.target.value))}
             >
@@ -118,9 +130,9 @@ export function NewSessionDialog({
               <option value={4}>4 · Full team</option>
             </select>
           </label>
-          <label className="field">
+          <label className={field}>
             <span>MCP researcher</span>
-            <select
+            <select className={control}
               value={configurationId}
               onChange={(event) => setConfigurationId(event.target.value)}
               disabled={teamSize < 2 || enabledConfigurations.length === 0}
@@ -136,9 +148,9 @@ export function NewSessionDialog({
           </label>
         </div>
 
-        <label className="field">
+        <label className={field}>
           <span>Workspace <small>absolute path</small></span>
-          <input
+          <input className={control}
             ref={workspaceInput}
             value={workspace}
             onChange={(event) => setWorkspace(event.target.value)}
@@ -148,16 +160,16 @@ export function NewSessionDialog({
           />
         </label>
 
-        <div className="team-preview">
+        <div className="mt-0.5 mb-[21px] flex flex-wrap gap-1.5 text-[9px] capitalize text-[#aeb8b0] [&>span]:rounded-[7px] [&>span]:border [&>span]:border-[#2e372a] [&>span]:bg-[#151b13] [&>span]:px-2 [&>span]:py-1.5">
           {roles.slice(0, teamSize).map((role, index) => (
             <span key={role}>
               ○ {index === 1 && configurationId ? "MCP specialist" : role} · on demand
             </span>
           ))}
         </div>
-        <div className="dialog-actions">
-          <button className="ghost" type="button" onClick={onClose}>Cancel</button>
-          <button className="primary" type="submit" disabled={submitting}>
+        <div className={dialogActions}>
+          <button className={ghostButton} type="button" onClick={onClose}>Cancel</button>
+          <button className={primaryButton} type="submit" disabled={submitting}>
             {submitting ? "Creating team…" : "Create session"}
           </button>
         </div>
