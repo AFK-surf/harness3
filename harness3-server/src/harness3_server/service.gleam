@@ -34,6 +34,8 @@ const catalog_key = "harness3-server/catalog"
 
 const mcp_catalog_key = "harness3-server/mcp-catalog"
 
+const all_mcp_configuration_id = "__harness3_server_all_mcp_servers__"
+
 const sessions_prefix = "harness3-server/sessions/"
 
 const lease_seconds = 30
@@ -50,7 +52,7 @@ fn system_time(unit: TimeUnit) -> Int
 pub type AgentKind {
   CodingAgent
   ResearchAgent
-  McpSpecialist(configuration_id: String)
+  McpSpecialist
 }
 
 pub type AgentSpec {
@@ -73,12 +75,7 @@ pub type Session {
 }
 
 pub type CreateInput {
-  CreateInput(
-    model_id: String,
-    workspace: String,
-    team_size: Int,
-    mcp_configuration_id: Option(String),
-  )
+  CreateInput(model_id: String, workspace: String, team_size: Int)
 }
 
 pub type UpdateInput {
@@ -149,6 +146,9 @@ pub fn mcp_configurations(
   service.mcp_runtime
   |> mcp.catalog
   |> mcp_catalog.configurations
+  |> list.filter(fn(configuration) {
+    configuration.id != all_mcp_configuration_id
+  })
 }
 
 pub fn stop(service: Service) -> Nil {
@@ -161,17 +161,13 @@ pub fn create_session(
   input: CreateInput,
 ) -> Result(Session, String) {
   use _ <- result.try(validate_create(service, input))
-  use mcp_configuration_id <- result.try(select_mcp_configuration(
-    service,
-    input,
-  ))
   use workspace <- result.try(resolve_workspace(input.workspace))
   use _ <- result.try(
     simplifile.create_directory_all(workspace)
     |> result.map_error(simplifile.describe_error),
   )
   let id = new_id()
-  let agents = team(input.team_size, mcp_configuration_id, input.model_id)
+  let agents = team(input.team_size, has_mcp_servers(service), input.model_id)
   let metadata =
     SessionMetadata(
       id:,
@@ -566,18 +562,36 @@ fn start_mcp(backend: Storage) -> Result(mcp.Runtime, String) {
       |> result.map_error(fn(error) { string.inspect(error) })
     }
   })
+  use _ <- result.try(
+    case mcp_catalog.lookup(desired, all_mcp_configuration_id) {
+      Error(mcp_catalog.UnknownConfiguration(_)) -> Ok(Nil)
+      Ok(_) ->
+        Error(
+          "MCP configuration ID is reserved by harness3-server: "
+          <> all_mcp_configuration_id,
+        )
+      Error(error) -> Error(string.inspect(error))
+    },
+  )
   use runtime <- result.try(
     mcp.start(desired, config.environment, fn() { system_time(Second) }),
   )
-  case persist {
-    False -> Ok(runtime)
-    True ->
-      case persist_mcp_catalog(backend, existing, desired) {
+  let initialized = case persist {
+    False -> Ok(Nil)
+    True -> persist_mcp_catalog(backend, existing, desired)
+  }
+  case initialized {
+    Error(error) -> {
+      mcp.stop(runtime)
+      Error(error)
+    }
+    Ok(Nil) ->
+      case refresh_all_mcp_configuration(runtime) {
+        Ok(Nil) -> Ok(runtime)
         Error(error) -> {
           mcp.stop(runtime)
           Error(error)
         }
-        Ok(Nil) -> Ok(runtime)
       }
   }
 }
@@ -588,6 +602,10 @@ pub fn add_mcp_server(
   configuration_label: String,
   server: mcp_configuration.Server,
 ) -> Result(mcp_configuration.Configuration, String) {
+  use _ <- result.try(case configuration_id == all_mcp_configuration_id {
+    True -> Error("MCP configuration ID is reserved by harness3-server")
+    False -> Ok(Nil)
+  })
   use configuration <- result.try(commit_mcp_change(
     service.storage,
     fn(catalog) {
@@ -630,6 +648,7 @@ pub fn add_mcp_server(
     3,
   ))
   use _ <- result.try(mcp.put_configuration(service.mcp_runtime, configuration))
+  use _ <- result.try(refresh_all_mcp_configuration(service.mcp_runtime))
   Ok(configuration)
 }
 
@@ -679,6 +698,7 @@ pub fn update_mcp_server(
     3,
   ))
   use _ <- result.try(mcp.put_configuration(service.mcp_runtime, configuration))
+  use _ <- result.try(refresh_all_mcp_configuration(service.mcp_runtime))
   Ok(configuration)
 }
 
@@ -720,7 +740,43 @@ pub fn remove_mcp_server(
     3,
   ))
   use _ <- result.try(mcp.put_configuration(service.mcp_runtime, configuration))
+  use _ <- result.try(refresh_all_mcp_configuration(service.mcp_runtime))
   Ok(configuration)
+}
+
+fn refresh_all_mcp_configuration(runtime: mcp.Runtime) -> Result(Nil, String) {
+  runtime
+  |> mcp.catalog
+  |> mcp_catalog.configurations
+  |> list.filter(fn(configuration) {
+    configuration.id != all_mcp_configuration_id && configuration.enabled
+  })
+  |> list.flat_map(fn(configuration) {
+    list.map(configuration.servers, fn(server) {
+      mcp_configuration.Server(
+        ..server,
+        id: aggregate_server_id(configuration.id, server.id),
+      )
+    })
+  })
+  |> fn(servers) {
+    mcp_configuration.Configuration(
+      id: all_mcp_configuration_id,
+      label: "All enabled MCP servers",
+      enabled: True,
+      servers:,
+    )
+  }
+  |> fn(configuration) { mcp.put_configuration(runtime, configuration) }
+}
+
+fn aggregate_server_id(configuration_id: String, server_id: String) -> String {
+  "c"
+  <> int.to_string(string.length(configuration_id))
+  <> "_"
+  <> configuration_id
+  <> "_"
+  <> server_id
 }
 
 fn commit_mcp_change(
@@ -815,8 +871,8 @@ fn validate_update(
     )
     use _ <- result.try(case normalized.kind {
       CodingAgent | ResearchAgent -> Ok(Nil)
-      McpSpecialist(configuration_id) ->
-        mcp.configuration(service.mcp_runtime, configuration_id)
+      McpSpecialist ->
+        mcp.configuration(service.mcp_runtime, all_mcp_configuration_id)
         |> result.map(fn(_) { Nil })
     })
     Ok([normalized, ..validated])
@@ -824,27 +880,10 @@ fn validate_update(
   |> result.map(list.reverse)
 }
 
-fn select_mcp_configuration(
-  service: Service,
-  input: CreateInput,
-) -> Result(Option(String), String) {
-  case input.mcp_configuration_id, input.team_size >= 2 {
-    Some(_), False ->
-      Error("an MCP specialist requires team_size to be at least 2")
-    Some(id), True ->
-      mcp.configuration(service.mcp_runtime, id)
-      |> result.map(fn(_) { Some(id) })
-    None, False -> Ok(None)
-    None, True ->
-      case
-        mcp_configurations(service)
-        |> list.filter(fn(configuration) {
-          configuration.enabled && !list.is_empty(configuration.servers)
-        })
-      {
-        [] -> Ok(None)
-        [configuration, ..] -> Ok(Some(configuration.id))
-      }
+fn has_mcp_servers(service: Service) -> Bool {
+  case mcp.configuration(service.mcp_runtime, all_mcp_configuration_id) {
+    Ok(configuration) -> !list.is_empty(configuration.servers)
+    Error(_) -> False
   }
 }
 
@@ -978,10 +1017,10 @@ fn group_config(
             coding_plugin.workspace(metadata.workspace),
           ])
         ResearchAgent -> Ok([collaboration, group_storage])
-        McpSpecialist(configuration_id) -> {
+        McpSpecialist -> {
           use configuration <- result.try(mcp.configuration(
             service.mcp_runtime,
-            configuration_id,
+            all_mcp_configuration_id,
           ))
           let specialist = mcp.plugin(service.mcp_runtime, configuration)
           Ok([collaboration, group_storage, specialist])
@@ -1018,10 +1057,8 @@ fn capability_instructions(kind: AgentKind) -> String {
       "You can inspect and modify the shared workspace, run commands with the installed coding tools, and read, write, list, delete, or create transfer URLs for durable cloud-storage objects shared by this agent group."
     ResearchAgent ->
       "You have no filesystem, workspace, shell, or MCP tools. You can use `team.message_agent` only to report to the lead, and you can use the `cloud_storage.*` tools to read, write, list, delete, or create transfer URLs for durable objects shared by this agent group."
-    McpSpecialist(configuration_id) ->
-      "You are the MCP specialist for global configuration `"
-      <> configuration_id
-      <> "`. You have `team.message_agent` (to report to the lead), `mcp.list` (to inspect tools from currently reachable external servers), `mcp.call` (to invoke a listed tool), and the `cloud_storage.*` tools for durable objects shared by this agent group. You have no direct filesystem or shell access."
+    McpSpecialist ->
+      "You are the MCP research specialist with access to all enabled global MCP servers. You have `team.message_agent` (to report to the lead), `mcp.list` (to inspect tools from currently reachable external servers), `mcp.call` (to invoke a listed tool), and the `cloud_storage.*` tools for durable objects shared by this agent group. You have no direct filesystem or shell access."
   }
 }
 
@@ -1097,21 +1134,15 @@ fn validate_agent(
   }
 }
 
-fn team(
-  size: Int,
-  mcp_configuration_id: Option(String),
-  model_id: String,
-) -> List(AgentSpec) {
-  let #(researcher_kind, researcher_role) = case mcp_configuration_id {
-    Some(id) -> #(
-      McpSpecialist(id),
-      "MCP research specialist for global configuration `"
-        <> id
-        <> "`. Has `team.message_agent` access only to the lead, `mcp.list` and `mcp.call` access to tools discovered from currently reachable external servers, and `cloud_storage.*` access to shared durable objects; has no filesystem or shell access.",
+fn team(size: Int, mcp_available: Bool, model_id: String) -> List(AgentSpec) {
+  let #(researcher_kind, researcher_role) = case mcp_available {
+    True -> #(
+      McpSpecialist,
+      "MCP research specialist with `mcp.list` and `mcp.call` access to every enabled global MCP server, `cloud_storage.*` access to shared durable objects, and `team.message_agent` access only to the lead; has no filesystem or shell access.",
     )
-    None -> #(
+    False -> #(
       ResearchAgent,
-      "Researcher without an MCP configuration. Has shared durable cloud-storage access and can message only the lead agent; has no filesystem, workspace, shell, or external MCP access.",
+      "Researcher without configured MCP servers. Has shared durable cloud-storage access and can message only the lead agent; has no filesystem, workspace, shell, or external MCP access.",
     )
   }
   [
@@ -1165,7 +1196,7 @@ fn group_key(id: String) -> String {
 
 fn encode_metadata(metadata: SessionMetadata) -> json.Json {
   json.object([
-    #("schema_version", json.int(3)),
+    #("schema_version", json.int(4)),
     #("id", json.string(metadata.id)),
     #("title", json.string(metadata.title)),
     #("prompt", json.string(metadata.prompt)),
@@ -1174,20 +1205,16 @@ fn encode_metadata(metadata: SessionMetadata) -> json.Json {
     #(
       "agents",
       json.array(metadata.agents, fn(agent) {
-        let #(kind, mcp_configuration_id) = case agent.kind {
-          CodingAgent -> #("coding", None)
-          ResearchAgent -> #("researcher", None)
-          McpSpecialist(id) -> #("mcp", Some(id))
+        let kind = case agent.kind {
+          CodingAgent -> "coding"
+          ResearchAgent -> "researcher"
+          McpSpecialist -> "mcp"
         }
         json.object([
           #("id", json.string(agent.id)),
           #("role", json.string(agent.role)),
           #("kind", json.string(kind)),
           #("model_id", json.string(agent.model_id)),
-          #(
-            "mcp_configuration_id",
-            json.nullable(mcp_configuration_id, json.string),
-          ),
         ])
       }),
     ),
@@ -1203,7 +1230,7 @@ fn metadata_decoder() -> decode.Decoder(SessionMetadata) {
   use created_at <- decode.field("created_at", decode.int)
   use agents <- decode.field("agents", decode.list(of: agent_spec_decoder()))
   case schema {
-    3 ->
+    4 ->
       decode.success(SessionMetadata(
         id,
         title,
@@ -1225,28 +1252,11 @@ fn agent_spec_decoder() -> decode.Decoder(AgentSpec) {
   use role <- decode.field("role", decode.string)
   use kind <- decode.field("kind", decode.string)
   use model_id <- decode.field("model_id", decode.string)
-  use mcp_configuration_id <- decode.optional_field(
-    "mcp_configuration_id",
-    None,
-    decode.optional(decode.string),
-  )
-  case kind, mcp_configuration_id {
-    "coding", _ -> decode.success(AgentSpec(id, role, CodingAgent, model_id))
-    "researcher", _ ->
-      decode.success(AgentSpec(id, role, ResearchAgent, model_id))
-    "mcp", Some(configuration_id) ->
-      decode.success(AgentSpec(
-        id,
-        role,
-        McpSpecialist(configuration_id),
-        model_id,
-      ))
-    "mcp", None ->
-      decode.failure(
-        AgentSpec("", "", ResearchAgent, ""),
-        "MCP agent is missing mcp_configuration_id",
-      )
-    _, _ ->
+  case kind {
+    "coding" -> decode.success(AgentSpec(id, role, CodingAgent, model_id))
+    "researcher" -> decode.success(AgentSpec(id, role, ResearchAgent, model_id))
+    "mcp" -> decode.success(AgentSpec(id, role, McpSpecialist, model_id))
+    _ ->
       decode.failure(AgentSpec("", "", ResearchAgent, ""), "unknown agent kind")
   }
 }

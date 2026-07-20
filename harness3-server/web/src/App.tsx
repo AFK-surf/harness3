@@ -372,7 +372,6 @@ export function App() {
           open={editGroupOpen}
           session={current}
           models={models}
-          configurations={mcpConfigurations}
           onClose={() => setEditGroupOpen(false)}
           onSave={updateSession}
           onError={(message) => showToast(message, true)}

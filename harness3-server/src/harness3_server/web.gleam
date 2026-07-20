@@ -336,16 +336,16 @@ fn session_json(session: Session) -> json.Json {
         let spec =
           metadata.agents
           |> list.find(fn(spec) { spec.id == state.id })
-        let #(role, kind, mcp_configuration_id) = case spec {
-          Error(_) -> #("", "coding", None)
+        let #(role, kind) = case spec {
+          Error(_) -> #("", "coding")
           Ok(spec) ->
             case spec.kind {
-              service.CodingAgent -> #(spec.role, "coding", None)
-              service.ResearchAgent -> #(spec.role, "researcher", None)
-              service.McpSpecialist(id) -> #(spec.role, "mcp", Some(id))
+              service.CodingAgent -> #(spec.role, "coding")
+              service.ResearchAgent -> #(spec.role, "researcher")
+              service.McpSpecialist -> #(spec.role, "mcp")
             }
         }
-        agent_json(state, role, kind, mcp_configuration_id)
+        agent_json(state, role, kind)
       }),
     ),
   ])
@@ -366,12 +366,7 @@ fn execution_json(execution: agent_group.ExecutionState) -> json.Json {
   }
 }
 
-fn agent_json(
-  state: agent.State,
-  role: String,
-  kind: String,
-  mcp_configuration_id: Option(String),
-) -> json.Json {
+fn agent_json(state: agent.State, role: String, kind: String) -> json.Json {
   let llm.Stats(
     input_tokens:,
     output_tokens:,
@@ -388,7 +383,6 @@ fn agent_json(
     #("id", json.string(state.id)),
     #("role", json.string(role)),
     #("kind", json.string(kind)),
-    #("mcp_configuration_id", json.nullable(mcp_configuration_id, json.string)),
     #("status", json.string(status)),
     #("failure", option_string(failure)),
     #("round", json.int(state.round)),
@@ -518,17 +512,7 @@ fn create_input_decoder() -> decode.Decoder(service.CreateInput) {
   use model_id <- decode.field("model_id", decode.string)
   use workspace <- decode.optional_field("workspace", "", decode.string)
   use team_size <- decode.optional_field("team_size", 3, decode.int)
-  use mcp_configuration_id <- decode.optional_field(
-    "mcp_configuration_id",
-    None,
-    decode.optional(decode.string),
-  )
-  decode.success(service.CreateInput(
-    model_id,
-    workspace,
-    team_size,
-    mcp_configuration_id,
-  ))
+  decode.success(service.CreateInput(model_id, workspace, team_size))
 }
 
 fn update_input_decoder() -> decode.Decoder(service.UpdateInput) {
@@ -542,34 +526,24 @@ fn edit_agent_decoder() -> decode.Decoder(service.AgentSpec) {
   use role <- decode.field("role", decode.string)
   use kind <- decode.field("kind", decode.string)
   use model_id <- decode.field("model_id", decode.string)
-  use mcp_configuration_id <- decode.optional_field(
-    "mcp_configuration_id",
-    None,
-    decode.optional(decode.string),
-  )
-  case kind, mcp_configuration_id {
-    "coding", _ ->
+  case kind {
+    "coding" ->
       decode.success(service.AgentSpec(id, role, service.CodingAgent, model_id))
-    "researcher", _ ->
+    "researcher" ->
       decode.success(service.AgentSpec(
         id,
         role,
         service.ResearchAgent,
         model_id,
       ))
-    "mcp", Some(configuration_id) ->
+    "mcp" ->
       decode.success(service.AgentSpec(
         id,
         role,
-        service.McpSpecialist(configuration_id),
+        service.McpSpecialist,
         model_id,
       ))
-    "mcp", None ->
-      decode.failure(
-        service.AgentSpec("", "", service.ResearchAgent, ""),
-        "MCP agent is missing mcp_configuration_id",
-      )
-    _, _ ->
+    _ ->
       decode.failure(
         service.AgentSpec("", "", service.ResearchAgent, ""),
         "unknown agent kind",

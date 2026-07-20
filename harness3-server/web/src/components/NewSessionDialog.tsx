@@ -38,15 +38,14 @@ export function NewSessionDialog({
   onCreate,
   onError,
 }: NewSessionDialogProps) {
-  const enabledConfigurations = useMemo(
-    () => configurations.filter(
+  const mcpAvailable = useMemo(
+    () => configurations.some(
       (configuration) => configuration.enabled && configuration.servers.length > 0,
     ),
     [configurations],
   );
   const [modelId, setModelId] = useState("");
   const [teamSize, setTeamSize] = useState(3);
-  const [configurationId, setConfigurationId] = useState("");
   const [workspace, setWorkspace] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const workspaceInput = useRef<HTMLInputElement>(null);
@@ -56,13 +55,10 @@ export function NewSessionDialog({
     setModelId((current) => models.some((model) => model.id === current)
       ? current
       : models[0]?.id ?? "");
-    setConfigurationId((current) => enabledConfigurations.some(
-      (configuration) => configuration.id === current,
-    ) ? current : enabledConfigurations[0]?.id ?? "");
     setWorkspace((current) => current || workspaceRoot);
     const frame = window.requestAnimationFrame(() => workspaceInput.current?.focus());
     return () => window.cancelAnimationFrame(frame);
-  }, [enabledConfigurations, models, open, workspaceRoot]);
+  }, [models, open, workspaceRoot]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -73,7 +69,6 @@ export function NewSessionDialog({
         model_id: modelId,
         workspace,
         team_size: teamSize,
-        mcp_configuration_id: teamSize >= 2 ? configurationId || null : null,
       });
       setTeamSize(3);
       setWorkspace(workspaceRoot);
@@ -130,22 +125,6 @@ export function NewSessionDialog({
               <option value={4}>4 · Full team</option>
             </select>
           </label>
-          <label className={field}>
-            <span>MCP researcher</span>
-            <select className={control}
-              value={configurationId}
-              onChange={(event) => setConfigurationId(event.target.value)}
-              disabled={teamSize < 2 || enabledConfigurations.length === 0}
-            >
-              {enabledConfigurations.length === 0 ? (
-                <option value="">No MCP configuration installed</option>
-              ) : enabledConfigurations.map((configuration) => (
-                <option key={configuration.id} value={configuration.id}>
-                  {configuration.label} · {configuration.server_count} server{configuration.server_count === 1 ? "" : "s"}
-                </option>
-              ))}
-            </select>
-          </label>
         </div>
 
         <label className={field}>
@@ -163,7 +142,7 @@ export function NewSessionDialog({
         <div className="mt-0.5 mb-[21px] flex flex-wrap gap-1.5 text-[9px] capitalize text-[#aeb8b0] [&>span]:rounded-[7px] [&>span]:border [&>span]:border-[#2e372a] [&>span]:bg-[#151b13] [&>span]:px-2 [&>span]:py-1.5">
           {roles.slice(0, teamSize).map((role, index) => (
             <span key={role}>
-              ○ {index === 1 && configurationId ? "MCP specialist" : role} · on demand
+              ○ {index === 1 && mcpAvailable ? "MCP researcher · all servers" : role} · on demand
             </span>
           ))}
         </div>

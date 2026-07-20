@@ -146,6 +146,24 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   assert mcp_configuration.id == "research"
   let assert [mcp_server] = mcp_configuration.servers
   assert mcp_server.id == "evidence"
+  let secondary_server =
+    mcp_configuration.Server(
+      id: "archive",
+      transport: mcp_configuration.Stdio(
+        "/bin/sh",
+        ["-c", mcp_server_script()],
+        None,
+        [],
+      ),
+      timeout_milliseconds: 1000,
+    )
+  let assert Ok(_) =
+    service.add_mcp_server(
+      second,
+      "secondary",
+      "Secondary MCP",
+      secondary_server,
+    )
   assert service.resolve_workspace("nested")
     == Error("workspace path must be absolute")
   let outside = root <> "-outside"
@@ -154,7 +172,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let assert Ok(service.Session(metadata, group)) =
     service.create_session(
       second,
-      service.CreateInput("test/model-1", workspace, 3, None),
+      service.CreateInput("test/model-1", workspace, 3),
     )
   assert metadata.title == "New coding session"
   assert metadata.prompt == ""
@@ -165,7 +183,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   })
   let assert [
     service.AgentSpec(kind: service.CodingAgent, ..),
-    service.AgentSpec(kind: service.McpSpecialist("research"), ..),
+    service.AgentSpec(kind: service.McpSpecialist, ..),
     service.AgentSpec(kind: service.CodingAgent, ..),
   ] = metadata.agents
   // Manual compaction always wakes through the RPC first. The request still
@@ -197,7 +215,10 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let lead_tools = tool_names(lead_profile)
   let researcher_tools = tool_names(researcher_profile)
   let implementer_tools = tool_names(implementer_profile)
-  let broker_name = mcp_configuration.broker_tool_name("evidence", "lookup")
+  let broker_name =
+    mcp_configuration.broker_tool_name("c8_research_evidence", "lookup")
+  let secondary_broker_name =
+    mcp_configuration.broker_tool_name("c9_secondary_archive", "lookup")
   assert list.contains(lead_tools, "coding.read")
   assert list.contains(lead_tools, "team.message_agent")
   assert_cloud_storage_tools(lead_tools)
@@ -251,6 +272,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
       plugin.ToolInvocation("list-tools", "{}"),
     )
   assert string.contains(listing, broker_name)
+  assert string.contains(listing, secondary_broker_name)
   let assert Ok(#(_, plugin.ToolOutput(is_error: True, ..))) =
     plugin.invoke_tool(
       researcher_runtime,
@@ -316,8 +338,9 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   service.stop(second)
 
   let assert Ok(after_seed_restart) = service.start()
-  let assert [after_seed_configuration] =
+  let assert Ok(after_seed_configuration) =
     service.mcp_configurations(after_seed_restart)
+    |> list.find(fn(configuration) { configuration.id == "research" })
   assert list.contains(after_seed_configuration.servers, seeded_ui_server)
   let assert Ok(service.Session(
     metadata: persisted_edit,
@@ -335,7 +358,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let assert Ok(service.Session(metadata: without_mcp_metadata, ..)) =
     service.create_session(
       without_mcp,
-      service.CreateInput("test/model-1", workspace, 2, None),
+      service.CreateInput("test/model-1", workspace, 2),
     )
   let assert [_, service.AgentSpec(kind: service.ResearchAgent, ..)] =
     without_mcp_metadata.agents
@@ -463,9 +486,9 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let assert Ok(service.Session(metadata: offline_metadata, ..)) =
     service.create_session(
       with_offline_mcp,
-      service.CreateInput("test/model-1", workspace, 2, None),
+      service.CreateInput("test/model-1", workspace, 2),
     )
-  let assert [_, service.AgentSpec(kind: service.McpSpecialist("offline"), ..)] =
+  let assert [_, service.AgentSpec(kind: service.McpSpecialist, ..)] =
     offline_metadata.agents
   let assert Ok([offline_profile]) =
     agent_profile.profiles([offline_metadata.id <> ":researcher"])
@@ -492,7 +515,10 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
       plugin.ToolInvocation("list-offline-tools", "{}"),
     )
   assert string.contains(offline_listing, "\"tools\":[]")
-  assert string.contains(offline_listing, "\"server_id\":\"missing\"")
+  assert string.contains(
+    offline_listing,
+    "\"server_id\":\"c7_offline_missing\"",
+  )
   let assert Ok(Nil) =
     service.stop_session(with_offline_mcp, offline_metadata.id)
   service.stop(with_offline_mcp)

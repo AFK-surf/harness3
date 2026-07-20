@@ -221,8 +221,12 @@ event-consumer failures are permanent.
   Its web API and UI can add, edit, or remove servers with CAS-backed durable
   updates. Management responses return complete transport settings and bindings,
   including literal HTTP header values; the UI masks literal values by default and
-  can reveal them in plaintext for editing. A configured team
-  assigns the researcher `mcp.list`, `mcp.call`, `team.message_agent`, and group
+  can reveal them in plaintext for editing. Harness3-server folds every server
+  from every enabled configuration into a stable runtime-only aggregate
+  configuration, namespacing server IDs with an injective source-configuration
+  prefix. The agent editor therefore exposes one MCP researcher resource profile,
+  not one profile per configuration. A configured team assigns that researcher
+  `mcp.list`, `mcp.call`, `team.message_agent`, and group
   `cloud_storage.*` tools, but no filesystem or shell capability. Coding agents
   receive `coding.read`, `coding.write`, `coding.exec`, `team.message_agent`, and
   `cloud_storage.*`, but no MCP tools. The lead may message all subagents; every

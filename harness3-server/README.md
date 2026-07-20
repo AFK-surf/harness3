@@ -87,22 +87,25 @@ including literal HTTP header values, and the web editor can reveal those values
 in plaintext. Protect the management API accordingly. Supplied and previously
 discovered manifests are discarded at startup.
 
-When a configured team has at least two agents, its researcher can be assigned
-one configuration. When that agent activates, each configured server is
+When a configured team has at least two agents, its researcher receives every
+server from every enabled global MCP configuration. Harness3-server maintains a
+stable aggregate runtime configuration and namespaces server IDs by their source
+configuration, so identically named servers do not collide. Each server is
 discovered independently. Unavailable servers are excluded, so server startup
 and agent availability do not depend on external services. The model receives
 only `mcp.list`, which reports reachable tools and failures, and `mcp.call`,
 which invokes an identifier returned by `mcp.list`. The researcher keeps durable
 `team.message_agent` access but has no workspace, file-write, or shell tools.
-Without MCP, the researcher remains least-privilege and receives
+Without any enabled MCP servers, the researcher remains least-privilege and receives
 `team.message_agent` plus the group cloud-storage tools; it never falls back to
 local filesystem or shell tools. Every agent receives `cloud_storage.read`,
 `cloud_storage.write`, `cloud_storage.list`, `cloud_storage.delete`, and
 `cloud_storage.get_url`. These tools share durable objects within one session
 while keeping different sessions isolated. The lead, implementer, and reviewer
 retain the coding tools and do not receive MCP
-access. Session metadata and plugin state store the configuration ID, while the
-global catalog owns the actual server settings. The lead can message every
+access. Plugin state references the stable aggregate configuration ID, while
+session metadata only records the MCP resource profile and the global catalog
+owns the actual server settings. The lead can message every
 subagent; subagents can message only the lead, so there is no direct
 subagent-to-subagent communication path.
 
@@ -174,8 +177,7 @@ Create request example:
 {
   "model_id": "provider/model",
   "workspace": "/absolute/path/to/project",
-  "team_size": 3,
-  "mcp_configuration_id": "research"
+  "team_size": 3
 }
 ```
 
@@ -189,15 +191,13 @@ Update request example:
       "id": "lead",
       "role": "Lead engineer with coding workspace access.",
       "kind": "coding",
-      "model_id": "provider/model",
-      "mcp_configuration_id": null
+      "model_id": "provider/model"
     },
     {
       "id": "researcher",
       "role": "MCP research specialist that reports to the lead.",
       "kind": "mcp",
-      "model_id": "provider/other-model",
-      "mcp_configuration_id": "research"
+      "model_id": "provider/other-model"
     }
   ]
 }
@@ -210,10 +210,11 @@ surviving agents retain their durable history and plugin state, added agents
 start dormant, and removed agents are deleted. Existing agent IDs are immutable
 in the UI; replace an agent to give it a different ID.
 
-`mcp_configuration_id` is optional. If omitted or `null` for a team of at least
-two, the first enabled configuration is selected. A lead-only team,
-or a server with no installed configuration, has no MCP specialist; an included
-researcher is message-only in that case.
+A team of at least two uses the MCP researcher automatically when any enabled
+global configuration contains a server. The agent editor exposes one MCP
+resource profile covering all enabled servers; it does not select individual
+configurations. A lead-only team, or a server with no enabled configuration,
+has no MCP specialist; an included researcher is message-only in that case.
 
 Creating a session opens its chat without starting a model call. Every agent is
 durable and dormant until messaged. The first message names the session, wakes

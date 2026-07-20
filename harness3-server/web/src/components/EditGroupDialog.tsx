@@ -1,7 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { errorMessage } from "../api";
 import type {
-  McpConfiguration,
   Model,
   Session,
   UpdateAgentInput,
@@ -29,7 +28,6 @@ interface EditGroupDialogProps {
   open: boolean;
   session: Session;
   models: Model[];
-  configurations: McpConfiguration[];
   onClose: () => void;
   onSave: (input: UpdateSessionInput) => Promise<void>;
   onError: (message: string) => void;
@@ -46,7 +44,6 @@ export function EditGroupDialog({
   open,
   session,
   models,
-  configurations,
   onClose,
   onSave,
   onError,
@@ -64,7 +61,6 @@ export function EditGroupDialog({
       id: agent.id,
       role: agent.role,
       kind: agent.kind,
-      mcp_configuration_id: agent.mcp_configuration_id,
       model_id: agent.model_id,
     })));
   }, [open, session.id]);
@@ -87,7 +83,6 @@ export function EditGroupDialog({
         id: "",
         role: "Coding agent working on tasks assigned by the lead.",
         kind: "coding",
-        mcp_configuration_id: null,
         model_id: models[0]?.id ?? "",
       },
     ]);
@@ -154,7 +149,6 @@ export function EditGroupDialog({
               agent={agent}
               index={index}
               models={models}
-              configurations={configurations}
               removable={agents.length > 1}
               onChange={(update) => updateAgent(agent.key, update)}
               onRemove={() => setAgents((current) => current.filter(
@@ -191,7 +185,6 @@ function AgentEditor({
   agent,
   index,
   models,
-  configurations,
   removable,
   onChange,
   onRemove,
@@ -199,7 +192,6 @@ function AgentEditor({
   agent: DraftAgent;
   index: number;
   models: Model[];
-  configurations: McpConfiguration[];
   removable: boolean;
   onChange: (update: (agent: DraftAgent) => DraftAgent) => void;
   onRemove: () => void;
@@ -210,19 +202,14 @@ function AgentEditor({
       ? "Workspace read/write, shell commands, shared cloud storage, and messaging to every teammate."
       : "Workspace read/write, shell commands, shared cloud storage, and messaging only to the lead."
     : agent.kind === "mcp"
-      ? "MCP list/call, shared cloud storage, and messaging to the lead; no filesystem or shell."
+      ? "MCP list/call access to all enabled global servers, shared cloud storage, and messaging to the lead; no filesystem or shell."
       : "Shared cloud storage and messaging to the lead; no filesystem, shell, or MCP access.";
 
   function changeAccess(value: string) {
-    onChange((current) => value.startsWith("mcp:") ? {
+    onChange((current) => ({
       ...current,
-      kind: "mcp",
-      mcp_configuration_id: value.slice(4),
-    } : {
-      ...current,
-      kind: value as "coding" | "researcher",
-      mcp_configuration_id: null,
-    });
+      kind: value as "coding" | "researcher" | "mcp",
+    }));
   }
 
   return (
@@ -277,11 +264,7 @@ function AgentEditor({
           <select className={control} value={access} onChange={(event) => changeAccess(event.target.value)}>
             <option value="coding">Coding workspace</option>
             <option value="researcher">Isolated researcher</option>
-            {configurations.map((configuration) => (
-              <option key={configuration.id} value={`mcp:${configuration.id}`}>
-                MCP · {configuration.label}
-              </option>
-            ))}
+            <option value="mcp">MCP researcher · all enabled servers</option>
           </select>
           <small className="mt-1.5 block text-[9px] leading-[1.45]">{resourceDescription}</small>
         </label>
@@ -303,9 +286,7 @@ function AgentEditor({
 }
 
 function accessValue(agent: DraftAgent): string {
-  return agent.kind === "mcp"
-    ? `mcp:${agent.mcp_configuration_id ?? ""}`
-    : agent.kind;
+  return agent.kind;
 }
 
 function nextKey(): number {

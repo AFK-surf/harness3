@@ -130,7 +130,6 @@ export interface Agent {
   id: string;
   role: string;
   kind: "coding" | "researcher" | "mcp";
-  mcp_configuration_id: string | null;
   status: "ready" | "waiting" | "completed" | "failed";
   failure: string | null;
   round: number;
@@ -171,14 +170,12 @@ export interface CreateSessionInput {
   model_id: string;
   workspace: string;
   team_size: number;
-  mcp_configuration_id: string | null;
 }
 
 export interface UpdateAgentInput {
   id: string;
   role: string;
   kind: Agent["kind"];
-  mcp_configuration_id: string | null;
   model_id: string;
 }
 
