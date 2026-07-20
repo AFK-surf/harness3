@@ -173,6 +173,11 @@ Creating a session opens its chat without starting a model call. Every agent is
 durable and dormant until messaged. The first message names the session, wakes
 its target, and starts that agent's first round.
 
+Transient LLM connection, timeout, throttling, overload, and server failures are
+retried indefinitely with exponential backoff capped at 10 seconds. They do not
+fail or interrupt the agent; permanent request and authentication errors still
+surface as agent failures.
+
 The **Compact** button in the selected agent's thread toolbar manually queues a
 handover compaction. It is available after that agent has session messages,
 shows pending and retry states, and first sends the idempotent cluster wake RPC

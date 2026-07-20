@@ -10,6 +10,7 @@ import gleam/otp/actor
 import gleam/result
 import gleam/string
 import harness3/llm
+import harness3/llm/retry_policy
 import harness3/plugin
 
 const callback_timeout_milliseconds = 5000
@@ -74,7 +75,12 @@ pub fn state(id: String, model_id: String) -> State {
 }
 
 pub type TransportError {
-  TransportError(reason: String)
+  /// A network, throttling, or temporary provider failure. The agent retries
+  /// the identical request forever with capped exponential backoff.
+  RetryableTransportError(reason: String)
+  /// A bad request, authentication failure, or local consumer failure that a
+  /// repeated identical request cannot repair.
+  PermanentTransportError(reason: String)
 }
 
 /// A transport must not produce the next event until `consume` has returned.
@@ -422,7 +428,6 @@ fn run_model(
   observe: fn(Event) -> Result(Nil, Error),
 ) -> Result(Accumulator, Error) {
   let Active(config:, plugins:, ..) = active
-  use accumulator <- result.try(start_accumulator())
   let request =
     llm.Request(
       model: config.model_name,
@@ -432,6 +437,22 @@ fn run_model(
       reasoning_effort: config.reasoning_effort,
       stream: True,
     )
+  run_model_attempt(
+    active,
+    request,
+    observe,
+    retry_policy.initial_delay_milliseconds(),
+  )
+}
+
+fn run_model_attempt(
+  active: Active,
+  request: llm.Request,
+  observe: fn(Event) -> Result(Nil, Error),
+  retry_delay_milliseconds: Int,
+) -> Result(Accumulator, Error) {
+  let Active(config:, ..) = active
+  use accumulator <- result.try(start_accumulator())
   let ModelTransport(run:) = config.transport
   let transport_result =
     run(config.provider, request, fn(event) {
@@ -440,18 +461,21 @@ fn run_model(
     })
   let accumulated = process.call(accumulator, 5000, Read)
   process.send(accumulator, StopAccumulator)
-  use _ <- result.try(
-    transport_result
-    |> result.map_error(fn(error) {
-      let TransportError(reason) = error
-      ModelTransportFailed(reason)
-    }),
-  )
-  use _ <- result.try(case accumulated.error {
-    Some(error) -> Error(error)
-    None -> Ok(Nil)
-  })
-  Ok(accumulated)
+  case accumulated.error, transport_result {
+    Some(error), _ -> Error(error)
+    None, Ok(Nil) -> Ok(accumulated)
+    None, Error(PermanentTransportError(reason)) ->
+      Error(ModelTransportFailed(reason))
+    None, Error(RetryableTransportError(_)) -> {
+      process.sleep(retry_delay_milliseconds)
+      run_model_attempt(
+        active,
+        request,
+        observe,
+        retry_policy.next_delay_milliseconds(retry_delay_milliseconds),
+      )
+    }
+  }
 }
 
 fn context_tokens(accumulated: Accumulator) -> Option(Int) {

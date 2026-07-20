@@ -131,6 +131,21 @@ The harness itself never performs LLM HTTP I/O. An `agent.ModelTransport` is inj
 per profile; it receives the provider, the request, and a `consume` callback, and must
 not produce event N+1 until `consume` of event N has returned (backpressure contract).
 
+A transport classifies failures as `RetryableTransportError` or
+`PermanentTransportError`. The agent retries retryable failures indefinitely, beginning
+at 100 ms and doubling the delay up to a 10 s cap. Every attempt receives the identical
+LLM request and a fresh event accumulator, so failed partial output is not committed and
+prompt-cacheable request prefixes remain unchanged. A retryable failure therefore never
+marks or interrupts the agent as failed. Permanent failures still return
+`ModelTransportFailed`.
+
+The server's buffered HTTP transport treats connection and timeout failures, HTTP
+408/409/421/425/429, transient 5xx responses (excluding 501 and 505), and structured
+rate-limit/overload/server/timeout errors as retryable. A malformed successful provider
+response is also retried because no output was accepted. Invalid requests,
+authentication and other permanent HTTP failures, invalid URLs or methods, and
+event-consumer failures are permanent.
+
 ---
 
 ## 4. Plugins
@@ -248,8 +263,10 @@ include the synthesized system prompt.
 `run_round`:
 1. Builds the request: plugin system prompt (all sections joined as `## name\n\nbody`)
    prepended as a System message when non-empty; tools = all plugin tools.
-2. Runs the transport; every event is forwarded to the profile's `observe` hook and to a
-   per-round accumulator actor (events keyed by provider index, stored in stream order).
+2. Runs the transport; retryable LLM failures repeat the identical request forever with
+   exponential backoff capped at 10 s. Each attempt gets a fresh per-round accumulator;
+   events are keyed by provider index, stored in stream order, and forwarded to the
+   profile's `observe` hook.
 3. On stream end, parts become assistant content; tool-call arguments must parse as JSON
    (`InvalidModelOutput` otherwise). `Finished(reason)` events are **ignored** — the
    round's outcome is derived solely from whether tool calls are present.
