@@ -3,6 +3,7 @@ const state = {
   sessions: [],
   current: null,
   selectedAgent: null,
+  workspaceRoot: "",
   poll: null,
   sessionRefreshTick: 0,
 };
@@ -53,6 +54,8 @@ async function connect() {
     $("#connection-dot").className = "connection-dot online";
     $("#connection-label").textContent = "Server online";
     $("#workspace-root").textContent = health.workspace_root;
+    state.workspaceRoot = health.workspace_root;
+    if (!$("#workspace-input").value) $("#workspace-input").value = health.workspace_root;
   } catch (error) {
     $("#connection-dot").className = "connection-dot offline";
     $("#connection-label").textContent = "Server unavailable";
@@ -244,7 +247,7 @@ async function createSession() {
     });
     dialog.close();
     newForm.reset();
-    $("#workspace-input").value = ".";
+    $("#workspace-input").value = state.workspaceRoot;
     $("#team-size").value = "3";
     updateTeamPreview();
     state.current = session;

@@ -110,7 +110,7 @@ pub fn create_session(
   input: CreateInput,
 ) -> Result(Session, String) {
   use _ <- result.try(validate_create(service, input))
-  use workspace <- result.try(resolve_workspace(service, input.workspace))
+  use workspace <- result.try(resolve_workspace(input.workspace))
   use _ <- result.try(
     simplifile.create_directory_all(workspace)
     |> result.map_error(simplifile.describe_error),
@@ -280,28 +280,15 @@ fn validate_create(
   }
 }
 
-fn resolve_workspace(
-  service: Service,
-  requested: String,
-) -> Result(String, String) {
-  let requested = case string.trim(requested) {
-    "" -> "."
-    value -> value
-  }
-  let candidate = case filepath.is_absolute(requested) {
-    True -> requested
-    False -> filepath.join(service.workspace_root, requested)
-  }
-  use candidate <- result.try(
-    simplifile.resolve(candidate)
-    |> result.map_error(simplifile.describe_error),
-  )
-  case
-    candidate == service.workspace_root
-    || string.starts_with(candidate, service.workspace_root <> "/")
-  {
-    True -> Ok(candidate)
-    False -> Error("workspace must be inside " <> service.workspace_root)
+/// Validates and normalizes an absolute workspace path.
+pub fn resolve_workspace(requested: String) -> Result(String, String) {
+  let requested = string.trim(requested)
+  case requested, filepath.is_absolute(requested) {
+    "", _ -> Error("workspace path cannot be empty")
+    _, False -> Error("workspace path must be absolute")
+    _, True ->
+      simplifile.resolve(requested)
+      |> result.map_error(simplifile.describe_error)
   }
 }
 

@@ -42,6 +42,10 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let assert Ok(second) = service.start()
   assert list.length(service.models(first)) == 1
   assert service.workspace_root(second) == workspace
+  assert service.resolve_workspace("nested")
+    == Error("workspace path must be absolute")
+  let outside = root <> "-outside"
+  assert service.resolve_workspace(outside) == Ok(outside)
 
   envoy.unset("HARNESS3_MODELS_PATH")
   envoy.unset("HARNESS3_DATA_DIR")

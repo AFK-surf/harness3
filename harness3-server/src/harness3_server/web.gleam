@@ -385,7 +385,7 @@ fn image_detail_name(detail: llm.ImageDetail) -> String {
 fn create_input_decoder() -> decode.Decoder(service.CreateInput) {
   use prompt <- decode.field("prompt", decode.string)
   use model_id <- decode.field("model_id", decode.string)
-  use workspace <- decode.optional_field("workspace", ".", decode.string)
+  use workspace <- decode.optional_field("workspace", "", decode.string)
   use team_size <- decode.optional_field("team_size", 3, decode.int)
   decode.success(service.CreateInput(prompt, model_id, workspace, team_size))
 }

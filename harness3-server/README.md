@@ -14,8 +14,10 @@ gleam run
 
 Open <http://127.0.0.1:8080>. The server binds only to loopback by default.
 
-The default workspace root is the parent directory (`..`) and durable state is
-stored under `./.harness3-server-data`. Override either location explicitly:
+Workspace paths must be absolute. The UI initially suggests the absolute path
+resolved from `HARNESS3_WORKSPACE_ROOT` (the parent directory, `..`, by default),
+and durable state is stored under `./.harness3-server-data`. Override the
+suggested workspace or state location:
 
 ```sh
 HARNESS3_WORKSPACE_ROOT=/path/to/projects \
@@ -49,7 +51,7 @@ gleam run
 | `HARNESS3_MODELS_PATH` | `~/.pi/agent/models.json` |
 | `HARNESS3_BIND` | `127.0.0.1` |
 | `HARNESS3_PORT` | `8080` |
-| `HARNESS3_WORKSPACE_ROOT` | `..` |
+| `HARNESS3_WORKSPACE_ROOT` | `..` (resolved and suggested in the UI) |
 | `HARNESS3_DATA_DIR` | `./.harness3-server-data` |
 | `HARNESS3_STORAGE` | `local` |
 | `HARNESS3_MODEL_TIMEOUT_MS` | `300000` |
