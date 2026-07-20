@@ -31,15 +31,15 @@ export interface Binding {
 export interface HttpMcpTransport {
   type: "streamable_http";
   endpoint: string;
-  binding_count: number;
+  headers: Binding[];
 }
 
 export interface StdioMcpTransport {
   type: "stdio";
   executable: string;
-  argument_count: number;
+  arguments: string[];
   working_directory: string | null;
-  binding_count: number;
+  environment: Binding[];
 }
 
 export type McpTransport = HttpMcpTransport | StdioMcpTransport;
@@ -209,6 +209,10 @@ export interface AddMcpServerInput {
     timeout_milliseconds: number;
     transport: AddMcpTransport;
   };
+}
+
+export interface UpdateMcpServerInput {
+  server: AddMcpServerInput["server"];
 }
 
 export interface CompactionResponse {

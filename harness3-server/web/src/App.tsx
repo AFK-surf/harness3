@@ -18,6 +18,7 @@ import type {
   Session,
   SessionsResponse,
   UpdateSessionInput,
+  UpdateMcpServerInput,
 } from "./types";
 
 interface ToastState {
@@ -301,6 +302,19 @@ export function App() {
     showToast("MCP server removed.");
   }
 
+  async function updateMcpServer(
+    configurationId: string,
+    serverId: string,
+    input: UpdateMcpServerInput,
+  ) {
+    await api<McpConfiguration>(
+      `/api/mcp/configurations/${encodeURIComponent(configurationId)}/servers/${encodeURIComponent(serverId)}`,
+      { method: "PUT", body: JSON.stringify(input) },
+    );
+    await loadMcpConfigurations();
+    showToast("MCP server updated. Active specialists pick it up on next activation.");
+  }
+
   return (
     <>
       <div className="grid h-screen grid-cols-[274px_minmax(0,1fr)] max-[1020px]:grid-cols-[224px_minmax(0,1fr)] max-[780px]:block max-[780px]:h-auto max-[780px]:min-h-screen">
@@ -349,6 +363,7 @@ export function App() {
         configurations={mcpConfigurations}
         onClose={() => setMcpOpen(false)}
         onAdd={addMcpServer}
+        onUpdate={updateMcpServer}
         onRemove={removeMcpServer}
         onError={(message) => showToast(message, true)}
       />

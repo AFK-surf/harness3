@@ -15,6 +15,7 @@ import harness3/plugin
 import harness3/plugin/mcp/configuration as mcp_configuration
 import harness3_server/config
 import harness3_server/service
+import harness3_server/web
 import simplifile
 
 fn temporary_root(label: String) -> String {
@@ -386,13 +387,56 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
       managed_server,
     )
   assert string.contains(duplicate_error, "already exists")
+  let replacement_server =
+    mcp_configuration.Server(
+      id: "ignored-new-id",
+      transport: mcp_configuration.StreamableHttp(
+        "https://mcp.example.test/v2",
+        [
+          mcp_configuration.Binding(
+            "authorization",
+            mcp_configuration.Literal("plaintext-token"),
+          ),
+          mcp_configuration.Binding(
+            "x-consumer",
+            mcp_configuration.EnvironmentVariable("WEB_MCP_CONSUMER"),
+          ),
+        ],
+      ),
+      timeout_milliseconds: 24_000,
+    )
+  let assert Ok(updated) =
+    service.update_mcp_server(
+      without_mcp,
+      "web-managed",
+      "web-added",
+      replacement_server,
+    )
+  let assert [updated_server] = updated.servers
+  assert updated_server.id == "web-added"
+  assert updated_server.timeout_milliseconds == 24_000
+  assert updated_server.transport
+    == mcp_configuration.StreamableHttp("https://mcp.example.test/v2", [
+      mcp_configuration.Binding(
+        "authorization",
+        mcp_configuration.Literal("plaintext-token"),
+      ),
+      mcp_configuration.Binding(
+        "x-consumer",
+        mcp_configuration.EnvironmentVariable("WEB_MCP_CONSUMER"),
+      ),
+    ])
+  let management_json = web.mcp_configuration_json(updated) |> json.to_string
+  assert string.contains(management_json, "\"headers\"")
+  assert string.contains(management_json, "plaintext-token")
+  assert !string.contains(management_json, "binding_count")
   service.stop(without_mcp)
 
   let assert Ok(after_add_restart) = service.start()
   let assert [persisted_web_configuration] =
     service.mcp_configurations(after_add_restart)
   assert persisted_web_configuration.id == "web-managed"
-  assert persisted_web_configuration.servers == [managed_server]
+  assert persisted_web_configuration.servers == [updated_server]
   let assert Ok(after_remove) =
     service.remove_mcp_server(after_add_restart, "web-managed", "web-added")
   assert after_remove.servers == []

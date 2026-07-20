@@ -80,6 +80,9 @@ fn handle(
       )
     http.Post, ["api", "mcp", "servers"] ->
       add_mcp_server(service, request.body)
+    http.Put,
+      ["api", "mcp", "configurations", configuration_id, "servers", server_id]
+    -> update_mcp_server(service, configuration_id, server_id, request.body)
     http.Delete,
       ["api", "mcp", "configurations", configuration_id, "servers", server_id]
     -> remove_mcp_server(service, configuration_id, server_id)
@@ -184,6 +187,27 @@ fn remove_mcp_server(
     Ok(configuration) ->
       json_response(200, mcp_configuration_json(configuration))
     Error(error) -> error_response(404, error)
+  }
+}
+
+fn update_mcp_server(
+  service: Service,
+  configuration_id: String,
+  server_id: String,
+  body: BitArray,
+) -> Response(ResponseData) {
+  use input <- body_decoded(body, update_mcp_server_decoder())
+  case
+    service.update_mcp_server(
+      service,
+      configuration_id,
+      server_id,
+      input.server,
+    )
+  {
+    Ok(configuration) ->
+      json_response(200, mcp_configuration_json(configuration))
+    Error(error) -> error_response(400, error)
   }
 }
 
@@ -553,7 +577,9 @@ fn edit_agent_decoder() -> decode.Decoder(service.AgentSpec) {
   }
 }
 
-fn mcp_configuration_json(
+/// Encodes the management representation, including configured binding values.
+/// Callers must protect this response as they would the durable configuration.
+pub fn mcp_configuration_json(
   configuration: mcp_configuration.Configuration,
 ) -> json.Json {
   // Tools are discovered per agent, not per configuration, so there is no
@@ -573,7 +599,7 @@ fn mcp_server_json(server: mcp_configuration.Server) -> json.Json {
       json.object([
         #("type", json.string("streamable_http")),
         #("endpoint", json.string(endpoint)),
-        #("binding_count", json.int(list.length(headers))),
+        #("headers", json.array(headers, mcp_binding_json)),
       ])
     mcp_configuration.Stdio(
       executable,
@@ -584,15 +610,37 @@ fn mcp_server_json(server: mcp_configuration.Server) -> json.Json {
       json.object([
         #("type", json.string("stdio")),
         #("executable", json.string(executable)),
-        #("argument_count", json.int(list.length(arguments))),
+        #("arguments", json.array(arguments, json.string)),
         #("working_directory", json.nullable(working_directory, json.string)),
-        #("binding_count", json.int(list.length(environment))),
+        #("environment", json.array(environment, mcp_binding_json)),
       ])
   }
   json.object([
     #("id", json.string(server.id)),
     #("timeout_milliseconds", json.int(server.timeout_milliseconds)),
     #("transport", transport),
+  ])
+}
+
+fn mcp_binding_json(binding: mcp_configuration.Binding) -> json.Json {
+  let #(kind, value) = case binding.value {
+    mcp_configuration.Literal(value) -> #("literal", value)
+    mcp_configuration.EnvironmentVariable(name) -> #(
+      "environment_variable",
+      name,
+    )
+  }
+  json.object([
+    #("name", json.string(binding.name)),
+    #(
+      "value",
+      json.object([
+        #("type", json.string(kind)),
+        // The management API intentionally returns literal header values so
+        // an operator can inspect and edit the durable configuration.
+        #("value", json.string(value)),
+      ]),
+    ),
   ])
 }
 
@@ -613,6 +661,15 @@ fn add_mcp_server_decoder() -> decode.Decoder(AddMcpServerRequest) {
     configuration_label,
     server,
   ))
+}
+
+type UpdateMcpServerRequest {
+  UpdateMcpServerRequest(server: mcp_configuration.Server)
+}
+
+fn update_mcp_server_decoder() -> decode.Decoder(UpdateMcpServerRequest) {
+  use server <- decode.field("server", mcp_configuration.server_decoder())
+  decode.success(UpdateMcpServerRequest(server))
 }
 
 type MessageRequest {

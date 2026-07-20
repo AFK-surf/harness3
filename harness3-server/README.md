@@ -35,12 +35,12 @@ not the secret values.
 
 ## MCP configurations
 
-Use the **MCP servers** button in the web UI sidebar to add or remove global MCP
-servers. The manager supports Streamable HTTP and stdio transports, multiple
-servers per named configuration, environment-variable or literal bindings, and
-absolute stdio paths. Changes are validated and written to the durable catalog
-without contacting the external server; discovery waits until an MCP specialist
-activates.
+Use the **MCP servers** button in the web UI sidebar to add, edit, or remove
+global MCP servers. The manager supports Streamable HTTP and stdio transports,
+multiple servers per named configuration, environment-variable or literal
+bindings, and absolute stdio paths. Changes are validated and written to the
+durable catalog without contacting the external server; discovery waits until
+an MCP specialist activates.
 
 As an optional bootstrap, set `HARNESS3_MCP_CONFIG_PATH` to an absolute JSON
 file path. The file seeds the durable catalog only when no catalog exists yet,
@@ -82,7 +82,10 @@ Stdio servers use `"type": "stdio"` with an absolute `executable`, optional
 `arguments`, an optional absolute `working_directory`, and `environment`
 bindings in the same format as HTTP headers. Prefer
 `environment_variable` bindings for secrets: literal values are persisted as
-written. Supplied and previously discovered manifests are discarded at startup.
+written. The management API intentionally returns configured bindings in full,
+including literal HTTP header values, and the web editor can reveal those values
+in plaintext. Protect the management API accordingly. Supplied and previously
+discovered manifests are discarded at startup.
 
 When a configured team has at least two agents, its researcher can be assigned
 one configuration. When that agent activates, each configured server is
@@ -149,6 +152,7 @@ authentication and isolation.
 - `GET /api/models`
 - `GET /api/mcp/configurations`
 - `POST /api/mcp/servers`
+- `PUT /api/mcp/configurations/:configuration_id/servers/:server_id`
 - `DELETE /api/mcp/configurations/:configuration_id/servers/:server_id`
 - `GET /api/sessions`
 - `POST /api/sessions`
@@ -157,6 +161,12 @@ authentication and isolation.
 - `POST /api/sessions/:id/messages`
 - `POST /api/sessions/:id/agents/:agent_id/compact`
 - `POST /api/sessions/:id/stop`
+
+The MCP update route accepts `{ "server": { ... } }` using the same server
+shape nested in the add request. The configuration and server IDs come from
+the URL and remain stable. MCP configuration responses include full `headers`
+or `environment` binding arrays and stdio `arguments`, rather than redacted
+counts.
 
 Create request example:
 

@@ -6,6 +6,7 @@ import type {
   BindingValue,
   McpConfiguration,
   McpServer,
+  UpdateMcpServerInput,
 } from "../types";
 import {
   control,
@@ -29,12 +30,22 @@ interface McpDialogProps {
   configurations: McpConfiguration[];
   onClose: () => void;
   onAdd: (input: AddMcpServerInput) => Promise<void>;
+  onUpdate: (
+    configurationId: string,
+    serverId: string,
+    input: UpdateMcpServerInput,
+  ) => Promise<void>;
   onRemove: (configurationId: string, serverId: string) => Promise<void>;
   onError: (message: string) => void;
 }
 
 interface EditableBinding extends Binding {
   key: number;
+}
+
+interface EditingServer {
+  configurationId: string;
+  serverId: string;
 }
 
 let nextBindingKey = 0;
@@ -44,6 +55,7 @@ export function McpDialog({
   configurations,
   onClose,
   onAdd,
+  onUpdate,
   onRemove,
   onError,
 }: McpDialogProps) {
@@ -60,6 +72,7 @@ export function McpDialog({
   const [argumentsJson, setArgumentsJson] = useState("[]");
   const [workingDirectory, setWorkingDirectory] = useState("");
   const [bindings, setBindings] = useState<EditableBinding[]>([]);
+  const [editing, setEditing] = useState<EditingServer | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const existingConfiguration = useMemo(
     () => configurations.find(
@@ -88,12 +101,57 @@ export function McpDialog({
     setConfigurationLabel(existing?.label ?? "");
   }
 
+  function editServer(
+    configuration: McpConfiguration,
+    server: McpServer,
+  ) {
+    setEditing({
+      configurationId: configuration.id,
+      serverId: server.id,
+    });
+    setSelectedConfiguration(configuration.id);
+    setConfigurationId(configuration.id);
+    setConfigurationLabel(configuration.label);
+    setServerId(server.id);
+    setTimeoutValue(server.timeout_milliseconds);
+    setTransportType(server.transport.type);
+    if (server.transport.type === "streamable_http") {
+      setEndpoint(server.transport.endpoint);
+      setExecutable("");
+      setArgumentsJson("[]");
+      setWorkingDirectory("");
+      setBindings(editableBindings(server.transport.headers));
+    } else {
+      setEndpoint("");
+      setExecutable(server.transport.executable);
+      setArgumentsJson(JSON.stringify(server.transport.arguments));
+      setWorkingDirectory(server.transport.working_directory ?? "");
+      setBindings(editableBindings(server.transport.environment));
+    }
+  }
+
+  function resetServerForm() {
+    setEditing(null);
+    setServerId("");
+    setTimeoutValue(60_000);
+    setTransportType("streamable_http");
+    setEndpoint("");
+    setExecutable("");
+    setArgumentsJson("[]");
+    setWorkingDirectory("");
+    setBindings([]);
+  }
+
+  function closeDialog() {
+    resetServerForm();
+    onClose();
+  }
+
   function addBinding() {
-    nextBindingKey += 1;
     setBindings((current) => [
       ...current,
       {
-        key: nextBindingKey,
+        key: bindingKey(),
         name: "",
         value: { type: "environment_variable", value: "" },
       },
@@ -135,23 +193,23 @@ export function McpDialog({
           environment: cleanBindings,
         };
       }
+      const server = {
+        id: serverId.trim(),
+        timeout_milliseconds: timeout,
+        transport,
+      };
       const submittedConfigurationId = configurationId.trim();
-      await onAdd({
-        configuration_id: submittedConfigurationId,
-        configuration_label: configurationLabel.trim(),
-        server: {
-          id: serverId.trim(),
-          timeout_milliseconds: timeout,
-          transport,
-        },
-      });
+      if (editing) {
+        await onUpdate(editing.configurationId, editing.serverId, { server });
+      } else {
+        await onAdd({
+          configuration_id: submittedConfigurationId,
+          configuration_label: configurationLabel.trim(),
+          server,
+        });
+      }
       setSelectedConfiguration(submittedConfigurationId);
-      setServerId("");
-      setEndpoint("");
-      setExecutable("");
-      setArgumentsJson("[]");
-      setWorkingDirectory("");
-      setBindings([]);
+      resetServerForm();
     } catch (error) {
       onError(errorMessage(error));
     } finally {
@@ -176,7 +234,7 @@ export function McpDialog({
   );
 
   return (
-    <Modal open={open} className="max-w-[980px]" onClose={onClose}>
+    <Modal open={open} className="max-w-[980px]" onClose={closeDialog}>
       <div className={dialogCard}>
         <div className={dialogTopline} />
         <div className={dialogHeading}>
@@ -188,7 +246,7 @@ export function McpDialog({
             className={iconButton}
             aria-label="Close dialog"
             type="button"
-            onClick={onClose}
+            onClick={closeDialog}
           >
             ×
           </button>
@@ -215,6 +273,7 @@ export function McpDialog({
                     <McpServerRow
                       key={server.id}
                       server={server}
+                      onEdit={() => editServer(configuration, server)}
                       onRemove={() => void removeServer(configuration.id, server.id)}
                     />
                   ))}
@@ -226,9 +285,22 @@ export function McpDialog({
           <form onSubmit={(event) => void submit(event)}>
             <div className="mb-3 flex min-h-[42px] items-start justify-between">
               <div>
-                <span className={sectionLabel}>Add server</span>
-                <p className="mt-1.5 mb-0 text-[10px] leading-normal text-faint">Settings are stored globally and survive restarts.</p>
+                <span className={sectionLabel}>{editing ? "Edit server" : "Add server"}</span>
+                <p className="mt-1.5 mb-0 text-[10px] leading-normal text-faint">
+                  {editing
+                    ? `Editing ${editing.configurationId} / ${editing.serverId}`
+                    : "Settings are stored globally and survive restarts."}
+                </p>
               </div>
+              {editing ? (
+                <button
+                  className={smallGhostButton}
+                  type="button"
+                  onClick={resetServerForm}
+                >
+                  Cancel edit
+                </button>
+              ) : null}
             </div>
 
             <label className={field}>
@@ -236,6 +308,7 @@ export function McpDialog({
               <select className={control}
                 value={selectedConfiguration}
                 onChange={(event) => chooseConfiguration(event.target.value)}
+                disabled={Boolean(editing)}
               >
                 {configurations.map((configuration) => (
                   <option key={configuration.id} value={configuration.id}>
@@ -274,6 +347,7 @@ export function McpDialog({
                 <input className={control}
                   value={serverId}
                   onChange={(event) => setServerId(event.target.value)}
+                  readOnly={Boolean(editing)}
                   pattern="[A-Za-z0-9_-]+"
                   placeholder="knowledge"
                   required
@@ -365,12 +439,15 @@ export function McpDialog({
             </div>
             <p className="mt-[9px] mb-[15px] text-[9px] leading-normal text-faint">
               Use an environment-variable binding for secrets when possible.
-              Literal values are stored in plaintext and are never returned by the API.
+              Literal values are stored and returned by the management API in
+              plaintext; use Show to reveal them in this form.
             </p>
 
             <div className={dialogActions}>
               <button className={primaryButton} type="submit" disabled={submitting}>
-                {submitting ? "Adding…" : "Add server"}
+                {submitting
+                  ? editing ? "Saving…" : "Adding…"
+                  : editing ? "Save changes" : "Add server"}
               </button>
             </div>
           </form>
@@ -380,16 +457,27 @@ export function McpDialog({
   );
 }
 
-function McpServerRow({ server, onRemove }: { server: McpServer; onRemove: () => void }) {
+function McpServerRow({
+  server,
+  onEdit,
+  onRemove,
+}: {
+  server: McpServer;
+  onEdit: () => void;
+  onRemove: () => void;
+}) {
   const location = server.transport.type === "streamable_http"
     ? server.transport.endpoint
     : server.transport.executable;
   const kind = server.transport.type === "streamable_http" ? "HTTP" : "stdio";
-  const argumentCount = server.transport.type === "stdio" && server.transport.argument_count
-    ? ` · ${server.transport.argument_count} arg${server.transport.argument_count === 1 ? "" : "s"}`
+  const argumentCount = server.transport.type === "stdio" && server.transport.arguments.length
+    ? ` · ${server.transport.arguments.length} arg${server.transport.arguments.length === 1 ? "" : "s"}`
     : "";
-  const bindingCount = server.transport.binding_count
-    ? ` · ${server.transport.binding_count} binding${server.transport.binding_count === 1 ? "" : "s"}`
+  const bindings = server.transport.type === "streamable_http"
+    ? server.transport.headers
+    : server.transport.environment;
+  const bindingCount = bindings.length
+    ? ` · ${bindings.length} binding${bindings.length === 1 ? "" : "s"}`
     : "";
   return (
     <div className="flex items-start justify-between gap-[10px] p-[11px] not-first:border-t not-first:border-line-soft">
@@ -401,14 +489,24 @@ function McpServerRow({ server, onRemove }: { server: McpServer; onRemove: () =>
         </small>
         <code className="mt-[7px] block truncate text-[9px] text-muted" title={location}>{location}</code>
       </div>
-      <button
-        className={`${dangerIconButton} size-[26px] text-base`}
-        type="button"
-        aria-label={`Remove ${server.id}`}
-        onClick={onRemove}
-      >
-        ×
-      </button>
+      <div className="flex shrink-0 items-center gap-1.5">
+        <button
+          className={`${smallGhostButton} py-[5px]`}
+          type="button"
+          aria-label={`Edit ${server.id}`}
+          onClick={onEdit}
+        >
+          Edit
+        </button>
+        <button
+          className={`${dangerIconButton} size-[26px] text-base`}
+          type="button"
+          aria-label={`Remove ${server.id}`}
+          onClick={onRemove}
+        >
+          ×
+        </button>
+      </div>
     </div>
   );
 }
@@ -422,6 +520,8 @@ function BindingRow({
   onChange: (update: (binding: EditableBinding) => EditableBinding) => void;
   onRemove: () => void;
 }) {
+  const [showValue, setShowValue] = useState(false);
+
   function updateValue(update: Partial<BindingValue>) {
     onChange((current) => ({
       ...current,
@@ -430,7 +530,7 @@ function BindingRow({
   }
 
   return (
-    <div className="grid grid-cols-[minmax(0,.8fr)_minmax(0,1fr)_minmax(0,1fr)_30px] gap-1.5 max-[520px]:grid-cols-[1fr_1fr_30px]">
+    <div className="grid grid-cols-[minmax(0,.8fr)_minmax(0,1fr)_minmax(0,1fr)_42px_30px] gap-1.5 max-[650px]:grid-cols-[1fr_1fr_42px_30px]">
       <input
         className={`${control} min-w-0 p-2 text-[10px]`}
         aria-label="Binding name"
@@ -454,9 +554,9 @@ function BindingRow({
         <option value="literal">Literal value</option>
       </select>
       <input
-        className={`${control} min-w-0 p-2 text-[10px] max-[520px]:col-span-full max-[520px]:row-start-2`}
+        className={`${control} min-w-0 p-2 text-[10px] max-[650px]:col-span-2 max-[650px]:row-start-2`}
         aria-label="Binding value"
-        type={binding.value.type === "literal" ? "password" : "text"}
+        type={binding.value.type === "literal" && !showValue ? "password" : "text"}
         value={binding.value.value}
         onChange={(event) => updateValue({ value: event.target.value })}
         placeholder={binding.value.type === "literal"
@@ -464,8 +564,18 @@ function BindingRow({
           : "VARIABLE_NAME"}
         required
       />
+      {binding.value.type === "literal" ? (
+        <button
+          className="rounded-[7px] border border-line bg-transparent px-1 text-[9px] text-muted hover:border-[#3a4248] hover:bg-panel-2 hover:text-ink max-[650px]:col-start-3 max-[650px]:row-start-2"
+          type="button"
+          aria-pressed={showValue}
+          onClick={() => setShowValue((shown) => !shown)}
+        >
+          {showValue ? "Hide" : "Show"}
+        </button>
+      ) : <span className="max-[650px]:col-start-3 max-[650px]:row-start-2" aria-hidden="true" />}
       <button
-        className={`${iconButton} text-base`}
+        className={`${iconButton} text-base max-[650px]:col-start-4 max-[650px]:row-start-2`}
         type="button"
         aria-label="Remove binding"
         onClick={onRemove}
@@ -474,4 +584,13 @@ function BindingRow({
       </button>
     </div>
   );
+}
+
+function editableBindings(bindings: Binding[]): EditableBinding[] {
+  return bindings.map((binding) => ({ ...binding, key: bindingKey() }));
+}
+
+function bindingKey(): number {
+  nextBindingKey += 1;
+  return nextBindingKey;
 }

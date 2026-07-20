@@ -633,6 +633,55 @@ pub fn add_mcp_server(
   Ok(configuration)
 }
 
+/// Replaces an existing MCP server without contacting it. The configuration
+/// and server IDs are stable path identities; editable transport settings and
+/// bindings come from `replacement`.
+pub fn update_mcp_server(
+  service: Service,
+  configuration_id: String,
+  server_id: String,
+  replacement: mcp_configuration.Server,
+) -> Result(mcp_configuration.Configuration, String) {
+  let replacement = mcp_configuration.Server(..replacement, id: server_id)
+  use configuration <- result.try(commit_mcp_change(
+    service.storage,
+    fn(catalog) {
+      use current <- result.try(
+        mcp_catalog.lookup(catalog, configuration_id)
+        |> result.map_error(fn(error) { string.inspect(error) }),
+      )
+      use _ <- result.try(
+        case list.any(current.servers, fn(server) { server.id == server_id }) {
+          True -> Ok(Nil)
+          False ->
+            Error(
+              "unknown MCP server in configuration `"
+              <> configuration_id
+              <> "`: "
+              <> server_id,
+            )
+        },
+      )
+      let updated =
+        mcp_configuration.Configuration(
+          ..current,
+          servers: list.map(current.servers, fn(server) {
+            case server.id == server_id {
+              True -> replacement
+              False -> server
+            }
+          }),
+        )
+      mcp_catalog.put_configuration(catalog, updated)
+      |> result.map(fn(next) { #(next, updated) })
+      |> result.map_error(fn(error) { string.inspect(error) })
+    },
+    3,
+  ))
+  use _ <- result.try(mcp.put_configuration(service.mcp_runtime, configuration))
+  Ok(configuration)
+}
+
 pub fn remove_mcp_server(
   service: Service,
   configuration_id: String,

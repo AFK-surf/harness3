@@ -218,9 +218,10 @@ event-consumer failures are permanent.
 - The server loads optional global configuration from an absolute
   `HARNESS3_MCP_CONFIG_PATH` as a first-run seed, validates and persists configuration
   without contacting external services, and discards persisted manifests at startup.
-  Its web API and UI can add or remove servers with CAS-backed durable updates; those
-  updates invalidate live connections and discovery state for the affected
-  configuration. Management responses omit binding values. A configured team
+  Its web API and UI can add, edit, or remove servers with CAS-backed durable
+  updates. Management responses return complete transport settings and bindings,
+  including literal HTTP header values; the UI masks literal values by default and
+  can reveal them in plaintext for editing. A configured team
   assigns the researcher `mcp.list`, `mcp.call`, `team.message_agent`, and group
   `cloud_storage.*` tools, but no filesystem or shell capability. Coding agents
   receive `coding.read`, `coding.write`, `coding.exec`, `team.message_agent`, and
