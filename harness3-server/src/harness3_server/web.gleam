@@ -95,6 +95,8 @@ fn handle(
       }
     http.Post, ["api", "sessions", id, "messages"] ->
       send_message(service, id, request.body)
+    http.Post, ["api", "sessions", id, "agents", agent_id, "compact"] ->
+      request_compaction(service, id, agent_id)
     http.Post, ["api", "sessions", id, "stop"] ->
       case service.stop_session(service, id) {
         Ok(Nil) -> json_response(200, json.object([#("ok", json.bool(True))]))
@@ -122,6 +124,24 @@ fn send_message(
   case service.send_message(service, id, message.agent_id, message.message) {
     Ok(Nil) -> json_response(202, json.object([#("ok", json.bool(True))]))
     Error(error) -> error_response(400, error)
+  }
+}
+
+fn request_compaction(
+  service: Service,
+  id: String,
+  agent_id: String,
+) -> Response(ResponseData) {
+  case service.request_compaction(service, id, agent_id) {
+    Ok(generation) ->
+      json_response(
+        202,
+        json.object([
+          #("ok", json.bool(True)),
+          #("generation", json.int(generation)),
+        ]),
+      )
+    Error(error) -> error_response(409, error)
   }
 }
 

@@ -265,6 +265,22 @@ pub fn send_message(
   }
 }
 
+/// Durably requests compaction for one agent without waking a dormant group.
+pub fn request_compaction(
+  service: Service,
+  id: String,
+  agent_id: String,
+) -> Result(Int, String) {
+  use metadata <- result.try(load_metadata(service, id))
+  use _ <- result.try(validate_agent(metadata, agent_id))
+  case agent_group_registry.request_compaction(id, agent_id) {
+    Ok(generation) -> Ok(generation)
+    Error(agent_group_registry.NotFound(_)) -> Error("agent group is not awake")
+    Error(agent_group_registry.CompactionFailed(reason)) -> Error(reason)
+    Error(error) -> Error(string.inspect(error))
+  }
+}
+
 fn deliver_registered(
   id: String,
   agent_id: String,

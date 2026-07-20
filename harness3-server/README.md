@@ -148,6 +148,7 @@ authentication and isolation.
 - `POST /api/sessions`
 - `GET /api/sessions/:id`
 - `POST /api/sessions/:id/messages`
+- `POST /api/sessions/:id/agents/:agent_id/compact`
 - `POST /api/sessions/:id/stop`
 
 Create request example:
@@ -169,6 +170,11 @@ researcher is message-only in that case.
 Creating a session opens its chat without starting a model call. Every agent is
 durable and dormant until messaged. The first message names the session, wakes
 its target, and starts that agent's first round.
+
+The **Compact** button in the selected agent's thread toolbar manually queues a
+handover compaction. It is available after that agent has session messages,
+shows pending and retry states, and fails without waking the group if the team
+is not currently awake.
 
 ## Test
 

@@ -175,6 +175,11 @@ kbd { padding: 2px 5px; border: 1px solid #363d3a; border-radius: 4px; color: va
 .thread-panel { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .thread-toolbar { display: flex; align-items: center; justify-content: space-between; padding: 13px 26px; border-bottom: 1px solid var(--line-soft); }
 .thread-toolbar strong { display: block; margin-top: 4px; font-size: 13px; }
+.thread-toolbar-actions { display: flex; align-items: center; gap: 12px; }
+.compact-context { padding: 6px 9px; font-size: 10px; }
+.compact-context.pending { color: var(--amber); border-color: #4c3a26; background: #1e1811; }
+.compact-context.failed { color: var(--red); border-color: #5a3432; }
+.compact-context:disabled { cursor: default; opacity: .5; }
 .poll-indicator { display: flex; align-items: center; gap: 6px; color: var(--faint); font-size: 10px; text-transform: uppercase; letter-spacing: .09em; }
 .poll-indicator span { width: 5px; height: 5px; border-radius: 50%; background: var(--lime); animation: pulse 1.8s infinite; }
 @keyframes pulse { 50% { opacity: .25; } }

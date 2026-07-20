@@ -164,6 +164,12 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     service.AgentSpec(kind: service.McpSpecialist("research"), ..),
     service.AgentSpec(kind: service.CodingAgent, ..),
   ] = metadata.agents
+  let assert Error(compaction_error) =
+    service.request_compaction(second, metadata.id, "lead")
+  assert compaction_error == "agent group is not awake"
+  let assert Error(unknown_compaction_agent) =
+    service.request_compaction(second, metadata.id, "missing")
+  assert string.contains(unknown_compaction_agent, "unknown agent")
 
   let assert Ok([lead_profile, researcher_profile, implementer_profile]) =
     agent_profile.profiles([

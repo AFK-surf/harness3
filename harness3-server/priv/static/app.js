@@ -7,6 +7,7 @@ const state = {
   workspaceRoot: "",
   poll: null,
   sessionRefreshTick: 0,
+  compactionRequesting: false,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -360,6 +361,7 @@ function renderThread(forceScroll = false) {
   const agent = state.current.agents.find((item) => item.id === state.selectedAgent);
   if (!agent) return;
   $("#thread-title").textContent = `${agent.id} · round ${agent.round}`;
+  renderCompactButton(agent);
   const thread = $("#thread");
   const nearBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 100;
   const visible = agent.messages.filter((message) => message.role !== "system" && message.role !== "developer");
@@ -367,6 +369,33 @@ function renderThread(forceScroll = false) {
     ? visible.map((message) => messageHtml(message, agent.id)).join("") + failureHtml(agent)
     : `<div class="thread-empty">Send the first message below to start ${escapeHtml(agent.id)}.</div>`;
   if (forceScroll || nearBottom) thread.scrollTop = thread.scrollHeight;
+}
+
+function renderCompactButton(agent) {
+  const button = $("#compact-button");
+  const compaction = agent.compaction;
+  const hasMessages = agent.messages.length > 0;
+  button.disabled = state.compactionRequesting || compaction.pending || !hasMessages;
+  button.classList.toggle("pending", compaction.pending);
+  button.classList.toggle("failed", Boolean(compaction.error));
+  button.textContent = state.compactionRequesting
+    ? "Requesting…"
+    : compaction.pending
+      ? "Compacting…"
+      : compaction.error
+        ? "Retry compact"
+        : "Compact";
+  if (!hasMessages) {
+    button.title = "This agent has no session context to compact";
+  } else if (compaction.pending) {
+    button.title = `Compaction generation ${compaction.requested} is pending`;
+  } else if (compaction.error) {
+    button.title = `Last compaction failed: ${compaction.error}`;
+  } else if (compaction.context_tokens) {
+    button.title = `Compact the selected agent's model context (last request: ${number(compaction.context_tokens)} tokens)`;
+  } else {
+    button.title = "Compact the selected agent's model context";
+  }
 }
 
 function messageHtml(message, agentId) {
@@ -495,6 +524,24 @@ async function stopSession() {
   }
 }
 
+async function compactSelectedAgent() {
+  if (!state.current || !state.selectedAgent || state.compactionRequesting) return;
+  const sessionId = state.current.id;
+  const agentId = state.selectedAgent;
+  state.compactionRequesting = true;
+  renderThread();
+  try {
+    const result = await api(`/api/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}/compact`, { method: "POST" });
+    toast(`Compaction generation ${result.generation} requested for ${agentId}.`);
+    await refreshCurrent();
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    state.compactionRequesting = false;
+    if (state.current) renderThread();
+  }
+}
+
 async function refreshCurrent(forceScroll = false) {
   if (!state.current) return;
   try {
@@ -537,6 +584,7 @@ function bindEvents() {
     renderThread(true);
   });
   $("#stop-button").addEventListener("click", stopSession);
+  $("#compact-button").addEventListener("click", compactSelectedAgent);
   newForm.addEventListener("submit", (event) => {
     if (event.submitter?.value === "cancel") return;
     event.preventDefault();

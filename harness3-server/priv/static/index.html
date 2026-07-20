@@ -78,7 +78,10 @@
                   <span class="sidebar-label">Agent thread</span>
                   <strong id="thread-title"></strong>
                 </div>
-                <div class="poll-indicator" title="The durable group state is refreshed automatically"><span></span> live</div>
+                <div class="thread-toolbar-actions">
+                  <button class="ghost compact-context" id="compact-button" type="button" title="Compact the selected agent's model context">Compact</button>
+                  <div class="poll-indicator" title="The durable group state is refreshed automatically"><span></span> live</div>
+                </div>
               </div>
               <div class="thread" id="thread" aria-live="polite"></div>
               <form class="composer" id="message-form">
