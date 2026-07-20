@@ -18,7 +18,7 @@ through storage objects (CAS writes, leases) plus token-authenticated HTTP RPC.
 | `llm/anthropic_messages`, `llm/openai_chat_completions`, `llm/openai_responses` | Provider adapters: build HTTP requests, decode buffered/streamed responses into neutral events |
 | `model_catalog` | Durable, versioned catalog of models (id → name/endpoint/type/credentials), CAS-committed |
 | `plugin` | Plugin registry/runtime: system-prompt sections, tools, callbacks, activation hooks, JSON state per plugin |
-| `plugin/mcp/*` | Reusable MCP configuration/catalog, 2025-11-25 client, stdio and Streamable HTTP transports, discovery runtime, and harness plugin adapter |
+| `plugin/mcp/*` | Reusable MCP configuration/catalog, client, stdio and Streamable HTTP transports, per-agent connections, and harness plugin adapter |
 | `agent` | Single agent: round loop (LLM call → tool execution → commit), streaming accumulator, plugin host actor, durable state (de)serialization |
 | `agent_profile` | Node-local ETS registry of installed profiles (id → plugin registry, transport, observer, limits) |
 | `agent_group` | Durable group of agents in one storage object; coordinator actor, lease/fencing, message delivery, cross-agent callbacks |
@@ -280,18 +280,22 @@ not:
   ambiguous-write read-back confirmation. It holds no connections and performs no
   discovery, so every call into it is served from memory and is safe from any
   process, including the group coordinator.
-- `mcp/pool` owns one agent's connections and its discovered tool manifest. It is
-  started from *inside that agent's plugin host* on first tool use, so it is linked
-  to the host and dies with the agent, and its handle lives in the plugin's
-  **ephemeral resource** (`plugin.resource` / `plugin.set_resource`) — a per-agent
-  slot that, unlike plugin state, is never serialized and never leaves the agent.
-  Connections are therefore never shared: one agent's discovery cannot close a
-  connection another agent is calling through, and an agent's servers die with it.
+- `mcp/connections` holds one agent's connections and discovered tools as **plain
+  state**,
+  not a process. The value lives in the plugin's **ephemeral resource**
+  (`plugin.resource` / `plugin.set_resource`) — a per-agent slot that, unlike plugin
+  state, is never serialized and never leaves the agent. Servers are contacted from
+  *inside that agent's plugin host* on first tool use, so the transport actors are
+  spawn-linked to the host and die with the agent. Connections are therefore never
+  shared: one agent's discovery cannot close a connection another agent is calling
+  through. An intermediate owning actor would add a hop without adding isolation —
+  it would be linked to the host too — and the host is already the single serialized
+  caller, since an agent's tool calls run sequentially.
 - **Activation never touches MCP servers.** Activation hooks run inside the group
   coordinator, which also services lease renewal, so the hook only validates that
   the configuration exists and is enabled. Connecting, discovering, and calling all
   happen in the agent's plugin host.
-- Within a pool, a manifest is reused for a TTL (5 min) while its connections are
+- Within an agent, a manifest is reused for a TTL (5 min) while its connections are
   still alive, so repeated tool calls don't re-spawn servers; a dead connection
   forces re-discovery rather than failing every call until the TTL lapses.
 

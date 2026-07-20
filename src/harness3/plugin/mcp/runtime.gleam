@@ -2,8 +2,9 @@
 ////
 //// This owns durable configuration only — the same role `model_catalog` plays
 //// for models. It deliberately owns no connections and performs no discovery:
-//// connections belong to the agent that uses them (see `mcp/pool`), so one
-//// agent can never tear down or block another's servers through shared state.
+//// connections belong to the agent that uses them (see `mcp/connections`), so
+//// one agent can never tear down or block another's servers through shared
+//// state.
 
 import exception
 import gleam/erlang/process.{type Subject}
@@ -13,7 +14,7 @@ import gleam/string
 import harness3/plugin/mcp/catalog
 import harness3/plugin/mcp/client
 import harness3/plugin/mcp/configuration
-import harness3/plugin/mcp/pool
+import harness3/plugin/mcp/connections
 import harness3/plugin/mcp/stdio
 import harness3/plugin/mcp/streamable_http
 
@@ -22,7 +23,7 @@ pub opaque type Runtime {
 }
 
 pub type Connector =
-  pool.Connector
+  connections.Connector
 
 type State {
   State(
@@ -43,9 +44,9 @@ type Message {
     configuration_id: String,
     reply: Subject(Result(configuration.Configuration, String)),
   )
-  GetSpec(
+  GetConnectionSpec(
     configuration_id: String,
-    reply: Subject(Result(pool.Spec, String)),
+    reply: Subject(Result(connections.Spec, String)),
     runtime: Subject(Message),
   )
   Stop
@@ -113,15 +114,15 @@ pub fn configuration(
 }
 
 /// Resolves everything an agent needs to open its own connections. The caller
-/// starts the pool itself, so the pool belongs to the caller's process.
-pub fn pool_spec(
+/// opens them itself, so the transports belong to the caller's process.
+pub fn connection_spec(
   runtime: Runtime,
   configuration_id: String,
-) -> Result(pool.Spec, String) {
+) -> Result(connections.Spec, String) {
   let Runtime(subject) = runtime
   exception.rescue(fn() {
     process.call(subject, 5000, fn(reply) {
-      GetSpec(configuration_id, reply, subject)
+      GetConnectionSpec(configuration_id, reply, subject)
     })
   })
   |> result.map_error(fn(_) { "MCP runtime is unavailable" })
@@ -157,12 +158,12 @@ fn handle_message(
       process.send(reply, enabled_configuration(state, configuration_id))
       actor.continue(state)
     }
-    GetSpec(configuration_id, reply, runtime) -> {
+    GetConnectionSpec(configuration_id, reply, runtime) -> {
       process.send(
         reply,
         enabled_configuration(state, configuration_id)
           |> result.map(fn(_) {
-            pool.Spec(
+            connections.Spec(
               // Re-read on every discovery so configuration edits reach
               // agents that are already running.
               fn() { configuration_of(runtime, configuration_id) },

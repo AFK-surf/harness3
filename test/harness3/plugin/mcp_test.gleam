@@ -10,8 +10,8 @@ import harness3/plugin as harness_plugin
 import harness3/plugin/mcp/catalog
 import harness3/plugin/mcp/client
 import harness3/plugin/mcp/configuration
+import harness3/plugin/mcp/connections
 import harness3/plugin/mcp/plugin as mcp_plugin
-import harness3/plugin/mcp/pool
 import harness3/plugin/mcp/protocol
 import harness3/plugin/mcp/runtime
 import harness3/storage/local
@@ -524,11 +524,12 @@ pub fn composio_streamable_http_smoke_test() {
       let assert Ok(value) =
         catalog.put_configuration(catalog.new(), configuration)
       let assert Ok(mcp_runtime) = runtime.start(value, envoy.get, fn() { 0 })
-      let assert Ok(spec) = runtime.pool_spec(mcp_runtime, "composio-smoke")
-      let assert Ok(connections) = pool.start(spec)
-      let assert Ok(listing) = pool.list(connections, 60_000)
+      let assert Ok(spec) =
+        runtime.connection_spec(mcp_runtime, "composio-smoke")
+      let #(connections, listed) = connections.list(connections.new(spec))
+      let assert Ok(listing) = listed
       assert !list.is_empty(listing.tools)
-      pool.stop(connections)
+      let _ = connections.close(connections)
       runtime.stop(mcp_runtime)
     }
   }

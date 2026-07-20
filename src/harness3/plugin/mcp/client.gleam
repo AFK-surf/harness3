@@ -22,7 +22,7 @@ pub fn connection(
   Connection(request, notify, close, fn() { True })
 }
 
-/// Adds a liveness probe so a pool can tell a dropped transport from a fresh
+/// Adds a liveness probe so a holder can tell a dropped transport from a fresh
 /// one and re-discover instead of failing every call.
 pub fn with_liveness(
   connection: Connection,

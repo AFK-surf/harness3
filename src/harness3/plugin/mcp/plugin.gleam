@@ -8,8 +8,8 @@ import gleam/string
 import harness3/llm
 import harness3/plugin
 import harness3/plugin/mcp/configuration
+import harness3/plugin/mcp/connections
 import harness3/plugin/mcp/json_document
-import harness3/plugin/mcp/pool
 import harness3/plugin/mcp/protocol
 import harness3/plugin/mcp/runtime
 
@@ -95,23 +95,27 @@ fn list_tool(
             plugin.ToolOutput([llm.Text(error)], True),
           ))
         Ok(_) -> {
-          // Opening connections here — inside this agent's plugin host — is
-          // what makes them the agent's own: the pool is linked to the host
-          // and dies with it.
-          let #(context, opened) =
-            ensure_pool(mcp_runtime, configuration_id, context)
-          let output = case opened {
-            Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
-            Ok(connections) ->
-              case pool.list(connections, listing_timeout_milliseconds) {
-                Ok(listing) ->
-                  plugin.ToolOutput(
-                    [llm.Text(listing |> encode_listing |> json.to_string)],
-                    False,
-                  )
-                Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
-              }
-          }
+          // Connecting here — inside this agent's plugin host — is what
+          // makes the transports the agent's own: they are linked to the host
+          // and die with it.
+          let #(context, output) =
+            with_connections(
+              mcp_runtime,
+              configuration_id,
+              context,
+              fn(connections) {
+                let #(connections, listing) = connections.list(connections)
+                let output = case listing {
+                  Ok(listing) ->
+                    plugin.ToolOutput(
+                      [llm.Text(listing |> encode_listing |> json.to_string)],
+                      False,
+                    )
+                  Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
+                }
+                #(connections, output)
+              },
+            )
           Ok(plugin.hook_result(state, context, output))
         }
       }
@@ -172,89 +176,78 @@ fn call_tool(
             True,
           ),
         )
-        Ok(call) -> {
-          let #(context, opened) =
-            ensure_pool(mcp_runtime, configuration_id, context)
-          let output = case opened {
-            Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
-            Ok(connections) ->
-              case
-                pool.call(
+        Ok(call) ->
+          with_connections(
+            mcp_runtime,
+            configuration_id,
+            context,
+            fn(connections) {
+              let #(connections, outcome) =
+                connections.call(
                   connections,
                   call.tool,
                   json.to_string(call.arguments),
-                  call_timeout_milliseconds,
                 )
-              {
+              let output = case outcome {
                 Ok(result) -> call_output(result)
                 Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
               }
-          }
-          #(context, output)
-        }
+              #(connections, output)
+            },
+          )
       }
       Ok(plugin.hook_result(state, context, output))
     },
   )
 }
 
-/// Returns this agent's connection pool, starting it on first use.
+/// Runs `use_connections` against this agent's connections, creating them on
+/// first use and storing the updated value back in the plugin's ephemeral
+/// resource.
 ///
-/// The pool is started from here, which runs inside the agent's plugin host,
-/// so it is linked to that host and dies with the agent. Its handle lives in
-/// the plugin's ephemeral resource — never in the durable state and never in
-/// node-wide state — so no other agent can reach or invalidate it.
-fn ensure_pool(
+/// The resource is per-agent and never persisted, so the transports opened
+/// here — linked to this plugin host — are reachable only by this agent and
+/// die with it.
+fn with_connections(
   mcp_runtime: runtime.Runtime,
   configuration_id: String,
   context: plugin.Context,
-) -> #(plugin.Context, Result(pool.Pool, String)) {
-  case existing_pool(context) {
-    Some(connections) -> #(context, Ok(connections))
+  use_connections: fn(connections.Connections) ->
+    #(connections.Connections, plugin.ToolOutput),
+) -> #(plugin.Context, plugin.ToolOutput) {
+  case existing_connections(context) {
+    Some(connections) -> {
+      let #(connections, output) = use_connections(connections)
+      #(plugin.set_resource(context, to_dynamic(connections)), output)
+    }
     None ->
-      case runtime.pool_spec(mcp_runtime, configuration_id) {
-        Error(error) -> #(context, Error(error))
-        Ok(spec) ->
-          case pool.start(spec) {
-            Error(error) -> #(context, Error(error))
-            Ok(connections) -> #(
-              plugin.set_resource(context, to_dynamic(connections)),
-              Ok(connections),
-            )
-          }
+      case runtime.connection_spec(mcp_runtime, configuration_id) {
+        Error(error) -> #(context, plugin.ToolOutput([llm.Text(error)], True))
+        Ok(spec) -> {
+          let #(connections, output) = use_connections(connections.new(spec))
+          #(plugin.set_resource(context, to_dynamic(connections)), output)
+        }
       }
   }
 }
 
-fn existing_pool(context: plugin.Context) -> Option(pool.Pool) {
+fn existing_connections(
+  context: plugin.Context,
+) -> Option(connections.Connections) {
   case plugin.resource(context) {
     Error(_) -> None
-    Ok(value) -> {
-      let connections = from_dynamic(value)
-      // A pool whose process is gone (its agent's host was restarted) must be
-      // replaced rather than reused.
-      case pool.alive(connections) {
-        True -> Some(connections)
-        False -> None
-      }
-    }
+    Ok(value) -> Some(from_dynamic(value))
   }
 }
 
 @external(erlang, "gleam_stdlib", "identity")
-fn to_dynamic(value: pool.Pool) -> dynamic.Dynamic
+fn to_dynamic(value: connections.Connections) -> dynamic.Dynamic
 
 @external(erlang, "gleam_stdlib", "identity")
-fn from_dynamic(value: dynamic.Dynamic) -> pool.Pool
+fn from_dynamic(value: dynamic.Dynamic) -> connections.Connections
 
-/// Bounds how long a tool call may occupy this agent's plugin host. Only this
-/// agent is affected, but the host also serves cross-agent callbacks.
-const call_timeout_milliseconds = 301_000
-
-const listing_timeout_milliseconds = 120_000
-
-fn encode_listing(listing: pool.Listing) -> json.Json {
-  let pool.Listing(configuration:, tools:, failures:) = listing
+fn encode_listing(listing: connections.Listing) -> json.Json {
+  let connections.Listing(configuration:, tools:, failures:) = listing
   json.object([
     #("configuration_id", json.string(configuration.id)),
     #("configuration_label", json.string(configuration.label)),
@@ -274,8 +267,8 @@ fn encode_tool(tool: configuration.Tool) -> json.Json {
   ])
 }
 
-fn encode_failure(failure: pool.ServerFailure) -> json.Json {
-  let pool.ServerFailure(server_id:, reason:) = failure
+fn encode_failure(failure: connections.ServerFailure) -> json.Json {
+  let connections.ServerFailure(server_id:, reason:) = failure
   json.object([
     #("server_id", json.string(server_id)),
     #("reason", json.string(reason)),

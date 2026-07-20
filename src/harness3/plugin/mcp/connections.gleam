@@ -1,23 +1,23 @@
 //// Per-agent ownership of MCP server connections.
 ////
-//// A pool belongs to exactly one agent: it is started from inside that
-//// agent's plugin host (so it is linked to the host and dies with the agent)
-//// and its handle is kept in the plugin's ephemeral resource. Connections are
-//// therefore never shared between agents, and one agent's discovery can never
-//// close a connection another agent is calling through.
+//// These connections belong to exactly one agent. They are opened from inside
+//// that agent's plugin host, so the transport actors are spawn-linked to the
+//// host and die with the agent, and the value holding them lives in the
+//// plugin's ephemeral resource. Nothing here is shared between agents, so one
+//// agent can never close or block another's servers.
+////
+//// This is deliberately plain state rather than a process: the plugin host is
+//// already the single, serialized owner, and an intermediate actor would add
+//// a hop without adding isolation — it would be linked to the host too.
 
-import exception
-import gleam/erlang/process.{type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
-import gleam/otp/actor
 import gleam/result
-import gleam/string
 import harness3/plugin/mcp/client
 import harness3/plugin/mcp/configuration
 import harness3/plugin/mcp/protocol
 
-/// How long a discovered manifest is reused before the pool re-lists tools.
+/// How long a discovered manifest is reused before servers are re-listed.
 const manifest_ttl_seconds = 300
 
 pub type ServerFailure {
@@ -36,10 +36,10 @@ pub type Connector =
   fn(configuration.Server, fn(String) -> Result(String, Nil)) ->
     Result(client.Connection, String)
 
-/// Everything a pool needs to reach its servers. The configuration is read
+/// Everything needed to reach an agent's servers. The configuration is read
 /// through a function rather than captured once, so an operator editing it
 /// reaches running agents: a changed configuration invalidates the manifest
-/// and forces reconnection on the next use.
+/// and forces reconnection on next use.
 pub type Spec {
   Spec(
     load_configuration: fn() -> Result(configuration.Configuration, String),
@@ -49,133 +49,80 @@ pub type Spec {
   )
 }
 
-pub opaque type Pool {
-  Pool(subject: Subject(Message))
-}
-
 type Connected {
   Connected(server_id: String, client: client.Connection)
 }
 
-type State {
-  State(
+pub opaque type Connections {
+  Connections(
     spec: Spec,
     /// The configuration the current connections were opened against.
     configuration: Option(configuration.Configuration),
-    connections: List(Connected),
+    open: List(Connected),
     tools: List(configuration.Tool),
     failures: List(ServerFailure),
     discovered_at: Option(Int),
   )
 }
 
-type Message {
-  List(reply: Subject(Result(Listing, String)))
-  Call(
-    exposed_name: String,
-    arguments: String,
-    reply: Subject(Result(protocol.CallResult, String)),
-  )
-  Stop
+/// Creates an unconnected value. Servers are contacted on first use, from
+/// whichever process calls `list` or `call` — which must be the agent's
+/// plugin host, so the transports it opens are owned by that agent.
+pub fn new(spec: Spec) -> Connections {
+  Connections(spec, None, [], [], [], None)
 }
 
-/// Starts a pool. Call this from the process that should own it — inside an
-/// agent's plugin host — so the link ties the pool's lifetime to that agent.
-pub fn start(spec: Spec) -> Result(Pool, String) {
-  actor.new(State(spec, None, [], [], [], None))
-  |> actor.on_message(handle_message)
-  |> actor.start
-  |> result.map(fn(started) { Pool(started.data) })
-  |> result.map_error(fn(error) { string.inspect(error) })
-}
-
-/// Lists the tools reachable through this agent's servers, discovering first
-/// when no fresh manifest is held. Blocks the calling plugin host only.
-pub fn list(pool: Pool, timeout: Int) -> Result(Listing, String) {
-  let Pool(subject) = pool
-  exception.rescue(fn() { process.call(subject, timeout, List) })
-  |> result.map_error(fn(_) { "MCP connections are unavailable" })
-  |> result.flatten
+/// Lists the tools reachable through this agent's servers, connecting and
+/// discovering first when no fresh manifest is held.
+pub fn list(
+  connections: Connections,
+) -> #(Connections, Result(Listing, String)) {
+  let #(next, discovered) = ensure_discovered(connections)
+  let listing = case discovered, next.configuration {
+    Error(error), _ -> Error(error)
+    Ok(Nil), Some(configuration) ->
+      Ok(Listing(configuration, next.tools, next.failures))
+    Ok(Nil), None -> Error("MCP configuration is unavailable")
+  }
+  #(next, listing)
 }
 
 pub fn call(
-  pool: Pool,
+  connections: Connections,
   exposed_name: String,
   arguments: String,
-  timeout: Int,
-) -> Result(protocol.CallResult, String) {
-  let Pool(subject) = pool
-  exception.rescue(fn() {
-    process.call(subject, timeout, fn(reply) {
-      Call(exposed_name, arguments, reply)
-    })
-  })
-  |> result.map_error(fn(_) { "MCP tool call timed out" })
-  |> result.flatten
-}
-
-pub fn stop(pool: Pool) -> Nil {
-  let Pool(subject) = pool
-  process.send(subject, Stop)
-}
-
-pub fn alive(pool: Pool) -> Bool {
-  let Pool(subject) = pool
-  case process.subject_owner(subject) {
-    Ok(pid) -> process.is_alive(pid)
-    Error(_) -> False
+) -> #(Connections, Result(protocol.CallResult, String)) {
+  let #(next, discovered) = ensure_discovered(connections)
+  let outcome = {
+    use _ <- result.try(discovered)
+    use #(connection, tool, timeout) <- result.try(prepare_call(
+      next,
+      exposed_name,
+    ))
+    client.call_tool(connection, tool.name, arguments, timeout)
   }
+  #(next, outcome)
 }
 
-fn handle_message(
-  state: State,
-  message: Message,
-) -> actor.Next(State, Message) {
-  case message {
-    List(reply) -> {
-      let #(next, loaded) = ensure_discovered(state)
-      process.send(reply, case loaded, next.configuration {
-        Error(error), _ -> Error(error)
-        Ok(Nil), Some(configuration) ->
-          Ok(Listing(configuration, next.tools, next.failures))
-        Ok(Nil), None -> Error("MCP configuration is unavailable")
-      })
-      actor.continue(next)
-    }
-    Call(exposed_name, arguments, reply) -> {
-      let #(next, loaded) = ensure_discovered(state)
-      case result.try(loaded, fn(_) { prepare_call(next, exposed_name) }) {
-        Error(error) -> process.send(reply, Error(error))
-        Ok(#(connection, tool, timeout)) ->
-          // Run the call outside the pool so a slow tool does not block this
-          // agent's own `mcp.list`, and so the pool can still be stopped.
-          process.spawn_unlinked(fn() {
-            process.send(
-              reply,
-              client.call_tool(connection, tool.name, arguments, timeout),
-            )
-          })
-          |> fn(_) { Nil }
-      }
-      actor.continue(next)
-    }
-    Stop -> {
-      close_all(state)
-      actor.stop()
-    }
-  }
+/// Closes every open transport. The agent's plugin host dying closes them
+/// anyway through the link; this is for callers that finish with them sooner.
+pub fn close(connections: Connections) -> Connections {
+  close_all(connections)
+  Connections(..connections, open: [], discovered_at: None)
 }
 
-fn ensure_discovered(state: State) -> #(State, Result(Nil, String)) {
+fn ensure_discovered(
+  connections: Connections,
+) -> #(Connections, Result(Nil, String)) {
   let Spec(load_configuration:, connector:, resolve_environment:, now_seconds:) =
-    state.spec
+    connections.spec
   case load_configuration() {
-    Error(error) -> #(state, Error(error))
+    Error(error) -> #(connections, Error(error))
     Ok(configuration) ->
-      case is_fresh(state, configuration) {
-        True -> #(state, Ok(Nil))
+      case is_fresh(connections, configuration) {
+        True -> #(connections, Ok(Nil))
         False -> {
-          close_all(state)
+          close_all(connections)
           let #(discovered, failures) =
             discover_servers(
               configuration.servers,
@@ -185,10 +132,10 @@ fn ensure_discovered(state: State) -> #(State, Result(Nil, String)) {
               [],
             )
           #(
-            State(
-              ..state,
+            Connections(
+              ..connections,
               configuration: Some(configuration),
-              connections: list.map(discovered, fn(item) { item.0 }),
+              open: list.map(discovered, fn(item) { item.0 }),
               tools: list.flat_map(discovered, fn(item) { item.1 }),
               failures:,
               discovered_at: Some(now_seconds()),
@@ -200,25 +147,28 @@ fn ensure_discovered(state: State) -> #(State, Result(Nil, String)) {
   }
 }
 
-fn is_fresh(state: State, configuration: configuration.Configuration) -> Bool {
+fn is_fresh(
+  connections: Connections,
+  configuration: configuration.Configuration,
+) -> Bool {
   // An edited configuration must not keep serving connections opened against
   // the previous definition.
-  let unchanged = state.configuration == Some(configuration)
-  case state.discovered_at {
+  let unchanged = connections.configuration == Some(configuration)
+  case connections.discovered_at {
     None -> False
     Some(at) -> {
-      let Spec(now_seconds:, ..) = state.spec
+      let Spec(now_seconds:, ..) = connections.spec
       let within_ttl = now_seconds() - at < manifest_ttl_seconds
-      // A connection that has since died forces a re-listing rather than
-      // failing every call until the TTL lapses.
+      // A transport that has since died forces re-listing rather than failing
+      // every call until the TTL lapses.
       let live =
-        list.all(state.connections, fn(entry) { client.alive(entry.client) })
+        list.all(connections.open, fn(entry) { client.alive(entry.client) })
       let covered =
         list.all(configuration.servers, fn(server) {
-          list.any(state.failures, fn(failure) {
+          list.any(connections.failures, fn(failure) {
             failure.server_id == server.id
           })
-          || list.any(state.connections, fn(entry) {
+          || list.any(connections.open, fn(entry) {
             entry.server_id == server.id
           })
         })
@@ -227,8 +177,8 @@ fn is_fresh(state: State, configuration: configuration.Configuration) -> Bool {
   }
 }
 
-fn close_all(state: State) -> Nil {
-  list.each(state.connections, fn(entry) { client.close(entry.client) })
+fn close_all(connections: Connections) -> Nil {
+  list.each(connections.open, fn(entry) { client.close(entry.client) })
 }
 
 fn discover_servers(
@@ -304,15 +254,15 @@ fn validate_server_tools(
 }
 
 fn prepare_call(
-  state: State,
+  connections: Connections,
   exposed_name: String,
 ) -> Result(#(client.Connection, configuration.Tool, Int), String) {
-  use configuration <- result.try(case state.configuration {
+  use configuration <- result.try(case connections.configuration {
     Some(configuration) -> Ok(configuration)
     None -> Error("MCP configuration is unavailable")
   })
   use tool <- result.try(
-    list.find(state.tools, fn(tool) { tool.exposed_name == exposed_name })
+    list.find(connections.tools, fn(tool) { tool.exposed_name == exposed_name })
     |> result.map_error(fn(_) { "unknown MCP tool: " <> exposed_name }),
   )
   use server <- result.try(
@@ -320,7 +270,7 @@ fn prepare_call(
     |> result.map_error(fn(_) { "MCP tool references an unknown server" }),
   )
   use connected <- result.try(
-    list.find(state.connections, fn(entry) { entry.server_id == tool.server_id })
+    list.find(connections.open, fn(entry) { entry.server_id == tool.server_id })
     |> result.map_error(fn(_) {
       "MCP server is unavailable: " <> tool.server_id
     }),
