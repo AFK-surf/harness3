@@ -14,6 +14,7 @@ import harness3/agent
 import harness3/agent_group
 import harness3/llm
 import harness3/model_catalog
+import harness3/plugin/mcp/configuration as mcp_configuration
 import harness3_server/config
 import harness3_server/service.{type Service, type Session}
 import mist.{type ResponseData}
@@ -62,6 +63,19 @@ fn handle(
         200,
         json.object([
           #("models", json.array(service.models(service), model_json)),
+        ]),
+      )
+    http.Get, ["api", "mcp", "configurations"] ->
+      json_response(
+        200,
+        json.object([
+          #(
+            "configurations",
+            json.array(
+              service.mcp_configurations(service),
+              mcp_configuration_json,
+            ),
+          ),
         ]),
       )
     http.Get, ["api", "sessions"] ->
@@ -229,12 +243,19 @@ fn session_json(session: Session) -> json.Json {
     #(
       "agents",
       json.array(group.agents, fn(state) {
-        let role =
+        let spec =
           metadata.agents
           |> list.find(fn(spec) { spec.id == state.id })
-          |> result.map(fn(spec) { spec.role })
-          |> result.unwrap("")
-        agent_json(state, role)
+        let #(role, kind, mcp_configuration_id) = case spec {
+          Error(_) -> #("", "coding", None)
+          Ok(spec) ->
+            case spec.kind {
+              service.CodingAgent -> #(spec.role, "coding", None)
+              service.ResearchAgent -> #(spec.role, "researcher", None)
+              service.McpSpecialist(id) -> #(spec.role, "mcp", Some(id))
+            }
+        }
+        agent_json(state, role, kind, mcp_configuration_id)
       }),
     ),
   ])
@@ -255,7 +276,12 @@ fn execution_json(execution: agent_group.ExecutionState) -> json.Json {
   }
 }
 
-fn agent_json(state: agent.State, role: String) -> json.Json {
+fn agent_json(
+  state: agent.State,
+  role: String,
+  kind: String,
+  mcp_configuration_id: Option(String),
+) -> json.Json {
   let llm.Stats(
     input_tokens:,
     output_tokens:,
@@ -271,6 +297,8 @@ fn agent_json(state: agent.State, role: String) -> json.Json {
   json.object([
     #("id", json.string(state.id)),
     #("role", json.string(role)),
+    #("kind", json.string(kind)),
+    #("mcp_configuration_id", json.nullable(mcp_configuration_id, json.string)),
     #("status", json.string(status)),
     #("failure", option_string(failure)),
     #("round", json.int(state.round)),
@@ -400,7 +428,37 @@ fn create_input_decoder() -> decode.Decoder(service.CreateInput) {
   use model_id <- decode.field("model_id", decode.string)
   use workspace <- decode.optional_field("workspace", "", decode.string)
   use team_size <- decode.optional_field("team_size", 3, decode.int)
-  decode.success(service.CreateInput(model_id, workspace, team_size))
+  use mcp_configuration_id <- decode.optional_field(
+    "mcp_configuration_id",
+    None,
+    decode.optional(decode.string),
+  )
+  decode.success(service.CreateInput(
+    model_id,
+    workspace,
+    team_size,
+    mcp_configuration_id,
+  ))
+}
+
+fn mcp_configuration_json(
+  configuration: mcp_configuration.Configuration,
+) -> json.Json {
+  let #(refreshed_at, tool_count) = case configuration.manifest {
+    Some(manifest) -> #(
+      Some(manifest.refreshed_at_seconds),
+      list.length(manifest.tools),
+    )
+    None -> #(None, 0)
+  }
+  json.object([
+    #("id", json.string(configuration.id)),
+    #("label", json.string(configuration.label)),
+    #("enabled", json.bool(configuration.enabled)),
+    #("server_count", json.int(list.length(configuration.servers))),
+    #("tool_count", json.int(tool_count)),
+    #("refreshed_at_seconds", option_int(refreshed_at)),
+  ])
 }
 
 type MessageRequest {

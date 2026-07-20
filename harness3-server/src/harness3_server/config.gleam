@@ -1,4 +1,5 @@
 import envoy
+import filepath
 import gleam/bit_array
 import gleam/crypto
 import gleam/dict
@@ -6,10 +7,11 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{type Option, None}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import harness3/model_catalog
+import harness3/plugin/mcp/configuration as mcp_configuration
 import simplifile
 
 pub type ModelConfig {
@@ -65,6 +67,42 @@ pub fn models_path() -> String {
   environment_or("HARNESS3_MODELS_PATH", home <> "/.pi/agent/models.json")
 }
 
+pub fn mcp_configurations_path() -> Result(Option(String), String) {
+  case environment("HARNESS3_MCP_CONFIG_PATH") {
+    Error(_) -> Ok(None)
+    Ok(path) ->
+      case filepath.is_absolute(path) {
+        True -> Ok(Some(path))
+        False -> Error("HARNESS3_MCP_CONFIG_PATH must be absolute")
+      }
+  }
+}
+
+pub fn load_mcp_configurations(
+  path: String,
+) -> Result(List(mcp_configuration.Configuration), String) {
+  use body <- result.try(
+    simplifile.read(path)
+    |> result.map_error(fn(error) {
+      "could not read MCP configuration: " <> simplifile.describe_error(error)
+    }),
+  )
+  use configurations <- result.try(
+    json.parse(body, mcp_configurations_decoder())
+    |> result.map_error(fn(error) {
+      "could not decode MCP configuration: " <> string.inspect(error)
+    }),
+  )
+  let configurations =
+    list.map(configurations, fn(configuration) {
+      mcp_configuration.Configuration(..configuration, manifest: None)
+    })
+  configurations
+  |> list.try_each(mcp_configuration.validate)
+  |> result.map_error(fn(error) { string.inspect(error) })
+  |> result.map(fn(_) { configurations })
+}
+
 pub fn load_models(path: String) -> Result(List(ModelConfig), String) {
   use body <- result.try(
     simplifile.read(path)
@@ -118,6 +156,16 @@ fn providers_decoder() -> decode.Decoder(dict.Dict(String, PiProvider)) {
     decode.dict(decode.string, provider_decoder()),
   )
   decode.success(providers)
+}
+
+fn mcp_configurations_decoder() -> decode.Decoder(
+  List(mcp_configuration.Configuration),
+) {
+  use configurations <- decode.field(
+    "configurations",
+    decode.list(of: mcp_configuration.decoder()),
+  )
+  decode.success(configurations)
 }
 
 fn provider_decoder() -> decode.Decoder(PiProvider) {

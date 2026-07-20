@@ -28,7 +28,7 @@ fn output_text(output: plugin.ToolOutput) -> String {
 pub fn coding_tools_write_read_exec_and_reject_escape_test() {
   let root = temporary_root()
   let assert Ok(Nil) = simplifile.create_directory_all(root)
-  let coding = coding_plugin.new("group", "lead", "Lead", root, [])
+  let coding = coding_plugin.workspace(root)
   let assert Ok(registry) = plugin.registry([coding])
   let assert Ok(runtime) = plugin.activate(registry, plugin.empty_states())
 

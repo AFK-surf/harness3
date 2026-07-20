@@ -27,6 +27,8 @@ exception = ">= 2.1.1 and < 3.0.0"
 hackney = ">= 1.25.0 and < 2.0.0"
 simplifile = ">= 2.6.0 and < 3.0.0"
 envoy = ">= 1.2.0 and < 2.0.0"
+child_process = ">= 2.1.2 and < 3.0.0"
+filepath = ">= 1.1.2 and < 2.0.0"
 
 [dev_dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"

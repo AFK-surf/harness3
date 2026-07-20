@@ -6,7 +6,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/order
 import gleam/result
 import gleam/string
@@ -16,6 +16,9 @@ import harness3/agent_group_registry
 import harness3/agent_profile
 import harness3/model_catalog
 import harness3/plugin
+import harness3/plugin/mcp
+import harness3/plugin/mcp/catalog as mcp_catalog
+import harness3/plugin/mcp/configuration as mcp_configuration
 import harness3/storage.{type Storage}
 import harness3_server/coding_plugin
 import harness3_server/config.{type ModelConfig}
@@ -24,6 +27,8 @@ import harness3_server/transport
 import simplifile
 
 const catalog_key = "harness3-server/catalog"
+
+const mcp_catalog_key = "harness3-server/mcp-catalog"
 
 const sessions_prefix = "harness3-server/sessions/"
 
@@ -38,8 +43,14 @@ type TimeUnit {
 @external(erlang, "erlang", "system_time")
 fn system_time(unit: TimeUnit) -> Int
 
+pub type AgentKind {
+  CodingAgent
+  ResearchAgent
+  McpSpecialist(configuration_id: String)
+}
+
 pub type AgentSpec {
-  AgentSpec(id: String, role: String)
+  AgentSpec(id: String, role: String, kind: AgentKind)
 }
 
 pub type SessionMetadata {
@@ -59,7 +70,12 @@ pub type Session {
 }
 
 pub type CreateInput {
-  CreateInput(model_id: String, workspace: String, team_size: Int)
+  CreateInput(
+    model_id: String,
+    workspace: String,
+    team_size: Int,
+    mcp_configuration_id: Option(String),
+  )
 }
 
 pub opaque type Service {
@@ -67,6 +83,7 @@ pub opaque type Service {
     storage: Storage,
     models: List(ModelConfig),
     workspace_root: String,
+    mcp_runtime: mcp.Runtime,
     model_transport: agent.ModelTransport,
     max_output_tokens: Int,
     // Stable owner token for group claims, so every wake from this server
@@ -80,10 +97,12 @@ pub fn start() -> Result(Service, String) {
   use models <- result.try(config.load_models(config.models_path()))
   use root <- result.try(resolve_workspace_root())
   use _ <- result.try(install_catalog(storage, models))
+  use mcp_runtime <- result.try(start_mcp(storage))
   Ok(Service(
     storage:,
     models:,
     workspace_root: root,
+    mcp_runtime:,
     model_transport: transport.buffered_http(config.environment_int(
       "HARNESS3_MODEL_TIMEOUT_MS",
       300_000,
@@ -104,18 +123,34 @@ pub fn workspace_root(service: Service) -> String {
   service.workspace_root
 }
 
+pub fn mcp_configurations(
+  service: Service,
+) -> List(mcp_configuration.Configuration) {
+  service.mcp_runtime
+  |> mcp.catalog
+  |> mcp_catalog.configurations
+}
+
+pub fn stop(service: Service) -> Nil {
+  mcp.stop(service.mcp_runtime)
+}
+
 pub fn create_session(
   service: Service,
   input: CreateInput,
 ) -> Result(Session, String) {
   use _ <- result.try(validate_create(service, input))
+  use mcp_configuration_id <- result.try(select_mcp_configuration(
+    service,
+    input,
+  ))
   use workspace <- result.try(resolve_workspace(input.workspace))
   use _ <- result.try(
     simplifile.create_directory_all(workspace)
     |> result.map_error(simplifile.describe_error),
   )
   let id = new_id()
-  let agents = team(input.team_size)
+  let agents = team(input.team_size, mcp_configuration_id)
   let metadata =
     SessionMetadata(
       id:,
@@ -126,6 +161,7 @@ pub fn create_session(
       created_at: system_time(Second),
       agents:,
     )
+  use group_config <- result.try(group_config(service, metadata))
   let meta_key = metadata_key(id)
   use _ <- result.try(
     storage.put(
@@ -138,7 +174,6 @@ pub fn create_session(
       "could not persist session metadata: " <> string.inspect(error)
     }),
   )
-  let group_config = group_config(service, metadata)
   let states = initial_states(metadata)
   let created =
     agent_group.create(group_config, agent_group.new(id, catalog_key, states))
@@ -201,7 +236,7 @@ pub fn send_message(
   case agent_group_registry.send_message(id, agent_id, message) {
     Ok(Nil) -> Ok(Nil)
     Error(agent_group_registry.NotFound(_)) -> {
-      let config = group_config(service, metadata)
+      use config <- result.try(group_config(service, metadata))
       use loaded <- result.try(
         agent_group.resume(config)
         |> result.map_error(fn(error) {
@@ -295,6 +330,77 @@ fn install_catalog(
   }
 }
 
+fn start_mcp(backend: Storage) -> Result(mcp.Runtime, String) {
+  use path <- result.try(config.mcp_configurations_path())
+  use existing <- result.try(case mcp_catalog.resume(backend, mcp_catalog_key) {
+    Ok(session) -> Ok(Some(session))
+    Error(mcp_catalog.StorageFailed(storage.NotFound(_))) -> Ok(None)
+    Error(error) ->
+      Error("could not load MCP catalog: " <> string.inspect(error))
+  })
+  use desired <- result.try(case path {
+    None ->
+      case existing {
+        Some(session) -> Ok(mcp_catalog.catalog(session))
+        None -> Ok(mcp_catalog.new())
+      }
+    Some(path) -> {
+      use configurations <- result.try(config.load_mcp_configurations(path))
+      configurations
+      |> list.try_fold(mcp_catalog.new(), fn(catalog, configuration) {
+        mcp_catalog.put_configuration(catalog, configuration)
+      })
+      |> result.map_error(fn(error) { string.inspect(error) })
+    }
+  })
+  use runtime <- result.try(
+    mcp.start(desired, config.environment, fn() { system_time(Second) }),
+  )
+  let refreshed =
+    desired
+    |> mcp_catalog.configurations
+    |> list.filter(fn(configuration) { configuration.enabled })
+    |> list.try_each(fn(configuration) {
+      mcp.refresh(runtime, configuration.id)
+      |> result.map_error(fn(error) {
+        "could not refresh MCP configuration `"
+        <> configuration.id
+        <> "`: "
+        <> error
+      })
+    })
+  case refreshed {
+    Error(error) -> {
+      mcp.stop(runtime)
+      Error(error)
+    }
+    Ok(Nil) ->
+      case persist_mcp_catalog(backend, existing, mcp.catalog(runtime)) {
+        Ok(Nil) -> Ok(runtime)
+        Error(error) -> {
+          mcp.stop(runtime)
+          Error(error)
+        }
+      }
+  }
+}
+
+fn persist_mcp_catalog(
+  backend: Storage,
+  existing: Option(mcp_catalog.Session),
+  catalog: mcp_catalog.Catalog,
+) -> Result(Nil, String) {
+  let persisted = case existing {
+    Some(session) -> mcp_catalog.commit(session, catalog)
+    None -> mcp_catalog.create(backend, mcp_catalog_key, catalog)
+  }
+  persisted
+  |> result.map(fn(_) { Nil })
+  |> result.map_error(fn(error) {
+    "could not persist MCP catalog: " <> string.inspect(error)
+  })
+}
+
 fn validate_create(
   service: Service,
   input: CreateInput,
@@ -306,6 +412,30 @@ fn validate_create(
     False, _ -> Error("unknown model: " <> input.model_id)
     _, False -> Error("team_size must be between 1 and 4")
     _, _ -> Ok(Nil)
+  }
+}
+
+fn select_mcp_configuration(
+  service: Service,
+  input: CreateInput,
+) -> Result(Option(String), String) {
+  case input.mcp_configuration_id, input.team_size >= 2 {
+    Some(_), False ->
+      Error("an MCP specialist requires team_size to be at least 2")
+    Some(id), True ->
+      mcp.snapshot(service.mcp_runtime, id)
+      |> result.map(fn(_) { Some(id) })
+    None, False -> Ok(None)
+    None, True ->
+      case
+        mcp_configurations(service)
+        |> list.filter(fn(configuration) {
+          configuration.enabled && configuration.manifest != None
+        })
+      {
+        [] -> Ok(None)
+        [configuration, ..] -> Ok(Some(configuration.id))
+      }
   }
 }
 
@@ -325,7 +455,8 @@ fn load_session(
   service: Service,
   metadata: SessionMetadata,
 ) -> Result(Session, String) {
-  agent_group.load(group_config(service, metadata))
+  use group_config <- result.try(group_config(service, metadata))
+  agent_group.load(group_config)
   |> result.map(fn(group) { Session(metadata, group) })
   |> result.map_error(fn(error) { string.inspect(error) })
 }
@@ -404,38 +535,80 @@ fn initialize_session_metadata(
 fn group_config(
   service: Service,
   metadata: SessionMetadata,
-) -> agent_group.Config {
-  let profiles =
-    list.map(metadata.agents, fn(spec) {
-      let teammates =
-        metadata.agents
-        |> list.map(fn(item) { item.id })
-        |> list.filter(fn(id) { id != spec.id })
-      let coding =
-        coding_plugin.new(
+) -> Result(agent_group.Config, String) {
+  use profiles <- result.try(
+    list.try_map(metadata.agents, fn(spec) {
+      let message_targets = case spec.id {
+        "lead" ->
+          metadata.agents
+          |> list.map(fn(item) { item.id })
+          |> list.filter(fn(id) { id != "lead" })
+        _ ->
+          case list.any(metadata.agents, fn(item) { item.id == "lead" }) {
+            True -> ["lead"]
+            False -> []
+          }
+      }
+      let collaboration =
+        coding_plugin.collaboration(
           metadata.id,
           spec.id,
           spec.role,
-          metadata.workspace,
-          teammates,
+          message_targets,
+          capability_instructions(spec.kind),
         )
-      let assert Ok(registry) = plugin.registry([coding])
-      agent_profile.AgentProfile(
-        id: profile_id(metadata.id, spec.id),
-        registry:,
-        transport: service.model_transport,
-        max_output_tokens: Some(service.max_output_tokens),
-        reasoning_effort: None,
-        observe: fn(_) { Ok(Nil) },
+      use plugins <- result.try(case spec.kind {
+        CodingAgent ->
+          Ok([collaboration, coding_plugin.workspace(metadata.workspace)])
+        ResearchAgent -> Ok([collaboration])
+        McpSpecialist(configuration_id) -> {
+          use snapshot <- result.try(mcp.snapshot(
+            service.mcp_runtime,
+            configuration_id,
+          ))
+          use specialist <- result.try(
+            mcp.plugin(service.mcp_runtime, snapshot)
+            |> result.map_error(fn(error) { string.inspect(error) }),
+          )
+          Ok([collaboration, specialist])
+        }
+      })
+      use registry <- result.try(
+        plugin.registry(plugins)
+        |> result.map_error(fn(error) { string.inspect(error) }),
       )
-    })
-  agent_group.Config(
+      Ok(
+        agent_profile.AgentProfile(
+          id: profile_id(metadata.id, spec.id),
+          registry:,
+          transport: service.model_transport,
+          max_output_tokens: Some(service.max_output_tokens),
+          reasoning_effort: None,
+          observe: fn(_) { Ok(Nil) },
+        ),
+      )
+    }),
+  )
+  Ok(agent_group.Config(
     storage: service.storage,
     object_key: group_key(metadata.id),
     profiles:,
     lease_duration_seconds: lease_seconds,
     minimum_lifetime_milliseconds: minimum_lifetime_milliseconds,
-  )
+  ))
+}
+
+fn capability_instructions(kind: AgentKind) -> String {
+  case kind {
+    CodingAgent ->
+      "You can inspect and modify the shared workspace and run commands with the installed coding tools."
+    ResearchAgent ->
+      "You have no filesystem, workspace, shell, or MCP tools. Your only tool is MessageAgent, and you can use it only to report to the lead."
+    McpSpecialist(configuration_id) ->
+      "You are the MCP specialist for global configuration `"
+      <> configuration_id
+      <> "`. You have every tool exposed by that configuration, but no direct filesystem or shell access."
+  }
 }
 
 fn initial_states(metadata: SessionMetadata) -> List(agent.State) {
@@ -460,23 +633,35 @@ fn validate_agent(
   }
 }
 
-fn team(size: Int) -> List(AgentSpec) {
+fn team(size: Int, mcp_configuration_id: Option(String)) -> List(AgentSpec) {
+  let #(researcher_kind, researcher_role) = case mcp_configuration_id {
+    Some(id) -> #(
+      McpSpecialist(id),
+      "MCP research specialist. Has access to every tool in global MCP configuration `"
+        <> id
+        <> "`, has no filesystem or shell access, and can message only the lead agent.",
+    )
+    None -> #(
+      ResearchAgent,
+      "Researcher without an MCP configuration. Has no filesystem, workspace, shell, or external MCP access; can only message the lead agent.",
+    )
+  }
   [
     AgentSpec(
       "lead",
-      "Lead engineer. Own the task, inspect the repository, implement the main solution, delegate bounded work, and verify the final result.",
+      "Lead engineer. Has Read, Write, and Exec access to the selected workspace and can message every subagent; owns implementation, delegation, and verification.",
+      CodingAgent,
     ),
-    AgentSpec(
-      "researcher",
-      "Repository researcher. Investigate architecture, constraints, and likely failure modes; send concise findings to the lead.",
-    ),
+    AgentSpec("researcher", researcher_role, researcher_kind),
     AgentSpec(
       "implementer",
-      "Implementation specialist. Take a clearly assigned portion, make focused edits, run relevant tests, and report changed files.",
+      "Implementation specialist. Has Read, Write, and Exec access to the selected workspace and can message only the lead agent.",
+      CodingAgent,
     ),
     AgentSpec(
       "reviewer",
-      "Reviewer and test engineer. Inspect the current work for correctness, run tests, identify regressions, and suggest precise fixes.",
+      "Reviewer and test engineer. Has Read, Write, and Exec access to the selected workspace and can message only the lead agent.",
+      CodingAgent,
     ),
   ]
   |> list.take(size)
@@ -509,7 +694,7 @@ fn group_key(id: String) -> String {
 
 fn encode_metadata(metadata: SessionMetadata) -> json.Json {
   json.object([
-    #("schema_version", json.int(1)),
+    #("schema_version", json.int(2)),
     #("id", json.string(metadata.id)),
     #("title", json.string(metadata.title)),
     #("prompt", json.string(metadata.prompt)),
@@ -519,9 +704,19 @@ fn encode_metadata(metadata: SessionMetadata) -> json.Json {
     #(
       "agents",
       json.array(metadata.agents, fn(agent) {
+        let #(kind, mcp_configuration_id) = case agent.kind {
+          CodingAgent -> #("coding", None)
+          ResearchAgent -> #("researcher", None)
+          McpSpecialist(id) -> #("mcp", Some(id))
+        }
         json.object([
           #("id", json.string(agent.id)),
           #("role", json.string(agent.role)),
+          #("kind", json.string(kind)),
+          #(
+            "mcp_configuration_id",
+            json.nullable(mcp_configuration_id, json.string),
+          ),
         ])
       }),
     ),
@@ -538,7 +733,7 @@ fn metadata_decoder() -> decode.Decoder(SessionMetadata) {
   use created_at <- decode.field("created_at", decode.int)
   use agents <- decode.field("agents", decode.list(of: agent_spec_decoder()))
   case schema {
-    1 ->
+    2 ->
       decode.success(SessionMetadata(
         id,
         title,
@@ -559,5 +754,23 @@ fn metadata_decoder() -> decode.Decoder(SessionMetadata) {
 fn agent_spec_decoder() -> decode.Decoder(AgentSpec) {
   use id <- decode.field("id", decode.string)
   use role <- decode.field("role", decode.string)
-  decode.success(AgentSpec(id, role))
+  use kind <- decode.field("kind", decode.string)
+  use mcp_configuration_id <- decode.optional_field(
+    "mcp_configuration_id",
+    None,
+    decode.optional(decode.string),
+  )
+  case kind, mcp_configuration_id {
+    "coding", _ -> decode.success(AgentSpec(id, role, CodingAgent))
+    "researcher", _ -> decode.success(AgentSpec(id, role, ResearchAgent))
+    "mcp", Some(configuration_id) ->
+      decode.success(AgentSpec(id, role, McpSpecialist(configuration_id)))
+    "mcp", None ->
+      decode.failure(
+        AgentSpec("", "", ResearchAgent),
+        "MCP agent is missing mcp_configuration_id",
+      )
+    _, _ ->
+      decode.failure(AgentSpec("", "", ResearchAgent), "unknown agent kind")
+  }
 }

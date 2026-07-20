@@ -18,6 +18,7 @@ through storage objects (CAS writes, leases) plus token-authenticated HTTP RPC.
 | `llm/anthropic_messages`, `llm/openai_chat_completions`, `llm/openai_responses` | Provider adapters: build HTTP requests, decode buffered/streamed responses into neutral events |
 | `model_catalog` | Durable, versioned catalog of models (id → name/endpoint/type/credentials), CAS-committed |
 | `plugin` | Plugin registry/runtime: system-prompt sections, tools, callbacks, activation hooks, JSON state per plugin |
+| `plugin/mcp/*` | Reusable MCP configuration/catalog, 2025-11-25 client, stdio and Streamable HTTP transports, discovery runtime, and harness plugin adapter |
 | `agent` | Single agent: round loop (LLM call → tool execution → commit), streaming accumulator, plugin host actor, durable state (de)serialization |
 | `agent_profile` | Node-local ETS registry of installed profiles (id → plugin registry, transport, observer, limits) |
 | `agent_group` | Durable group of agents in one storage object; coordinator actor, lease/fencing, message delivery, cross-agent callbacks |
@@ -152,6 +153,33 @@ not produce event N+1 until `consume` of event N has returned (backpressure cont
   never during activation.
 - Tool invocation resolves the tool by global name, runs the owning plugin's hook, and
   returns `ToolOutput(content, is_error)`.
+
+### 4.1 MCP plugin
+
+- MCP configuration is application-owned and durable through a CAS catalog analogous
+  to the model catalog. Configurations contain one or more servers; plugin state and
+  server session metadata reference a configuration by stable ID. Credentials may be
+  literal or environment-variable bindings. Stdio executables and working directories
+  must be absolute; HTTP endpoints must be absolute HTTP(S) URLs.
+- The runtime supports MCP 2025-11-25 over newline-delimited stdio and Streamable HTTP.
+  It initializes each server, sends `notifications/initialized`, follows paginated
+  `tools/list` responses (bounded at 100 pages), and atomically replaces a
+  configuration's complete discovered manifest only after every server succeeds.
+  Failed refreshes close newly opened connections and retain the prior manifest and
+  connections. Tool calls are never retried because they may have side effects.
+- `Tool.input_schema` and `Tool.output_schema` are typed `json.Json` values produced by
+  object-only decoders. Catalog persistence and LLM tool definitions reuse those values
+  directly; there is no string-to-JSON cast. Server/tool names are deterministically
+  namespaced and hash-suffixed to satisfy the plugin registry's global uniqueness rule.
+- The server loads optional global configuration from an absolute
+  `HARNESS3_MCP_CONFIG_PATH`, performs live discovery, and persists only the refreshed
+  catalog. A configured team assigns the researcher every tool in one MCP
+  configuration plus `MessageAgent`, but no filesystem or shell capability. Coding
+  agents receive Read/Write/Exec plus `MessageAgent`, but no MCP tools. The lead may
+  message all subagents; every subagent's `MessageAgent` allow-list contains only the
+  lead, preventing direct peer-to-peer subagent communication. Without an MCP
+  configuration, the researcher remains a separate message-only profile and is not
+  granted local filesystem or shell tools.
 
 ## 5. Model catalog
 
@@ -446,3 +474,6 @@ unregistration only removes the exact (id, pid) pair.
 7. Tool names are globally unique per registry; dependencies are acyclic and must be
    declared to be callable.
 8. The persisted conversation never contains the synthesized system prompt.
+9. An MCP manifest becomes visible only after all configured servers initialize and
+   enumerate successfully; every exposed schema remains typed JSON across discovery,
+   persistence, plugin installation, and tool invocation.

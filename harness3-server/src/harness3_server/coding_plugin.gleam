@@ -14,41 +14,45 @@ import simplifile
 
 const plugin_name = "coding"
 
-pub fn new(
-  group_id: String,
-  agent_id: String,
-  role: String,
-  workspace: String,
-  teammates: List(String),
-) -> plugin.Plugin {
+/// Filesystem and shell capabilities for agents that are allowed to modify the
+/// selected workspace. Team coordination is installed separately so other
+/// agent kinds do not inherit these capabilities.
+pub fn workspace(workspace: String) -> plugin.Plugin {
   plugin.new(plugin_name, "{}")
   |> plugin.with_system_prompt(plugin.SystemPromptSection(
-    "Coding agent",
-    system_prompt(agent_id, role, workspace, teammates),
+    "Workspace tools",
+    "The shared workspace root is `"
+      <> workspace
+      <> "`. Use Read, Write, and Exec to inspect, change, and verify it. Tool paths are relative to this workspace.",
   ))
   |> plugin.with_tool(read_tool(workspace))
   |> plugin.with_tool(write_tool(workspace))
   |> plugin.with_tool(exec_tool(workspace))
-  |> plugin.with_tool(message_tool(group_id, agent_id, teammates))
 }
 
-fn system_prompt(
+/// Durable teammate messaging and the role prompt shared by heterogeneous
+/// agent profiles.
+pub fn collaboration(
+  group_id: String,
   agent_id: String,
   role: String,
-  workspace: String,
   teammates: List(String),
-) -> String {
-  "You are agent `"
-  <> agent_id
-  <> "` in a persistent harness3 coding team. Your role is: "
-  <> role
-  <> ".\n\nThe shared workspace root is `"
-  <> workspace
-  <> "`. Use Read, Write, and Exec to inspect, change, and verify it. Paths are relative to the workspace. "
-  <> "Your teammates are: "
-  <> string.join(teammates, ", ")
-  <> ". Use MessageAgent when another agent can help or needs your findings. "
-  <> "Messages are durable and wake the target agent. Coordinate explicitly, avoid overlapping edits, and report concrete results."
+  capability_instructions: String,
+) -> plugin.Plugin {
+  plugin.new("team", "{}")
+  |> plugin.with_system_prompt(plugin.SystemPromptSection(
+    "Team role",
+    "You are agent `"
+      <> agent_id
+      <> "` in a persistent harness3 team. Your role is: "
+      <> role
+      <> ".\n\n"
+      <> capability_instructions
+      <> " Your permitted MessageAgent recipients are: "
+      <> string.join(teammates, ", ")
+      <> ". MessageAgent rejects every other recipient. Subagents communicate only with the lead; the lead may communicate with every subagent. Messages are durable and wake the target agent. Coordinate explicitly and report concrete results.",
+  ))
+  |> plugin.with_tool(message_tool(group_id, agent_id, teammates))
 }
 
 fn read_tool(workspace: String) -> plugin.Tool {

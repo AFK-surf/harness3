@@ -29,6 +29,62 @@ Model secrets loaded from Pi are held in process environment variables. The
 durable harness catalog stores only generated environment-variable references,
 not the secret values.
 
+## MCP configurations
+
+Set `HARNESS3_MCP_CONFIG_PATH` to an absolute JSON file path to install global
+MCP configurations. On startup, the server validates the file, connects to all
+enabled servers, negotiates MCP 2025-11-25, discovers every tool, and stores the
+configuration plus discovered manifest in the durable MCP catalog. If the
+variable is omitted on a later start, the persisted catalog is reused.
+
+```json
+{
+  "configurations": [
+    {
+      "id": "research",
+      "label": "Research services",
+      "enabled": true,
+      "servers": [
+        {
+          "id": "knowledge",
+          "timeout_milliseconds": 60000,
+          "transport": {
+            "type": "streamable_http",
+            "endpoint": "https://mcp.example.com/mcp",
+            "headers": [
+              {
+                "name": "authorization",
+                "value": {
+                  "type": "environment_variable",
+                  "value": "KNOWLEDGE_MCP_TOKEN"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Stdio servers use `"type": "stdio"` with an absolute `executable`, optional
+`arguments`, an optional absolute `working_directory`, and `environment`
+bindings in the same format as HTTP headers. Prefer
+`environment_variable` bindings for secrets: literal values are persisted as
+written. Supplied manifests are ignored and replaced with live discovery.
+
+When a configured team has at least two agents, its researcher can be assigned
+one configuration and receives all of that configuration's MCP tools. It keeps
+durable teammate messaging but has no workspace, file-write, or shell tools.
+Without MCP, the researcher remains least-privilege and receives only
+`MessageAgent`; it never falls back to local filesystem or shell tools. The
+lead, implementer, and reviewer retain the coding tools and do not receive MCP
+access. Session metadata stores the configuration ID, while the global catalog
+owns the actual server settings and tool manifest. The lead can message every subagent;
+subagents can message only the lead, so there is no direct subagent-to-subagent
+communication path.
+
 Models must provide Pi's `contextWindow` field. Each agent automatically
 compacts its model-facing context after a normal request reaches 80% of that
 window. Compaction keeps the complete persisted message history returned to
@@ -54,6 +110,7 @@ gleam run
 | Variable | Default |
 |---|---|
 | `HARNESS3_MODELS_PATH` | `~/.pi/agent/models.json` |
+| `HARNESS3_MCP_CONFIG_PATH` | unset (reuse the persisted catalog) |
 | `HARNESS3_BIND` | `127.0.0.1` |
 | `HARNESS3_PORT` | `8080` |
 | `HARNESS3_WORKSPACE_ROOT` | `..` (resolved and suggested in the UI) |
@@ -70,6 +127,7 @@ authentication and isolation.
 
 - `GET /api/health`
 - `GET /api/models`
+- `GET /api/mcp/configurations`
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `GET /api/sessions/:id`
@@ -82,9 +140,15 @@ Create request example:
 {
   "model_id": "provider/model",
   "workspace": "/absolute/path/to/project",
-  "team_size": 3
+  "team_size": 3,
+  "mcp_configuration_id": "research"
 }
 ```
+
+`mcp_configuration_id` is optional. If omitted or `null` for a team of at least
+two, the first enabled discovered configuration is selected. A lead-only team,
+or a server with no installed configuration, has no MCP specialist; an included
+researcher is message-only in that case.
 
 Creating a session opens its chat without starting a model call. Every agent is
 durable and dormant until messaged. The first message names the session, wakes

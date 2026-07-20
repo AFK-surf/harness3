@@ -1,10 +1,16 @@
 import envoy
 import gleam/bit_array
 import gleam/crypto
+import gleam/json
 import gleam/list
+import gleam/option.{None, Some}
 import harness3/agent
 import harness3/agent_group
+import harness3/agent_profile
+import harness3/llm
 import harness3/model_catalog
+import harness3/plugin
+import harness3/plugin/mcp/configuration as mcp_configuration
 import harness3_server/config
 import harness3_server/service
 import simplifile
@@ -20,14 +26,57 @@ fn models_json() -> String {
   "{\"providers\":{\"test\":{\"name\":\"Test Provider\",\"baseUrl\":\"https://example.test/api/v3\",\"api\":\"openai-completions\",\"apiKey\":\"test-secret\",\"models\":[{\"id\":\"model-1\",\"name\":\"Model One\",\"contextWindow\":32768,\"maxTokens\":4096}]}}}"
 }
 
+fn mcp_server_script() -> String {
+  "while IFS= read -r line; do case \"$line\" in *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"test\",\"version\":\"1\"}}}' ;; *'\"method\":\"tools/list\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"lookup\",\"description\":\"Look up evidence\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]}}' ;; esac; done"
+}
+
+fn mcp_config_json() -> String {
+  let configuration =
+    mcp_configuration.Configuration(
+      id: "research",
+      label: "Research MCP",
+      enabled: True,
+      servers: [
+        mcp_configuration.Server(
+          id: "evidence",
+          transport: mcp_configuration.Stdio(
+            "/bin/sh",
+            ["-c", mcp_server_script()],
+            None,
+            [],
+          ),
+          timeout_milliseconds: 1000,
+        ),
+      ],
+      manifest: None,
+    )
+  json.object([
+    #("configurations", json.array([configuration], mcp_configuration.encode)),
+  ])
+  |> json.to_string
+}
+
+fn tool_names(profile: agent_profile.AgentProfile) -> List(String) {
+  let assert Ok(runtime) =
+    plugin.activate(profile.registry, plugin.empty_states())
+  plugin.tools(runtime)
+  |> list.map(fn(tool) {
+    let llm.Tool(name:, ..) = tool
+    name
+  })
+}
+
 pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let root = temporary_root("harness3-server-config-test")
   let models_path = root <> "/models.json"
   let data_path = root <> "/data"
   let workspace = root <> "/workspace"
+  let mcp_path = root <> "/mcp.json"
   let assert Ok(Nil) = simplifile.create_directory_all(workspace)
   let assert Ok(Nil) =
     simplifile.write(to: models_path, contents: models_json())
+  let assert Ok(Nil) =
+    simplifile.write(to: mcp_path, contents: mcp_config_json())
 
   let assert Ok(models) = config.load_models(models_path)
   let assert [model] = models
@@ -41,10 +90,18 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   envoy.set("HARNESS3_DATA_DIR", data_path)
   envoy.set("HARNESS3_WORKSPACE_ROOT", workspace)
   envoy.set("HARNESS3_STORAGE", "local")
+  envoy.set("HARNESS3_MCP_CONFIG_PATH", "relative-mcp.json")
+  assert config.mcp_configurations_path()
+    == Error("HARNESS3_MCP_CONFIG_PATH must be absolute")
+  envoy.set("HARNESS3_MCP_CONFIG_PATH", mcp_path)
   let assert Ok(first) = service.start()
   let assert Ok(second) = service.start()
   assert list.length(service.models(first)) == 1
   assert service.workspace_root(second) == workspace
+  let assert [mcp_configuration] = service.mcp_configurations(second)
+  assert mcp_configuration.id == "research"
+  let assert Some(manifest) = mcp_configuration.manifest
+  assert list.length(manifest.tools) == 1
   assert service.resolve_workspace("nested")
     == Error("workspace path must be absolute")
   let outside = root <> "-outside"
@@ -53,15 +110,69 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let assert Ok(service.Session(metadata, group)) =
     service.create_session(
       second,
-      service.CreateInput("test/model-1", workspace, 2),
+      service.CreateInput("test/model-1", workspace, 3, None),
     )
   assert metadata.title == "New coding session"
   assert metadata.prompt == ""
   assert group.execution == agent_group.Idle
-  assert list.length(group.agents) == 2
+  assert list.length(group.agents) == 3
   assert list.all(group.agents, fn(state) {
     state.status == agent.Waiting && list.is_empty(state.messages)
   })
+  let assert [
+    service.AgentSpec(kind: service.CodingAgent, ..),
+    service.AgentSpec(kind: service.McpSpecialist("research"), ..),
+    service.AgentSpec(kind: service.CodingAgent, ..),
+  ] = metadata.agents
+
+  let assert Ok([lead_profile, researcher_profile]) =
+    agent_profile.profiles([
+      metadata.id <> ":lead",
+      metadata.id <> ":researcher",
+    ])
+  let lead_tools = tool_names(lead_profile)
+  let researcher_tools = tool_names(researcher_profile)
+  let exposed = mcp_configuration.exposed_tool_name("evidence", "lookup")
+  assert list.contains(lead_tools, "Read")
+  assert list.contains(lead_tools, "MessageAgent")
+  assert !list.contains(lead_tools, exposed)
+  assert list.contains(researcher_tools, "MessageAgent")
+  assert list.contains(researcher_tools, exposed)
+  assert !list.contains(researcher_tools, "Read")
+  let assert Ok(researcher_runtime) =
+    plugin.activate(researcher_profile.registry, plugin.empty_states())
+  let assert Ok(#(_, plugin.ToolOutput(is_error: True, ..))) =
+    plugin.invoke_tool(
+      researcher_runtime,
+      "MessageAgent",
+      plugin.ToolInvocation(
+        "blocked-peer-message",
+        "{\"agent_id\":\"implementer\",\"message\":\"bypass lead\"}",
+      ),
+    )
+
+  let assert Ok(Nil) = service.stop_session(second, metadata.id)
+  service.stop(first)
+  service.stop(second)
+
+  envoy.unset("HARNESS3_MCP_CONFIG_PATH")
+  envoy.set("HARNESS3_DATA_DIR", root <> "/data-without-mcp")
+  let assert Ok(without_mcp) = service.start()
+  let assert Ok(service.Session(metadata: without_mcp_metadata, ..)) =
+    service.create_session(
+      without_mcp,
+      service.CreateInput("test/model-1", workspace, 2, None),
+    )
+  let assert [_, service.AgentSpec(kind: service.ResearchAgent, ..)] =
+    without_mcp_metadata.agents
+  let assert Ok([researcher_without_mcp]) =
+    agent_profile.profiles([
+      without_mcp_metadata.id <> ":researcher",
+    ])
+  assert tool_names(researcher_without_mcp) == ["MessageAgent"]
+  let assert Ok(Nil) =
+    service.stop_session(without_mcp, without_mcp_metadata.id)
+  service.stop(without_mcp)
 
   envoy.unset("HARNESS3_MODELS_PATH")
   envoy.unset("HARNESS3_DATA_DIR")

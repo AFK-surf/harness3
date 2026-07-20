@@ -1,5 +1,6 @@
 const state = {
   models: [],
+  mcpConfigurations: [],
   sessions: [],
   current: null,
   selectedAgent: null,
@@ -70,6 +71,18 @@ async function loadModels() {
   select.innerHTML = state.models.map((model) =>
     `<option value="${escapeHtml(model.id)}">${escapeHtml(model.name)}</option>`
   ).join("");
+}
+
+async function loadMcpConfigurations() {
+  const body = await api("/api/mcp/configurations");
+  state.mcpConfigurations = body.configurations.filter((configuration) => configuration.enabled);
+  const select = $("#mcp-configuration-select");
+  const options = state.mcpConfigurations.map((configuration) =>
+    `<option value="${escapeHtml(configuration.id)}">${escapeHtml(configuration.label)} · ${configuration.tool_count} tools</option>`
+  );
+  if (!options.length) options.push(`<option value="">No MCP configuration installed</option>`);
+  select.innerHTML = options.join("");
+  updateTeamPreview();
 }
 
 async function loadSessions(selectFirst = false) {
@@ -146,7 +159,7 @@ function renderTeam() {
         <span class="agent-status ${escapeHtml(agent.status)}">${escapeHtml(agent.status)}</span>
       </div>
       <p>${escapeHtml(agent.role)}</p>
-      <div class="agent-card-footer"><span>round ${agent.round}</span><span>${number(tokens)} tokens</span>${agent.pending_messages ? `<span>${agent.pending_messages} queued</span>` : ""}</div>
+      <div class="agent-card-footer"><span>${agent.kind === "mcp" ? "MCP specialist" : `round ${agent.round}`}</span><span>${number(tokens)} tokens</span>${agent.pending_messages ? `<span>${agent.pending_messages} queued</span>` : ""}</div>
     </button>`;
   }).join("");
   $("#team-list").querySelectorAll("[data-agent]").forEach((button) => {
@@ -242,6 +255,9 @@ async function createSession() {
         model_id: $("#model-select").value,
         workspace: $("#workspace-input").value,
         team_size: Number($("#team-size").value),
+        mcp_configuration_id: Number($("#team-size").value) >= 2
+          ? $("#mcp-configuration-select").value || null
+          : null,
       }),
     });
     dialog.close();
@@ -316,8 +332,9 @@ async function refreshCurrent(forceScroll = false) {
 function updateTeamPreview() {
   const roles = ["lead", "researcher", "implementer", "reviewer"];
   const size = Number($("#team-size").value || 3);
+  $("#mcp-configuration-select").disabled = size < 2 || !state.mcpConfigurations.length;
   $("#team-preview").innerHTML = roles.slice(0, size).map((role, index) =>
-    `<span>○ ${role} · on demand</span>`
+    `<span>○ ${index === 1 && $("#mcp-configuration-select").value ? "MCP specialist" : role} · on demand</span>`
   ).join("");
 }
 
@@ -325,6 +342,7 @@ function bindEvents() {
   $("#new-session-button").addEventListener("click", openNewSession);
   $("#empty-new-button").addEventListener("click", openNewSession);
   $("#team-size").addEventListener("change", updateTeamPreview);
+  $("#mcp-configuration-select").addEventListener("change", updateTeamPreview);
   $("#target-agent").addEventListener("change", (event) => {
     state.selectedAgent = event.target.value;
     renderTeam();
@@ -356,7 +374,7 @@ async function init() {
   bindEvents();
   updateTeamPreview();
   try {
-    await Promise.all([connect(), loadModels()]);
+    await Promise.all([connect(), loadModels(), loadMcpConfigurations()]);
     await loadSessions(true);
   } catch (error) {
     toast(error.message, true);
