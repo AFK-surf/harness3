@@ -49,7 +49,6 @@ fn mcp_config_json() -> String {
           timeout_milliseconds: 1000,
         ),
       ],
-      manifest: None,
     )
   json.object([
     #("configurations", json.array([configuration], mcp_configuration.encode)),
@@ -75,7 +74,6 @@ fn unavailable_mcp_config_json() -> String {
           timeout_milliseconds: 1000,
         ),
       ],
-      manifest: None,
     )
   json.object([
     #("configurations", json.array([configuration], mcp_configuration.encode)),
@@ -127,7 +125,8 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   assert service.workspace_root(second) == workspace
   let assert [mcp_configuration] = service.mcp_configurations(second)
   assert mcp_configuration.id == "research"
-  assert mcp_configuration.manifest == None
+  let assert [mcp_server] = mcp_configuration.servers
+  assert mcp_server.id == "evidence"
   assert service.resolve_workspace("nested")
     == Error("workspace path must be absolute")
   let outside = root <> "-outside"

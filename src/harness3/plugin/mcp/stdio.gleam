@@ -12,6 +12,9 @@ import harness3/plugin/mcp/client
 import harness3/plugin/mcp/configuration
 import harness3/plugin/mcp/protocol
 
+/// Upper bound on a single JSON-RPC document from a server.
+const maximum_document_bytes = 4_194_304
+
 type Pending {
   Pending(id: Int, reply: Subject(Result(String, String)))
 }
@@ -106,7 +109,13 @@ pub fn connect(
         |> result.flatten
       },
       fn() { process.send(subject, Stop) },
-    ),
+    )
+    |> client.with_liveness(fn() {
+      case process.subject_owner(subject) {
+        Ok(pid) -> process.is_alive(pid)
+        Error(_) -> False
+      }
+    }),
   )
 }
 
@@ -148,20 +157,37 @@ fn handle_message(
       process.send(reply, outcome)
       actor.continue(state)
     }
-    Received(line) -> {
-      let document = string.trim(line)
-      case protocol.response_id(document) {
-        Error(_) -> actor.continue(state)
-        Ok(id) ->
-          case take_pending(state.pending, id, []) {
-            None -> actor.continue(state)
-            Some(#(pending, remaining)) -> {
-              process.send(pending.reply, Ok(document))
-              actor.continue(State(..state, pending: remaining))
-            }
+    Received(line) ->
+      case string.byte_size(line) > maximum_document_bytes {
+        // A server streaming an oversized document would otherwise be copied
+        // into the agent's context. Fail every in-flight request and drop the
+        // connection rather than propagate it.
+        True -> {
+          list.each(state.pending, fn(pending) {
+            process.send(
+              pending.reply,
+              Error("MCP stdio server sent an oversized document"),
+            )
+          })
+          child_process.stop(state.process)
+          child_process.close(state.process)
+          actor.stop()
+        }
+        False -> {
+          let document = string.trim(line)
+          case protocol.response_id(document) {
+            Error(_) -> actor.continue(state)
+            Ok(id) ->
+              case take_pending(state.pending, id, []) {
+                None -> actor.continue(state)
+                Some(#(pending, remaining)) -> {
+                  process.send(pending.reply, Ok(document))
+                  actor.continue(State(..state, pending: remaining))
+                }
+              }
           }
+        }
       }
-    }
     TimedOut(id) ->
       case take_pending(state.pending, id, []) {
         None -> actor.continue(state)
@@ -188,8 +214,12 @@ fn handle_message(
       actor.stop()
     }
     Stop -> {
-      child_process.close(state.process)
+      // SIGTERM first: `stop` resolves the OS pid through `port_info`, which
+      // fails on an already-closed port, so closing first makes the signal a
+      // silent no-op and leaves the child running. Closing stdin afterwards
+      // gives servers that exit on EOF their usual path.
       child_process.stop(state.process)
+      child_process.close(state.process)
       actor.stop()
     }
   }

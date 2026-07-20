@@ -350,7 +350,7 @@ fn start_mcp(backend: Storage) -> Result(mcp.Runtime, String) {
       |> result.map_error(fn(error) { string.inspect(error) })
     }
   })
-  use desired <- result.try(without_mcp_manifests(configured))
+  let desired = configured
   use runtime <- result.try(
     mcp.start(desired, config.environment, fn() { system_time(Second) }),
   )
@@ -376,13 +376,14 @@ pub fn add_mcp_server(
       use current <- result.try(case existing {
         Ok(configuration) -> Ok(configuration)
         Error(mcp_catalog.UnknownConfiguration(_)) ->
-          Ok(mcp_configuration.Configuration(
-            id: configuration_id,
-            label: configuration_label,
-            enabled: True,
-            servers: [],
-            manifest: None,
-          ))
+          Ok(
+            mcp_configuration.Configuration(
+              id: configuration_id,
+              label: configuration_label,
+              enabled: True,
+              servers: [],
+            ),
+          )
         Error(error) -> Error(string.inspect(error))
       })
       use _ <- result.try(
@@ -402,7 +403,6 @@ pub fn add_mcp_server(
           ..current,
           label: configuration_label,
           servers: list.append(current.servers, [server]),
-          manifest: None,
         )
       mcp_catalog.put_configuration(catalog, updated)
       |> result.map(fn(next) { #(next, updated) })
@@ -444,7 +444,6 @@ pub fn remove_mcp_server(
           servers: list.filter(current.servers, fn(server) {
             server.id != server_id
           }),
-          manifest: None,
         )
       mcp_catalog.put_configuration(catalog, updated)
       |> result.map(fn(next) { #(next, updated) })
@@ -476,20 +475,6 @@ fn commit_mcp_change(
     Error(error) ->
       Error("could not persist MCP catalog: " <> string.inspect(error))
   }
-}
-
-fn without_mcp_manifests(
-  configured: mcp_catalog.Catalog,
-) -> Result(mcp_catalog.Catalog, String) {
-  configured
-  |> mcp_catalog.configurations
-  |> list.try_fold(mcp_catalog.new(), fn(catalog, configuration) {
-    mcp_catalog.put_configuration(
-      catalog,
-      mcp_configuration.Configuration(..configuration, manifest: None),
-    )
-  })
-  |> result.map_error(fn(error) { string.inspect(error) })
 }
 
 fn persist_mcp_catalog(
@@ -530,7 +515,7 @@ fn select_mcp_configuration(
     Some(_), False ->
       Error("an MCP specialist requires team_size to be at least 2")
     Some(id), True ->
-      mcp.snapshot(service.mcp_runtime, id)
+      mcp.configuration(service.mcp_runtime, id)
       |> result.map(fn(_) { Some(id) })
     None, False -> Ok(None)
     None, True ->
@@ -669,11 +654,11 @@ fn group_config(
           Ok([collaboration, coding_plugin.workspace(metadata.workspace)])
         ResearchAgent -> Ok([collaboration])
         McpSpecialist(configuration_id) -> {
-          use snapshot <- result.try(mcp.snapshot(
+          use configuration <- result.try(mcp.configuration(
             service.mcp_runtime,
             configuration_id,
           ))
-          let specialist = mcp.plugin(service.mcp_runtime, snapshot)
+          let specialist = mcp.plugin(service.mcp_runtime, configuration)
           Ok([collaboration, specialist])
         }
       })

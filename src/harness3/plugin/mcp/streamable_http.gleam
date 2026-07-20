@@ -24,6 +24,9 @@ type State {
   )
 }
 
+/// Bound for the best-effort session teardown on close.
+const session_delete_milliseconds = 5000
+
 type TimeUnit {
   Millisecond
 }
@@ -89,7 +92,13 @@ pub fn connect(
         |> result.flatten
       },
       fn() { process.send(subject, Stop) },
-    ),
+    )
+    |> client.with_liveness(fn() {
+      case process.subject_owner(subject) {
+        Ok(pid) -> process.is_alive(pid)
+        Error(_) -> False
+      }
+    }),
   )
 }
 
@@ -110,11 +119,19 @@ fn handle_message(
             False,
             id,
           )
-        False -> Error("MCP HTTP request timed out before dispatch")
+        False ->
+          Error(DispatchError(
+            "MCP HTTP request timed out before dispatch",
+            False,
+          ))
       }
       let #(next, response) = case outcome {
         Ok(#(next, response)) -> #(next, Ok(response))
-        Error(error) -> #(state, Error(error))
+        Error(DispatchError(reason:, session_expired: True)) -> #(
+          State(..state, session_id: None),
+          Error(reason),
+        )
+        Error(DispatchError(reason:, ..)) -> #(state, Error(reason))
       }
       process.send(reply, response)
       actor.continue(State(..next, next_id: id + 1))
@@ -130,21 +147,77 @@ fn handle_message(
             True,
             0,
           )
-        False -> Error("MCP HTTP notification timed out before dispatch")
+        False ->
+          Error(DispatchError(
+            "MCP HTTP notification timed out before dispatch",
+            False,
+          ))
       }
       case outcome {
         Ok(#(next, _)) -> {
           process.send(reply, Ok(Nil))
           actor.continue(next)
         }
-        Error(error) -> {
-          process.send(reply, Error(error))
-          actor.continue(state)
+        Error(DispatchError(reason:, session_expired:)) -> {
+          process.send(reply, Error(reason))
+          case session_expired {
+            True -> actor.continue(State(..state, session_id: None))
+            False -> actor.continue(state)
+          }
         }
       }
     }
-    Stop -> actor.stop()
+    Stop -> {
+      // Streamable HTTP sessions are server-side state: without an explicit
+      // DELETE the peer keeps one per connection we ever opened, and
+      // discovery opens a new one each time a manifest goes stale.
+      delete_session(state)
+      actor.stop()
+    }
   }
+}
+
+fn delete_session(state: State) -> Nil {
+  case state.session_id {
+    None -> Nil
+    Some(session) -> {
+      let deleted = {
+        use parsed <- result.try(
+          uri.parse(state.endpoint) |> result.map_error(fn(_) { Nil }),
+        )
+        use request <- result.try(
+          http_request.from_uri(parsed) |> result.map_error(fn(_) { Nil }),
+        )
+        let request =
+          state.headers
+          |> list.fold(request, fn(request, header) {
+            http_request.set_header(request, header.0, header.1)
+          })
+          |> http_request.set_header("mcp-session-id", session)
+          |> http_request.set_header(
+            "mcp-protocol-version",
+            configuration.protocol_version,
+          )
+          |> http_request.set_method(http.Delete)
+          |> http_request.set_body("")
+        httpc.configure()
+        |> httpc.timeout(session_delete_milliseconds)
+        |> httpc.dispatch(request)
+        |> result.map_error(fn(_) { Nil })
+      }
+      // Best effort: the connection is going away regardless, and servers are
+      // permitted to reject session termination.
+      let _ = deleted
+      Nil
+    }
+  }
+}
+
+/// `session_expired` marks a failure the caller recovers from by dropping the
+/// session id, so the next request initializes a fresh session instead of
+/// retrying against one the server has already discarded.
+type DispatchError {
+  DispatchError(reason: String, session_expired: Bool)
 }
 
 fn dispatch(
@@ -153,13 +226,14 @@ fn dispatch(
   timeout: Int,
   notification: Bool,
   request_id: Int,
-) -> Result(#(State, String), String) {
+) -> Result(#(State, String), DispatchError) {
   use parsed <- result.try(
-    uri.parse(state.endpoint) |> result.map_error(fn(_) { "invalid MCP URL" }),
+    uri.parse(state.endpoint)
+    |> result.map_error(fn(_) { DispatchError("invalid MCP URL", False) }),
   )
   use request <- result.try(
     http_request.from_uri(parsed)
-    |> result.map_error(fn(_) { "invalid MCP URL" }),
+    |> result.map_error(fn(_) { DispatchError("invalid MCP URL", False) }),
   )
   let request =
     state.headers
@@ -185,16 +259,25 @@ fn dispatch(
       |> http_request.set_body(body),
     )
     |> result.map_error(fn(error) {
-      "MCP HTTP request failed: " <> string.inspect(error)
+      DispatchError("MCP HTTP request failed: " <> string.inspect(error), False)
     }),
   )
-  use _ <- result.try(case response.status >= 200 && response.status < 300 {
-    True -> Ok(Nil)
-    False ->
-      Error(
+  use _ <- result.try(case response.status {
+    status if status >= 200 && status < 300 -> Ok(Nil)
+    // The server dropped this session (expiry or restart). Flag it so the
+    // caller clears the stale id rather than treating a recoverable state as
+    // a dead server.
+    404 if state.session_id != None ->
+      Error(DispatchError(
+        "MCP HTTP session expired: reinitialize required",
+        True,
+      ))
+    status ->
+      Error(DispatchError(
         "MCP HTTP request returned status "
-        <> { response.status |> json.int |> json.to_string },
-      )
+          <> { status |> json.int |> json.to_string },
+        False,
+      ))
   })
   let next =
     State(
@@ -210,11 +293,10 @@ fn dispatch(
       let content_type =
         http_response.get_header(response, "content-type")
         |> result.unwrap("application/json")
-      use document <- result.try(response_document(
-        response.body,
-        content_type,
-        request_id,
-      ))
+      use document <- result.try(
+        response_document(response.body, content_type, request_id)
+        |> result.map_error(fn(reason) { DispatchError(reason, False) }),
+      )
       Ok(#(next, document))
     }
   }

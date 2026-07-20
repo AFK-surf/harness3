@@ -266,6 +266,43 @@ rounds. A worker exiting with an unattempted pending request is restarted by the
 coordinator — unless a live replacement worker already exists (stale exit notices
 must not start duplicates).
 
+### 6.5 MCP plugin
+
+An optional plugin brokers Model Context Protocol servers to an agent as two tools
+(`mcp.list`, `mcp.call`). Stdio servers run as child processes, streamable-HTTP
+servers as sessioned HTTP clients.
+
+**Ownership is the load-bearing property.** Configuration is global; connections are
+not:
+
+- `mcp/runtime` is a node-wide registry of *configurations* only — the role
+  `model_catalog` plays for models. Its catalog is durable and CAS-committed with
+  ambiguous-write read-back confirmation. It holds no connections and performs no
+  discovery, so every call into it is served from memory and is safe from any
+  process, including the group coordinator.
+- `mcp/pool` owns one agent's connections and its discovered tool manifest. It is
+  started from *inside that agent's plugin host* on first tool use, so it is linked
+  to the host and dies with the agent, and its handle lives in the plugin's
+  **ephemeral resource** (`plugin.resource` / `plugin.set_resource`) — a per-agent
+  slot that, unlike plugin state, is never serialized and never leaves the agent.
+  Connections are therefore never shared: one agent's discovery cannot close a
+  connection another agent is calling through, and an agent's servers die with it.
+- **Activation never touches MCP servers.** Activation hooks run inside the group
+  coordinator, which also services lease renewal, so the hook only validates that
+  the configuration exists and is enabled. Connecting, discovering, and calling all
+  happen in the agent's plugin host.
+- Within a pool, a manifest is reused for a TTL (5 min) while its connections are
+  still alive, so repeated tool calls don't re-spawn servers; a dead connection
+  forces re-discovery rather than failing every call until the TTL lapses.
+
+Transport rules: child processes get SIGTERM *before* their port is closed (closing
+first makes the signal a no-op and orphans the child); response correlation requires
+the absence of a `method` field, since server-initiated requests share the client's
+ID space; servers negotiating an older protocol revision are accepted when supported;
+document size, tool count, and page count are bounded because everything listed is
+serialized into the agent's context; HTTP sessions are deleted on close and a 404
+clears the session id so the next call re-initializes.
+
 ## 7. Agent group
 
 ### 7.1 Durable object and execution states

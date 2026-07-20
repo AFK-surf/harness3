@@ -7,9 +7,16 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
-import harness3/plugin/mcp/json_document
 
+/// The revision proposed during initialization.
 pub const protocol_version = "2025-11-25"
+
+/// Revisions this client accepts when a server negotiates down. The wire
+/// shapes used here (initialize, tools/list paging, tools/call content) are
+/// compatible across these revisions.
+pub const supported_protocol_versions = [
+  "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05",
+]
 
 pub type Value {
   Literal(value: String)
@@ -45,18 +52,8 @@ pub type Tool {
   )
 }
 
-pub type Manifest {
-  Manifest(refreshed_at_seconds: Int, tools: List(Tool))
-}
-
 pub type Configuration {
-  Configuration(
-    id: String,
-    label: String,
-    enabled: Bool,
-    servers: List(Server),
-    manifest: Option(Manifest),
-  )
+  Configuration(id: String, label: String, enabled: Bool, servers: List(Server))
 }
 
 pub type Error {
@@ -71,11 +68,7 @@ pub fn validate(configuration: Configuration) -> Result(Nil, Error) {
     _ -> Ok(Nil)
   })
   use _ <- result.try(unique_server_ids(configuration.servers))
-  use _ <- result.try(list.try_each(configuration.servers, validate_server))
-  case configuration.manifest {
-    None -> Ok(Nil)
-    Some(manifest) -> validate_manifest(configuration, manifest)
-  }
+  list.try_each(configuration.servers, validate_server)
 }
 
 pub fn resolve_bindings(
@@ -203,54 +196,6 @@ fn validate_bindings(bindings: List(Binding)) -> Result(Nil, Error) {
   |> result.map(fn(_) { Nil })
 }
 
-fn validate_manifest(
-  configuration: Configuration,
-  manifest: Manifest,
-) -> Result(Nil, Error) {
-  let server_ids = list.map(configuration.servers, fn(server) { server.id })
-  manifest.tools
-  |> list.try_fold([], fn(names, tool) {
-    use _ <- result.try(case list.contains(server_ids, tool.server_id) {
-      True -> Ok(Nil)
-      False ->
-        Error(InvalidConfiguration(
-          "manifest references unknown MCP server: " <> tool.server_id,
-        ))
-    })
-    use _ <- result.try(validate_json_object(
-      "input schema for " <> tool.name,
-      tool.input_schema,
-    ))
-    use _ <- result.try(case tool.output_schema {
-      None -> Ok(Nil)
-      Some(schema) ->
-        validate_json_object("output schema for " <> tool.name, schema)
-    })
-    case list.contains(names, tool.exposed_name) {
-      True ->
-        Error(InvalidConfiguration(
-          "duplicate exposed MCP tool name: " <> tool.exposed_name,
-        ))
-      False -> Ok([tool.exposed_name, ..names])
-    }
-  })
-  |> result.map(fn(_) { Nil })
-}
-
-fn validate_json_object(
-  label: String,
-  document: json.Json,
-) -> Result(Nil, Error) {
-  json.parse(
-    json.to_string(document),
-    decode.dict(decode.string, decode.dynamic),
-  )
-  |> result.map(fn(_) { Nil })
-  |> result.map_error(fn(_) {
-    InvalidConfiguration(label <> " must be a JSON object")
-  })
-}
-
 fn validate_id(kind: String, id: String) -> Result(Nil, Error) {
   case string.trim(id), sanitize_name(id) == id {
     "", _ -> Error(InvalidConfiguration(kind <> " ID cannot be empty"))
@@ -282,7 +227,6 @@ pub fn encode(configuration: Configuration) -> json.Json {
     #("label", json.string(configuration.label)),
     #("enabled", json.bool(configuration.enabled)),
     #("servers", json.array(configuration.servers, encode_server)),
-    #("manifest", json.nullable(configuration.manifest, encode_manifest)),
   ])
 }
 
@@ -330,35 +274,12 @@ fn encode_binding(binding: Binding) -> json.Json {
   ])
 }
 
-fn encode_manifest(manifest: Manifest) -> json.Json {
-  json.object([
-    #("refreshed_at_seconds", json.int(manifest.refreshed_at_seconds)),
-    #("tools", json.array(manifest.tools, encode_tool)),
-  ])
-}
-
-fn encode_tool(tool: Tool) -> json.Json {
-  json.object([
-    #("server_id", json.string(tool.server_id)),
-    #("name", json.string(tool.name)),
-    #("exposed_name", json.string(tool.exposed_name)),
-    #("description", json.nullable(tool.description, json.string)),
-    #("input_schema", tool.input_schema),
-    #("output_schema", json.nullable(tool.output_schema, fn(value) { value })),
-  ])
-}
-
 pub fn decoder() -> decode.Decoder(Configuration) {
   use id <- decode.field("id", decode.string)
   use label <- decode.optional_field("label", id, decode.string)
   use enabled <- decode.optional_field("enabled", True, decode.bool)
   use servers <- decode.field("servers", decode.list(of: server_decoder()))
-  use manifest <- decode.optional_field(
-    "manifest",
-    None,
-    decode.optional(manifest_decoder()),
-  )
-  decode.success(Configuration(id, label, enabled, servers, manifest))
+  decode.success(Configuration(id, label, enabled, servers))
 }
 
 pub fn server_decoder() -> decode.Decoder(Server) {
@@ -426,39 +347,4 @@ fn value_decoder() -> decode.Decoder(Value) {
     "environment_variable" -> decode.success(EnvironmentVariable(value))
     _ -> decode.failure(Literal(""), "unknown MCP configuration value type")
   }
-}
-
-fn manifest_decoder() -> decode.Decoder(Manifest) {
-  use refreshed <- decode.field("refreshed_at_seconds", decode.int)
-  use tools <- decode.field("tools", decode.list(of: tool_decoder()))
-  decode.success(Manifest(refreshed, tools))
-}
-
-fn tool_decoder() -> decode.Decoder(Tool) {
-  use server_id <- decode.field("server_id", decode.string)
-  use name <- decode.field("name", decode.string)
-  use exposed_name <- decode.field("exposed_name", decode.string)
-  use description <- decode.optional_field(
-    "description",
-    None,
-    decode.optional(decode.string),
-  )
-  use input_schema <- decode.field("input_schema", json_document_decoder())
-  use output_schema <- decode.optional_field(
-    "output_schema",
-    None,
-    decode.optional(json_document_decoder()),
-  )
-  decode.success(Tool(
-    server_id,
-    name,
-    exposed_name,
-    description,
-    input_schema,
-    output_schema,
-  ))
-}
-
-fn json_document_decoder() -> decode.Decoder(json.Json) {
-  json_document.object_decoder()
 }

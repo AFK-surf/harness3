@@ -47,9 +47,27 @@ pub fn notification(method: String, params: json.Json) -> String {
   |> json.to_string
 }
 
+/// Extracts the correlation ID of a JSON-RPC *response*. A document carrying
+/// a `method` is a server-initiated request or notification, not a response:
+/// server request IDs share the client's ID space, so treating one as a
+/// response would deliver it to an unrelated pending request and drop the
+/// real reply.
 pub fn response_id(document: String) -> Result(Int, Nil) {
-  json.parse(document, id_decoder())
-  |> result.map_error(fn(_) { Nil })
+  case json.parse(document, method_probe_decoder()) {
+    Ok(True) -> Error(Nil)
+    _ ->
+      json.parse(document, id_decoder())
+      |> result.map_error(fn(_) { Nil })
+  }
+}
+
+fn method_probe_decoder() -> decode.Decoder(Bool) {
+  use method <- decode.optional_field(
+    "method",
+    None,
+    decode.optional(decode.string),
+  )
+  decode.success(option.is_some(method))
 }
 
 pub fn initialize_params() -> json.Json {

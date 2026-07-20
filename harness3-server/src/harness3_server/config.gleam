@@ -93,10 +93,6 @@ pub fn load_mcp_configurations(
       "could not decode MCP configuration: " <> string.inspect(error)
     }),
   )
-  let configurations =
-    list.map(configurations, fn(configuration) {
-      mcp_configuration.Configuration(..configuration, manifest: None)
-    })
   configurations
   |> list.try_each(mcp_configuration.validate)
   |> result.map_error(fn(error) { string.inspect(error) })

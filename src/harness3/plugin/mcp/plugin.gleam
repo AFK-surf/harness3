@@ -1,13 +1,15 @@
+import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import harness3/llm
 import harness3/plugin
 import harness3/plugin/mcp/configuration
 import harness3/plugin/mcp/json_document
+import harness3/plugin/mcp/pool
 import harness3/plugin/mcp/protocol
 import harness3/plugin/mcp/runtime
 
@@ -23,9 +25,8 @@ type BrokerCall {
 
 pub fn new(
   mcp_runtime: runtime.Runtime,
-  snapshot: runtime.Snapshot,
+  configuration: configuration.Configuration,
 ) -> plugin.Plugin {
-  let runtime.Snapshot(configuration:, ..) = snapshot
   plugin.new(plugin_name, encode_state(State(configuration.id)))
   |> plugin.with_system_prompt(plugin.SystemPromptSection(
     "MCP specialist",
@@ -51,8 +52,12 @@ pub fn new(
             "persisted configuration ID does not match the installed profile",
           ))
       })
+      // Activation runs inside the group coordinator, which also services its
+      // own lease renewal, so it must never touch MCP servers. Only the
+      // configuration is validated here; connections are opened lazily by the
+      // tools below, which run in this agent's own plugin host.
       use _ <- result.try(
-        runtime.discover(mcp_runtime, configuration.id)
+        runtime.configuration(mcp_runtime, configuration.id)
         |> result.map_error(fn(error) {
           plugin.HookFailed(plugin_name, "activation", error)
         }),
@@ -82,19 +87,34 @@ fn list_tool(
     ),
     fn(state, context, invocation) {
       let plugin.ToolInvocation(arguments:, ..) = invocation
-      let output = case json_document.parse_object(arguments) {
-        Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
-        Ok(_) ->
-          case runtime.snapshot(mcp_runtime, configuration_id) {
-            Ok(snapshot) ->
-              plugin.ToolOutput(
-                [llm.Text(snapshot |> encode_snapshot |> json.to_string)],
-                False,
-              )
+      case json_document.parse_object(arguments) {
+        Error(error) ->
+          Ok(plugin.hook_result(
+            state,
+            context,
+            plugin.ToolOutput([llm.Text(error)], True),
+          ))
+        Ok(_) -> {
+          // Opening connections here — inside this agent's plugin host — is
+          // what makes them the agent's own: the pool is linked to the host
+          // and dies with it.
+          let #(context, opened) =
+            ensure_pool(mcp_runtime, configuration_id, context)
+          let output = case opened {
             Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
+            Ok(connections) ->
+              case pool.list(connections, listing_timeout_milliseconds) {
+                Ok(listing) ->
+                  plugin.ToolOutput(
+                    [llm.Text(listing |> encode_listing |> json.to_string)],
+                    False,
+                  )
+                Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
+              }
           }
+          Ok(plugin.hook_result(state, context, output))
+        }
       }
-      Ok(plugin.hook_result(state, context, output))
     },
   )
 }
@@ -142,36 +162,99 @@ fn call_tool(
     ),
     fn(state, context, invocation) {
       let plugin.ToolInvocation(arguments:, ..) = invocation
-      let output = case json.parse(arguments, broker_call_decoder()) {
-        Error(error) ->
+      let #(context, output) = case
+        json.parse(arguments, broker_call_decoder())
+      {
+        Error(error) -> #(
+          context,
           plugin.ToolOutput(
             [llm.Text("invalid mcp.call arguments: " <> string.inspect(error))],
             True,
-          )
-        Ok(call) ->
-          case
-            runtime.call(
-              mcp_runtime,
-              configuration_id,
-              call.tool,
-              json.to_string(call.arguments),
-            )
-          {
-            Ok(result) -> call_output(result)
+          ),
+        )
+        Ok(call) -> {
+          let #(context, opened) =
+            ensure_pool(mcp_runtime, configuration_id, context)
+          let output = case opened {
             Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
+            Ok(connections) ->
+              case
+                pool.call(
+                  connections,
+                  call.tool,
+                  json.to_string(call.arguments),
+                  call_timeout_milliseconds,
+                )
+              {
+                Ok(result) -> call_output(result)
+                Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
+              }
           }
+          #(context, output)
+        }
       }
       Ok(plugin.hook_result(state, context, output))
     },
   )
 }
 
-fn encode_snapshot(snapshot: runtime.Snapshot) -> json.Json {
-  let runtime.Snapshot(configuration:, failures:, ..) = snapshot
-  let tools = case configuration.manifest {
-    Some(manifest) -> manifest.tools
-    None -> []
+/// Returns this agent's connection pool, starting it on first use.
+///
+/// The pool is started from here, which runs inside the agent's plugin host,
+/// so it is linked to that host and dies with the agent. Its handle lives in
+/// the plugin's ephemeral resource — never in the durable state and never in
+/// node-wide state — so no other agent can reach or invalidate it.
+fn ensure_pool(
+  mcp_runtime: runtime.Runtime,
+  configuration_id: String,
+  context: plugin.Context,
+) -> #(plugin.Context, Result(pool.Pool, String)) {
+  case existing_pool(context) {
+    Some(connections) -> #(context, Ok(connections))
+    None ->
+      case runtime.pool_spec(mcp_runtime, configuration_id) {
+        Error(error) -> #(context, Error(error))
+        Ok(spec) ->
+          case pool.start(spec) {
+            Error(error) -> #(context, Error(error))
+            Ok(connections) -> #(
+              plugin.set_resource(context, to_dynamic(connections)),
+              Ok(connections),
+            )
+          }
+      }
   }
+}
+
+fn existing_pool(context: plugin.Context) -> Option(pool.Pool) {
+  case plugin.resource(context) {
+    Error(_) -> None
+    Ok(value) -> {
+      let connections = from_dynamic(value)
+      // A pool whose process is gone (its agent's host was restarted) must be
+      // replaced rather than reused.
+      case pool.alive(connections) {
+        True -> Some(connections)
+        False -> None
+      }
+    }
+  }
+}
+
+@external(erlang, "gleam_stdlib", "identity")
+fn to_dynamic(value: pool.Pool) -> dynamic.Dynamic
+
+@external(erlang, "gleam_stdlib", "identity")
+fn from_dynamic(value: dynamic.Dynamic) -> pool.Pool
+
+/// Bounds how long a tool call may occupy this agent's plugin host. Only this
+/// agent is affected, but the host also serves cross-agent callbacks.
+const call_timeout_milliseconds = 301_000
+
+const listing_timeout_milliseconds = 120_000
+
+fn encode_listing(listing: pool.Listing) -> json.Json {
+  let pool.Listing(configuration:, tools:, failures:) = listing
   json.object([
     #("configuration_id", json.string(configuration.id)),
     #("configuration_label", json.string(configuration.label)),
@@ -191,8 +274,8 @@ fn encode_tool(tool: configuration.Tool) -> json.Json {
   ])
 }
 
-fn encode_failure(failure: runtime.ServerFailure) -> json.Json {
-  let runtime.ServerFailure(server_id:, reason:) = failure
+fn encode_failure(failure: pool.ServerFailure) -> json.Json {
+  let pool.ServerFailure(server_id:, reason:) = failure
   json.object([
     #("server_id", json.string(server_id)),
     #("reason", json.string(reason)),

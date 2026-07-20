@@ -1,4 +1,5 @@
 import gleam/dict.{type Dict}
+import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/json
 import gleam/list
@@ -48,6 +49,7 @@ pub opaque type Context {
   Context(
     registry: Registry,
     states: Dict(String, String),
+    resources: Dict(String, Dynamic),
     current: String,
     agent_callback: Option(AgentCallback),
   )
@@ -284,7 +286,7 @@ pub fn activate(
       Ok(dict.insert(states, plugin.name, state))
     }),
   )
-  let context = Context(registry, states, "", None)
+  let context = Context(registry, states, dict.new(), "", None)
   use context <- result.try(list.try_fold(ordered, context, activate_plugin))
   Ok(Runtime(context))
 }
@@ -307,6 +309,26 @@ pub fn hook_result(
   value: value,
 ) -> HookResult(value) {
   HookResult(state, context, value)
+}
+
+/// Reads the calling plugin's ephemeral resource, if it has set one.
+///
+/// Unlike `state`, a resource is never persisted and never leaves the agent:
+/// it holds live values such as process handles whose lifetime is the agent's
+/// plugin host. Resources are created inside a tool or callback hook, so the
+/// processes they refer to are linked to that host and die with the agent.
+/// Each plugin sees only its own resource.
+pub fn resource(context: Context) -> Result(Dynamic, Nil) {
+  let Context(resources:, current:, ..) = context
+  dict.get(resources, current)
+}
+
+/// Stores the calling plugin's ephemeral resource, replacing any previous one.
+/// The returned context must be threaded back through the `HookResult` for the
+/// value to be retained for later hooks.
+pub fn set_resource(context: Context, value: Dynamic) -> Context {
+  let Context(resources:, current:, ..) = context
+  Context(..context, resources: dict.insert(resources, current, value))
 }
 
 pub fn current_state(context: Context) -> Result(String, Error) {

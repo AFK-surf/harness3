@@ -127,13 +127,23 @@ pub fn commit(session: Session, catalog: Catalog) -> Result(Session, Error) {
   let next = Catalog(..catalog, revision: session.catalog.revision + 1)
   let body = encode(next) |> json.to_string |> bit_array.from_string
   use metadata <- result.try(
-    storage.put(
-      session.storage,
-      session.key,
-      body,
-      storage.IfUnchanged(session.version),
-    )
-    |> result.map_error(storage_error),
+    case
+      storage.put(
+        session.storage,
+        session.key,
+        body,
+        storage.IfUnchanged(session.version),
+      )
+    {
+      Ok(metadata) -> Ok(metadata)
+      // A conditional write can apply remotely and lose its response, so the
+      // storage-level retry sees its own object and reports a conflict. Confirm
+      // by read-back like `create` does, or an ambiguous success would fail
+      // server startup on a write that actually landed.
+      Error(storage.PreconditionFailed(_)) ->
+        confirm_write(session.storage, session.key, body)
+      Error(error) -> Error(storage_error(error))
+    },
   )
   Ok(Session(session.storage, session.key, next, metadata.version))
 }

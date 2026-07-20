@@ -477,21 +477,14 @@ fn create_input_decoder() -> decode.Decoder(service.CreateInput) {
 fn mcp_configuration_json(
   configuration: mcp_configuration.Configuration,
 ) -> json.Json {
-  let #(refreshed_at, tool_count) = case configuration.manifest {
-    Some(manifest) -> #(
-      Some(manifest.refreshed_at_seconds),
-      list.length(manifest.tools),
-    )
-    None -> #(None, 0)
-  }
+  // Tools are discovered per agent, not per configuration, so there is no
+  // configuration-wide tool list to report here.
   json.object([
     #("id", json.string(configuration.id)),
     #("label", json.string(configuration.label)),
     #("enabled", json.bool(configuration.enabled)),
     #("server_count", json.int(list.length(configuration.servers))),
     #("servers", json.array(configuration.servers, mcp_server_json)),
-    #("tool_count", json.int(tool_count)),
-    #("refreshed_at_seconds", option_int(refreshed_at)),
   ])
 }
 

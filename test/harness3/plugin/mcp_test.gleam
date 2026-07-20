@@ -1,8 +1,9 @@
 import gleam/bit_array
 import gleam/crypto
+import gleam/erlang/process
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{None}
 import gleam/string
 import harness3/llm
 import harness3/plugin as harness_plugin
@@ -10,12 +11,13 @@ import harness3/plugin/mcp/catalog
 import harness3/plugin/mcp/client
 import harness3/plugin/mcp/configuration
 import harness3/plugin/mcp/plugin as mcp_plugin
+import harness3/plugin/mcp/pool
 import harness3/plugin/mcp/protocol
 import harness3/plugin/mcp/runtime
 import harness3/storage/local
 import simplifile
 
-fn configured(manifest: configuration.Manifest) -> configuration.Configuration {
+fn configured() -> configuration.Configuration {
   configuration.Configuration(
     id: "research",
     label: "Research tools",
@@ -32,24 +34,7 @@ fn configured(manifest: configuration.Manifest) -> configuration.Configuration {
         timeout_milliseconds: 1000,
       ),
     ],
-    manifest: Some(manifest),
   )
-}
-
-fn persisted_manifest() -> configuration.Manifest {
-  configuration.Manifest(0, [
-    configuration.Tool(
-      server_id: "search",
-      name: "lookup",
-      exposed_name: configuration.exposed_tool_name("search", "lookup"),
-      description: Some("Look up evidence"),
-      input_schema: json.object([
-        #("type", json.string("object")),
-        #("properties", json.object([])),
-      ]),
-      output_schema: None,
-    ),
-  ])
 }
 
 fn temporary_root() -> String {
@@ -70,7 +55,6 @@ pub fn configuration_requires_absolute_process_paths_and_resolves_secrets_test()
           timeout_milliseconds: 1000,
         ),
       ],
-      manifest: None,
     )
   let assert Error(configuration.InvalidConfiguration(reason)) =
     configuration.validate(invalid)
@@ -97,14 +81,14 @@ pub fn catalog_is_durable_and_uses_compare_and_swap_test() {
   let root = temporary_root()
   let backend = local.new(local.config(root))
   let assert Ok(initial) =
-    catalog.put_configuration(catalog.new(), configured(persisted_manifest()))
+    catalog.put_configuration(catalog.new(), configured())
   let assert Ok(first) = catalog.create(backend, "mcp/catalog", initial)
   let assert Ok(stale) = catalog.resume(backend, "mcp/catalog")
   let assert Ok(changed) =
     catalog.put_configuration(
       catalog.catalog(first),
       configuration.Configuration(
-        ..configured(persisted_manifest()),
+        ..configured(),
         label: "Updated research tools",
       ),
     )
@@ -115,23 +99,208 @@ pub fn catalog_is_durable_and_uses_compare_and_swap_test() {
   let assert Ok(resumed) = catalog.resume(backend, "mcp/catalog")
   let assert Ok(found) = catalog.lookup(catalog.catalog(resumed), "research")
   assert found.label == "Updated research tools"
-  let assert Some(manifest) = found.manifest
-  let assert [tool] = manifest.tools
-  assert string.contains(
-    json.to_string(tool.input_schema),
-    "\"type\":\"object\"",
-  )
+  let assert [server] = found.servers
+  assert server.id == "search"
+  let assert configuration.StreamableHttp(endpoint, _) = server.transport
+  assert endpoint == "https://mcp.example.test/rpc"
   let assert Ok(Nil) = simplifile.delete(root)
 }
 
-pub fn runtime_discovers_and_broker_invokes_available_tools_test() {
-  let without_manifest =
-    configuration.Configuration(
-      ..configured(persisted_manifest()),
-      manifest: None,
+pub fn activation_never_touches_mcp_servers_test() {
+  // Activation runs inside the group coordinator, which also renews the
+  // group's lease. A connector reached during activation would mean a slow
+  // MCP server could cost the group its lease.
+  let assert Ok(value) = catalog.put_configuration(catalog.new(), configured())
+  let connector = fn(_server, _resolve) {
+    panic as "activation must not open MCP connections"
+  }
+  let assert Ok(mcp_runtime) =
+    runtime.start_with_connector(
+      value,
+      fn(_) { Ok("token") },
+      fn() { 1234 },
+      connector,
     )
-  let assert Ok(value) =
-    catalog.put_configuration(catalog.new(), without_manifest)
+  let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
+  let assert Ok(registry) =
+    harness_plugin.registry([mcp_plugin.new(mcp_runtime, current)])
+  let assert Ok(_) =
+    harness_plugin.activate(registry, harness_plugin.empty_states())
+  runtime.stop(mcp_runtime)
+}
+
+pub fn each_agent_owns_its_own_connections_test() {
+  let assert Ok(value) = catalog.put_configuration(catalog.new(), configured())
+  let closed = process.new_subject()
+  let connector = fn(_server, _resolve) {
+    Ok(stub_connection() |> closing_notifier(closed))
+  }
+  let assert Ok(mcp_runtime) =
+    runtime.start_with_connector(
+      value,
+      fn(_) { Ok("token") },
+      fn() { 1234 },
+      connector,
+    )
+  let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
+
+  // Two agents, each with its own activated plugin runtime.
+  let assert Ok(registry) =
+    harness_plugin.registry([mcp_plugin.new(mcp_runtime, current)])
+  let assert Ok(agent_a) =
+    harness_plugin.activate(registry, harness_plugin.empty_states())
+  let assert Ok(agent_b) =
+    harness_plugin.activate(registry, harness_plugin.empty_states())
+
+  let assert Ok(#(agent_a, harness_plugin.ToolOutput(is_error: False, ..))) =
+    harness_plugin.invoke_tool(
+      agent_a,
+      "mcp.list",
+      harness_plugin.ToolInvocation("list-a", "{}"),
+    )
+  // B listing must not disturb A: no connection of A's is closed by it.
+  let assert Ok(#(_, harness_plugin.ToolOutput(is_error: False, ..))) =
+    harness_plugin.invoke_tool(
+      agent_b,
+      "mcp.list",
+      harness_plugin.ToolInvocation("list-b", "{}"),
+    )
+  assert process.receive(closed, within: 100) == Error(Nil)
+
+  // A's connection is still usable after B has been through discovery.
+  let assert Ok(#(_, harness_plugin.ToolOutput(is_error: False, ..))) =
+    harness_plugin.invoke_tool(
+      agent_a,
+      "mcp.call",
+      harness_plugin.ToolInvocation(
+        "call-a",
+        json.object([
+          #(
+            "tool",
+            json.string(configuration.exposed_tool_name("search", "search_web")),
+          ),
+          #("arguments", json.object([])),
+        ])
+          |> json.to_string,
+      ),
+    )
+  runtime.stop(mcp_runtime)
+}
+
+fn closing_notifier(
+  connection: client.Connection,
+  closed: process.Subject(Nil),
+) -> client.Connection {
+  client.connection(
+    fn(method, params, timeout) {
+      client.request(connection, method, params, timeout)
+    },
+    fn(method, params) { client.notify(connection, method, params) },
+    fn() { process.send(closed, Nil) },
+  )
+}
+
+pub fn edited_configuration_reaches_a_running_agent_test() {
+  let assert Ok(value) = catalog.put_configuration(catalog.new(), configured())
+  let connects = process.new_subject()
+  let connector = fn(server: configuration.Server, _resolve) {
+    process.send(connects, server.id)
+    Ok(stub_connection())
+  }
+  let assert Ok(mcp_runtime) =
+    runtime.start_with_connector(
+      value,
+      fn(_) { Ok("token") },
+      fn() { 1234 },
+      connector,
+    )
+  let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
+  let assert Ok(registry) =
+    harness_plugin.registry([mcp_plugin.new(mcp_runtime, current)])
+  let assert Ok(agent) =
+    harness_plugin.activate(registry, harness_plugin.empty_states())
+
+  let assert Ok(#(agent, harness_plugin.ToolOutput(is_error: False, ..))) =
+    harness_plugin.invoke_tool(
+      agent,
+      "mcp.list",
+      harness_plugin.ToolInvocation("list-1", "{}"),
+    )
+  let assert Ok("search") = process.receive(connects, within: 1000)
+  // A second listing inside the TTL reuses the existing connection.
+  let assert Ok(#(agent, harness_plugin.ToolOutput(is_error: False, ..))) =
+    harness_plugin.invoke_tool(
+      agent,
+      "mcp.list",
+      harness_plugin.ToolInvocation("list-2", "{}"),
+    )
+  assert process.receive(connects, within: 100) == Error(Nil)
+
+  // An operator edits the configuration: the running agent must pick it up
+  // rather than keep serving the previous definition until its TTL lapses.
+  let assert Ok(Nil) =
+    runtime.put_configuration(
+      mcp_runtime,
+      configuration.Configuration(..current, servers: [
+        configuration.Server(
+          id: "replacement",
+          transport: configuration.StreamableHttp(
+            "https://mcp.example.test/rpc",
+            [],
+          ),
+          timeout_milliseconds: 1000,
+        ),
+      ]),
+    )
+  let assert Ok(#(_, harness_plugin.ToolOutput(is_error: False, ..))) =
+    harness_plugin.invoke_tool(
+      agent,
+      "mcp.list",
+      harness_plugin.ToolInvocation("list-3", "{}"),
+    )
+  let assert Ok("replacement") = process.receive(connects, within: 1000)
+  runtime.stop(mcp_runtime)
+}
+
+fn stub_connection() -> client.Connection {
+  client.connection(
+    fn(method, _params, _timeout) {
+      case method {
+        "initialize" ->
+          Ok(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fake\",\"version\":\"1\"}}}",
+          )
+        "tools/list" ->
+          Ok(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"search_web\",\"inputSchema\":{\"type\":\"object\"}}]}}",
+          )
+        "tools/call" ->
+          Ok(
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"isError\":false}}",
+          )
+        _ -> Error("unexpected method")
+      }
+    },
+    fn(_method, _params) { Ok(Nil) },
+    fn() { Nil },
+  )
+}
+
+pub fn server_initiated_request_is_not_taken_as_a_response_test() {
+  // A server request shares the client's ID space; treating it as a response
+  // would resolve an unrelated pending request with the wrong document.
+  assert protocol.response_id(
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+    )
+    == Error(Nil)
+  assert protocol.response_id(
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}",
+    )
+    == Ok(1)
+}
+
+pub fn runtime_discovers_and_broker_invokes_available_tools_test() {
+  let assert Ok(value) = catalog.put_configuration(catalog.new(), configured())
   let connector = fn(_server, resolve_environment) {
     let assert Ok("token") = resolve_environment("MCP_TEST_TOKEN")
     Ok(
@@ -177,15 +346,10 @@ pub fn runtime_discovers_and_broker_invokes_available_tools_test() {
       fn() { 1234 },
       connector,
     )
-  let assert Ok(snapshot) = runtime.discover(mcp_runtime, "research")
-  let runtime.Snapshot(configuration: discovered, ..) = snapshot
-  let assert Some(manifest) = discovered.manifest
-  let assert [tool] = manifest.tools
-  assert tool.name == "search_web"
-  assert tool.exposed_name
-    == configuration.exposed_tool_name("search", "search_web")
+  let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
+  let exposed = configuration.exposed_tool_name("search", "search_web")
 
-  let value = mcp_plugin.new(mcp_runtime, snapshot)
+  let value = mcp_plugin.new(mcp_runtime, current)
   let assert Ok(registry) = harness_plugin.registry([value])
   let assert Ok(plugin_runtime) =
     harness_plugin.activate(registry, harness_plugin.empty_states())
@@ -203,7 +367,7 @@ pub fn runtime_discovers_and_broker_invokes_available_tools_test() {
       list_name,
       harness_plugin.ToolInvocation("list", "{}"),
     )
-  assert string.contains(listing, tool.exposed_name)
+  assert string.contains(listing, exposed)
   assert string.contains(listing, "search_web")
   let assert Ok(#(
     _,
@@ -218,17 +382,16 @@ pub fn runtime_discovers_and_broker_invokes_available_tools_test() {
       harness_plugin.ToolInvocation(
         "call",
         json.object([
-          #("tool", json.string(tool.exposed_name)),
+          #("tool", json.string(exposed)),
           #("arguments", json.object([#("query", json.string("MCP"))])),
         ])
           |> json.to_string,
       ),
     )
-  let invalidated = configuration.Configuration(..discovered, manifest: None)
-  let assert Ok(Nil) = runtime.put_configuration(mcp_runtime, invalidated)
-  let assert Ok(runtime.Snapshot(configuration: after_update, failures: [], ..)) =
-    runtime.snapshot(mcp_runtime, "research")
-  assert after_update.manifest == None
+  let relabelled = configuration.Configuration(..current, label: "Renamed")
+  let assert Ok(Nil) = runtime.put_configuration(mcp_runtime, relabelled)
+  let assert Ok(after_update) = runtime.configuration(mcp_runtime, "research")
+  assert after_update.label == "Renamed"
   runtime.stop(mcp_runtime)
 }
 
@@ -256,7 +419,6 @@ pub fn discovery_excludes_failed_servers_without_failing_test() {
           timeout_milliseconds: 1000,
         ),
       ],
-      manifest: None,
     )
   let assert Ok(value) = catalog.put_configuration(catalog.new(), configured)
   let connector = fn(server: configuration.Server, _resolve_environment) {
@@ -296,14 +458,25 @@ pub fn discovery_excludes_failed_servers_without_failing_test() {
       fn() { 1234 },
       connector,
     )
-  let assert Ok(snapshot) = runtime.discover(mcp_runtime, "mixed")
-  let runtime.Snapshot(configuration:, failures:, ..) = snapshot
-  let assert Some(manifest) = configuration.manifest
-  let assert [available] = manifest.tools
-  assert available.server_id == "up"
-  let assert [runtime.ServerFailure(server_id:, reason:)] = failures
-  assert server_id == "down"
-  assert reason == "connection refused"
+  let assert Ok(current) = runtime.configuration(mcp_runtime, "mixed")
+  let assert Ok(registry) =
+    harness_plugin.registry([mcp_plugin.new(mcp_runtime, current)])
+  let assert Ok(plugin_runtime) =
+    harness_plugin.activate(registry, harness_plugin.empty_states())
+  let assert Ok(#(
+    _,
+    harness_plugin.ToolOutput(content: [llm.Text(listing)], is_error: False),
+  )) =
+    harness_plugin.invoke_tool(
+      plugin_runtime,
+      "mcp.list",
+      harness_plugin.ToolInvocation("list", "{}"),
+    )
+  // The reachable server's tools are listed and the unreachable one is
+  // reported rather than failing the whole listing.
+  assert string.contains(listing, "available")
+  assert string.contains(listing, "connection refused")
+  assert string.contains(listing, "\"server_id\":\"down\"")
   runtime.stop(mcp_runtime)
 }
 
@@ -347,15 +520,15 @@ pub fn composio_streamable_http_smoke_test() {
               timeout_milliseconds: 30_000,
             ),
           ],
-          manifest: None,
         )
       let assert Ok(value) =
         catalog.put_configuration(catalog.new(), configuration)
       let assert Ok(mcp_runtime) = runtime.start(value, envoy.get, fn() { 0 })
-      let assert Ok(snapshot) = runtime.discover(mcp_runtime, "composio-smoke")
-      let runtime.Snapshot(configuration:, ..) = snapshot
-      let assert Some(manifest) = configuration.manifest
-      assert !list.is_empty(manifest.tools)
+      let assert Ok(spec) = runtime.pool_spec(mcp_runtime, "composio-smoke")
+      let assert Ok(connections) = pool.start(spec)
+      let assert Ok(listing) = pool.list(connections, 60_000)
+      assert !list.is_empty(listing.tools)
+      pool.stop(connections)
       runtime.stop(mcp_runtime)
     }
   }

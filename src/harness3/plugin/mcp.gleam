@@ -7,8 +7,8 @@ import harness3/plugin/mcp/runtime
 pub type Runtime =
   runtime.Runtime
 
-pub type Snapshot =
-  runtime.Snapshot
+pub type Configuration =
+  configuration.Configuration
 
 pub fn start(
   catalog: catalog.Catalog,
@@ -18,22 +18,18 @@ pub fn start(
   runtime.start(catalog, resolve_environment, now_seconds)
 }
 
-pub fn discover(
+pub fn configuration(
   mcp_runtime: Runtime,
   configuration_id: String,
-) -> Result(Snapshot, String) {
-  runtime.discover(mcp_runtime, configuration_id)
+) -> Result(Configuration, String) {
+  runtime.configuration(mcp_runtime, configuration_id)
 }
 
-pub fn snapshot(
+pub fn plugin(
   mcp_runtime: Runtime,
-  configuration_id: String,
-) -> Result(Snapshot, String) {
-  runtime.snapshot(mcp_runtime, configuration_id)
-}
-
-pub fn plugin(mcp_runtime: Runtime, snapshot: Snapshot) -> plugin.Plugin {
-  mcp_plugin.new(mcp_runtime, snapshot)
+  configuration: Configuration,
+) -> plugin.Plugin {
+  mcp_plugin.new(mcp_runtime, configuration)
 }
 
 pub fn catalog(mcp_runtime: Runtime) -> catalog.Catalog {
