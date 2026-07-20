@@ -28,6 +28,7 @@ pub fn model_catalog_persistence_and_cas_test() {
       endpoint: "https://example.test",
       model_type: model_catalog.OpenAIResponses,
       credentials: model_catalog.api_key("secret"),
+      context_window_tokens: 100_000,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(first) =
@@ -41,6 +42,7 @@ pub fn model_catalog_persistence_and_cas_test() {
       endpoint: "https://anthropic.example.test",
       model_type: model_catalog.AnthropicMessages,
       credentials: model_catalog.api_key("another-secret"),
+      context_window_tokens: 200_000,
     )
   let assert Ok(updated) =
     model_catalog.put_model(model_catalog.catalog(first), second_model)
@@ -71,6 +73,7 @@ pub fn environment_credentials_persist_only_the_reference_test() {
       endpoint: "https://example.test",
       model_type: model_catalog.OpenAIResponses,
       credentials: model_catalog.environment_variable(variable),
+      context_window_tokens: 100_000,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog/models", catalog)
@@ -90,5 +93,33 @@ pub fn environment_credentials_persist_only_the_reference_test() {
     )
   assert list.contains(headers, #("authorization", "Bearer " <> secret))
   envoy.unset(variable)
+  remove_directory(root)
+}
+
+pub fn legacy_catalog_can_be_resumed_and_republished_with_context_window_test() {
+  let root = temporary_root("legacy-model-catalog-test")
+  let backend = local.new(local.config(root))
+  let legacy =
+    "{\"schema_version\":1,\"revision\":0,\"models\":[{\"id\":\"legacy\",\"name\":\"old-model\",\"endpoint\":\"https://example.test\",\"type\":\"openai_responses\",\"credentials\":{\"type\":\"api_key\",\"value\":\"secret\"}}]}"
+  let assert Ok(_) =
+    storage.put(
+      backend,
+      "catalog/legacy",
+      bit_array.from_string(legacy),
+      storage.IfAbsent,
+    )
+  let assert Ok(session) = model_catalog.resume(backend, "catalog/legacy")
+  let assert Ok(found) =
+    model_catalog.lookup(model_catalog.catalog(session), "legacy")
+  assert found.context_window_tokens == 0
+
+  let replacement = model_catalog.Model(..found, context_window_tokens: 128_000)
+  let assert Ok(updated) =
+    model_catalog.put_model(model_catalog.catalog(session), replacement)
+  let assert Ok(_) = model_catalog.commit(session, updated)
+  let assert Ok(stored) = storage.get(backend, "catalog/legacy")
+  let assert Ok(body) = bit_array.to_string(stored.body)
+  assert string.contains(body, "\"schema_version\":2")
+  assert string.contains(body, "\"context_window_tokens\":128000")
   remove_directory(root)
 }

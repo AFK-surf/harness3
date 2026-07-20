@@ -29,6 +29,11 @@ Model secrets loaded from Pi are held in process environment variables. The
 durable harness catalog stores only generated environment-variable references,
 not the secret values.
 
+Models must provide Pi's `contextWindow` field. Each agent automatically
+compacts its model-facing context after a normal request reaches 80% of that
+window. Compaction keeps the complete persisted message history returned to
+clients and stores a separate handover context for subsequent model calls.
+
 ## MinIO / S3 storage
 
 The existing local MinIO instance can be used instead of filesystem storage.

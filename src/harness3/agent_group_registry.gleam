@@ -20,10 +20,14 @@ pub type StopHandle =
 pub type MessageHandle =
   fn(String, String) -> Result(Nil, String)
 
+pub type CompactionHandle =
+  fn(String) -> Result(Int, String)
+
 pub type Error {
   NotFound(id: String)
   StopFailed(reason: String)
   MessageFailed(reason: String)
+  CompactionFailed(reason: String)
 }
 
 /// Registers a running agent group in the node-wide registry.
@@ -32,15 +36,22 @@ pub fn register(
   pid: Pid,
   stop: StopHandle,
   send_message: MessageHandle,
+  request_compaction: CompactionHandle,
 ) -> Nil {
   ensure_table()
   case
     exception.rescue(fn() {
-      ets_insert(Harness3AgentGroups, #(id, pid, stop, send_message))
+      ets_insert(Harness3AgentGroups, #(
+        id,
+        pid,
+        stop,
+        send_message,
+        request_compaction,
+      ))
     })
   {
     Ok(_) -> Nil
-    Error(_) -> register(id, pid, stop, send_message)
+    Error(_) -> register(id, pid, stop, send_message, request_compaction)
   }
 }
 
@@ -48,7 +59,7 @@ pub fn register(
 pub fn unregister(id: String, pid: Pid) -> Nil {
   ensure_table()
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
-    Ok([#(_, registered_pid, _, _) as entry]) if registered_pid == pid -> {
+    Ok([#(_, registered_pid, _, _, _) as entry]) if registered_pid == pid -> {
       let _ =
         exception.rescue(fn() { ets_delete_object(Harness3AgentGroups, entry) })
       Nil
@@ -63,7 +74,7 @@ pub fn force_stop(id: String) -> Result(Nil, Error) {
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
     Error(_) -> force_stop(id)
     Ok([]) -> Error(NotFound(id))
-    Ok([#(_, pid, stop, _) as entry]) ->
+    Ok([#(_, pid, stop, _, _) as entry]) ->
       case process.is_alive(pid) {
         False -> {
           let _ = ets_delete_object(Harness3AgentGroups, entry)
@@ -89,7 +100,7 @@ pub fn send_message(
   case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
     Error(_) -> send_message(id, agent_id, message)
     Ok([]) -> Error(NotFound(id))
-    Ok([#(_, pid, _, send) as entry]) ->
+    Ok([#(_, pid, _, send, _) as entry]) ->
       case process.is_alive(pid) {
         False -> {
           let _ = ets_delete_object(Harness3AgentGroups, entry)
@@ -100,6 +111,28 @@ pub fn send_message(
             Error(error) -> Error(MessageFailed(string.inspect(error)))
             Ok(Error(reason)) -> Error(MessageFailed(reason))
             Ok(Ok(Nil)) -> Ok(Nil)
+          }
+      }
+    Ok(_) -> Error(NotFound(id))
+  }
+}
+
+pub fn request_compaction(id: String, agent_id: String) -> Result(Int, Error) {
+  ensure_table()
+  case exception.rescue(fn() { lookup(Harness3AgentGroups, id) }) {
+    Error(_) -> request_compaction(id, agent_id)
+    Ok([]) -> Error(NotFound(id))
+    Ok([#(_, pid, _, _, compact) as entry]) ->
+      case process.is_alive(pid) {
+        False -> {
+          let _ = ets_delete_object(Harness3AgentGroups, entry)
+          Error(NotFound(id))
+        }
+        True ->
+          case exception.rescue(fn() { compact(agent_id) }) {
+            Error(error) -> Error(CompactionFailed(string.inspect(error)))
+            Ok(Error(reason)) -> Error(CompactionFailed(reason))
+            Ok(Ok(generation)) -> Ok(generation)
           }
       }
     Ok(_) -> Error(NotFound(id))
@@ -174,22 +207,22 @@ fn ets_new(name: TableName, options: List(TableOption)) -> Dynamic
 @external(erlang, "ets", "insert")
 fn ets_insert(
   table: TableName,
-  entry: #(String, Pid, StopHandle, MessageHandle),
+  entry: #(String, Pid, StopHandle, MessageHandle, CompactionHandle),
 ) -> Bool
 
 @external(erlang, "ets", "delete_object")
 fn ets_delete_object(
   table: TableName,
-  entry: #(String, Pid, StopHandle, MessageHandle),
+  entry: #(String, Pid, StopHandle, MessageHandle, CompactionHandle),
 ) -> Bool
 
 @external(erlang, "ets", "lookup")
 fn lookup(
   table: TableName,
   id: String,
-) -> List(#(String, Pid, StopHandle, MessageHandle))
+) -> List(#(String, Pid, StopHandle, MessageHandle, CompactionHandle))
 
 @external(erlang, "ets", "tab2list")
 fn ets_entries(
   table: TableName,
-) -> List(#(String, Pid, StopHandle, MessageHandle))
+) -> List(#(String, Pid, StopHandle, MessageHandle, CompactionHandle))

@@ -17,7 +17,7 @@ fn temporary_root(label: String) -> String {
 }
 
 fn models_json() -> String {
-  "{\"providers\":{\"test\":{\"name\":\"Test Provider\",\"baseUrl\":\"https://example.test/api/v3\",\"api\":\"openai-completions\",\"apiKey\":\"test-secret\",\"models\":[{\"id\":\"model-1\",\"name\":\"Model One\",\"maxTokens\":4096}]}}}"
+  "{\"providers\":{\"test\":{\"name\":\"Test Provider\",\"baseUrl\":\"https://example.test/api/v3\",\"api\":\"openai-completions\",\"apiKey\":\"test-secret\",\"models\":[{\"id\":\"model-1\",\"name\":\"Model One\",\"contextWindow\":32768,\"maxTokens\":4096}]}}}"
 }
 
 pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
@@ -35,6 +35,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   assert model.remote_id == "model-1"
   assert model.display_name == "Model One · Test Provider"
   assert model.model_type == model_catalog.OpenAIChatCompletions
+  assert model.context_window_tokens == 32_768
 
   envoy.set("HARNESS3_MODELS_PATH", models_path)
   envoy.set("HARNESS3_DATA_DIR", data_path)

@@ -21,12 +21,18 @@ pub type ModelConfig {
     endpoint: String,
     api_key: String,
     model_type: model_catalog.ModelType,
+    context_window_tokens: Int,
     max_output_tokens: Option(Int),
   )
 }
 
 type PiModel {
-  PiModel(id: String, name: String, max_tokens: Option(Int))
+  PiModel(
+    id: String,
+    name: String,
+    context_window_tokens: Int,
+    max_tokens: Option(Int),
+  )
 }
 
 type PiProvider {
@@ -102,6 +108,7 @@ pub fn catalog_model(model: ModelConfig) -> model_catalog.Model {
     endpoint: model.endpoint,
     model_type: model.model_type,
     credentials: model_catalog.environment_variable(credential_variable),
+    context_window_tokens: model.context_window_tokens,
   )
 }
 
@@ -125,12 +132,13 @@ fn provider_decoder() -> decode.Decoder(PiProvider) {
 fn model_decoder() -> decode.Decoder(PiModel) {
   use id <- decode.field("id", decode.string)
   use name <- decode.field("name", decode.string)
+  use context_window_tokens <- decode.field("contextWindow", decode.int)
   use max_tokens <- decode.optional_field(
     "maxTokens",
     None,
     decode.optional(decode.int),
   )
-  decode.success(PiModel(id, name, max_tokens))
+  decode.success(PiModel(id, name, context_window_tokens, max_tokens))
 }
 
 fn provider_models(
@@ -150,6 +158,7 @@ fn provider_models(
         endpoint: provider.base_url,
         api_key:,
         model_type:,
+        context_window_tokens: model.context_window_tokens,
         max_output_tokens: model.max_tokens,
       )
     }),

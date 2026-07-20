@@ -14,6 +14,8 @@ import harness3/plugin
 
 const callback_timeout_milliseconds = 5000
 
+const compaction_instruction = "Create a handover summary of the entire session above so another instance can continue after the earlier model context is discarded. Preserve the objective, constraints, decisions, completed work, exact paths and identifiers, command and test results, failures, current state, and remaining steps. Do not call tools. Output exactly one block and no text outside it:\n\n<handover>\n...\n</handover>"
+
 pub type Status {
   Ready
   Waiting
@@ -28,12 +30,21 @@ pub type State {
     revision: Int,
     model_id: String,
     round: Int,
+    /// Complete, client-visible session history. Compaction never removes
+    /// messages from this list.
     messages: List(llm.Message),
+    /// The model-facing context after compaction. `None` means `messages` is
+    /// still the active context.
+    context_messages: Option(List(llm.Message)),
     pending_messages: List(llm.Message),
     stats: llm.Stats,
     plugin_states: Dict(String, String),
     plugin_generation: Int,
     last_catalog_revision: Option(Int),
+    last_context_tokens: Option(Int),
+    compaction_requested: Int,
+    compaction_completed: Int,
+    last_compaction_error: Option(String),
     status: Status,
   )
 }
@@ -46,11 +57,16 @@ pub fn state(id: String, model_id: String) -> State {
     model_id:,
     round: 0,
     messages: [],
+    context_messages: None,
     pending_messages: [],
     stats: llm.empty_stats(),
     plugin_states: plugin.empty_states(),
     plugin_generation: 0,
     last_catalog_revision: None,
+    last_context_tokens: None,
+    compaction_requested: 0,
+    compaction_completed: 0,
+    last_compaction_error: None,
     status: Ready,
   )
 }
@@ -83,6 +99,7 @@ pub type Config {
     transport: ModelTransport,
     max_output_tokens: Option(Int),
     reasoning_effort: Option(String),
+    context_window_tokens: Int,
   )
 }
 
@@ -300,6 +317,8 @@ type Accumulator {
     active_slots: Dict(Int, Int),
     next_slot: Int,
     stats: llm.Stats,
+    input_tokens: Option(Int),
+    output_tokens: Option(Int),
     finish: Option(llm.FinishReason),
     error: Option(Error),
   )
@@ -317,18 +336,82 @@ pub fn run_round(
   observe: fn(Event) -> Result(Nil, Error),
 ) -> Result(RoundResult, Error) {
   let Active(state:, config:, plugins:) = active
-  use accumulator <- result.try(start_accumulator())
-  let system_prompt = plugin_prompt(plugins)
-  let messages = case system_prompt {
-    "" -> state.messages
-    prompt -> [llm.Message(llm.System, [llm.Text(prompt)]), ..state.messages]
+  use accumulated <- result.try(run_model(
+    active,
+    normal_request_messages(state, plugins),
+    config.max_output_tokens,
+    observe,
+  ))
+  use _ <- result.try(validate_finish(accumulated.finish))
+  use assistant_content <- result.try(parts_to_content(accumulated.parts))
+  let assistant = llm.Message(llm.Assistant, assistant_content)
+  use tool_messages <- result.try(execute_tools(
+    plugins,
+    router,
+    assistant_content,
+    observe,
+  ))
+  let additions = [assistant, ..tool_messages]
+  let messages = list.append(state.messages, additions)
+  let context_messages = case state.context_messages {
+    None -> None
+    Some(context) -> Some(list.append(context, additions))
   }
+  let disposition = case accumulated.finish, tool_messages {
+    Some(llm.Paused), _ -> Continue
+    _, [] -> Complete
+    _, _ -> Continue
+  }
+  let status = case disposition {
+    Continue -> Ready
+    Complete -> Completed
+  }
+  let PluginSnapshot(generation:, states:) = plugin_states(plugins)
+  let state =
+    State(
+      ..state,
+      round: state.round + 1,
+      messages:,
+      context_messages:,
+      stats: add_stats(state.stats, accumulated.stats),
+      plugin_states: states,
+      plugin_generation: generation,
+      last_catalog_revision: Some(config.catalog_revision),
+      last_context_tokens: context_tokens(accumulated),
+      status:,
+    )
+  let active = Active(state, config, plugins)
+  Ok(RoundResult(active, state, disposition))
+}
+
+fn normal_request_messages(
+  state: State,
+  plugins: PluginHost,
+) -> List(llm.Message) {
+  let context = case state.context_messages {
+    Some(messages) -> messages
+    None -> state.messages
+  }
+  case plugin_prompt(plugins) {
+    "" -> context
+    prompt -> [llm.Message(llm.System, [llm.Text(prompt)]), ..context]
+  }
+}
+
+fn run_model(
+  active: Active,
+  messages: List(llm.Message),
+  max_output_tokens: Option(Int),
+  observe: fn(Event) -> Result(Nil, Error),
+) -> Result(Accumulator, Error) {
+  let Active(config:, plugins:, ..) = active
+  use accumulator <- result.try(start_accumulator())
   let request =
     llm.Request(
       model: config.model_name,
       messages:,
       tools: plugin_tools(plugins),
-      max_output_tokens: config.max_output_tokens,
+      max_output_tokens:,
       reasoning_effort: config.reasoning_effort,
       stream: True,
     )
@@ -351,39 +434,14 @@ pub fn run_round(
     Some(error) -> Error(error)
     None -> Ok(Nil)
   })
-  use _ <- result.try(validate_finish(accumulated.finish))
-  use assistant_content <- result.try(parts_to_content(accumulated.parts))
-  let assistant = llm.Message(llm.Assistant, assistant_content)
-  use tool_messages <- result.try(execute_tools(
-    plugins,
-    router,
-    assistant_content,
-    observe,
-  ))
-  let messages = list.append(state.messages, [assistant, ..tool_messages])
-  let disposition = case accumulated.finish, tool_messages {
-    Some(llm.Paused), _ -> Continue
-    _, [] -> Complete
-    _, _ -> Continue
+  Ok(accumulated)
+}
+
+fn context_tokens(accumulated: Accumulator) -> Option(Int) {
+  case accumulated.input_tokens {
+    None -> None
+    Some(input) -> Some(input + option.unwrap(accumulated.output_tokens, 0))
   }
-  let status = case disposition {
-    Continue -> Ready
-    Complete -> Completed
-  }
-  let PluginSnapshot(generation:, states:) = plugin_states(plugins)
-  let state =
-    State(
-      ..state,
-      round: state.round + 1,
-      messages:,
-      stats: add_stats(state.stats, accumulated.stats),
-      plugin_states: states,
-      plugin_generation: generation,
-      last_catalog_revision: Some(config.catalog_revision),
-      status:,
-    )
-  let active = Active(state, config, plugins)
-  Ok(RoundResult(active, state, disposition))
 }
 
 fn start_accumulator() -> Result(Subject(AccumulatorMessage), Error) {
@@ -392,6 +450,8 @@ fn start_accumulator() -> Result(Subject(AccumulatorMessage), Error) {
     dict.new(),
     0,
     llm.empty_stats(),
+    None,
+    None,
     None,
     None,
   ))
@@ -455,12 +515,26 @@ fn accumulate(state: Accumulator, event: llm.Event) -> Accumulator {
           _ -> part
         }
       })
-    llm.UsageReported(usage) ->
-      Accumulator(..state, stats: llm.apply_usage(state.stats, usage))
+    llm.UsageReported(usage) -> {
+      let llm.Usage(input_tokens:, output_tokens:, ..) = usage
+      Accumulator(
+        ..state,
+        stats: llm.apply_usage(state.stats, usage),
+        input_tokens: prefer_usage(input_tokens, state.input_tokens),
+        output_tokens: prefer_usage(output_tokens, state.output_tokens),
+      )
+    }
     llm.Finished(reason) -> Accumulator(..state, finish: Some(reason))
     llm.ContentStop(index) ->
       Accumulator(..state, active_slots: dict.delete(state.active_slots, index))
     _ -> state
+  }
+}
+
+fn prefer_usage(latest: Option(Int), current: Option(Int)) -> Option(Int) {
+  case latest {
+    Some(_) -> latest
+    None -> current
   }
 }
 
@@ -496,6 +570,128 @@ fn add_stats(total: llm.Stats, round: llm.Stats) -> llm.Stats {
     cache_read_tokens: total_cache_read + round_cache_read,
     cache_write_tokens: total_cache_write + round_cache_write,
   )
+}
+
+fn compaction_target(state: State, config: Config) -> Option(Int) {
+  let manually_requested =
+    state.compaction_requested > state.compaction_completed
+  let automatically_requested = case state.last_context_tokens {
+    Some(tokens) if config.context_window_tokens > 0 ->
+      tokens * 5 >= config.context_window_tokens * 4
+    _ -> False
+  }
+  case manually_requested, automatically_requested {
+    True, _ -> Some(state.compaction_requested)
+    False, True -> Some(state.compaction_completed + 1)
+    False, False -> None
+  }
+}
+
+fn compact(
+  active: Active,
+  target: Int,
+  observe: fn(Event) -> Result(Nil, Error),
+) -> Result(#(Active, State), Error) {
+  let Active(state:, config:, plugins:) = active
+  let messages =
+    normal_request_messages(state, plugins)
+    |> list.append([
+      llm.Message(llm.User, [llm.Text(compaction_instruction)]),
+    ])
+  use accumulated <- result.try(run_model(
+    active,
+    messages,
+    compaction_output_tokens(config),
+    observe,
+  ))
+  use _ <- result.try(validate_compaction_finish(accumulated.finish))
+  use content <- result.try(parts_to_content(accumulated.parts))
+  use output <- result.try(compaction_text(content))
+  use handover <- result.try(parse_handover(output))
+  let compacted_context = [
+    llm.Message(llm.User, [
+      llm.Text("Continue from this compacted handover:\n\n" <> handover),
+    ]),
+  ]
+  let state =
+    State(
+      ..state,
+      context_messages: Some(compacted_context),
+      stats: add_stats(state.stats, accumulated.stats),
+      last_catalog_revision: Some(config.catalog_revision),
+      last_context_tokens: None,
+      compaction_requested: int.max(state.compaction_requested, target),
+      compaction_completed: target,
+      last_compaction_error: None,
+    )
+  Ok(#(Active(state, config, plugins), state))
+}
+
+fn compaction_output_tokens(config: Config) -> Option(Int) {
+  case config.context_window_tokens > 0 {
+    False -> config.max_output_tokens
+    True -> {
+      let cap = int.max(1, config.context_window_tokens / 10)
+      case config.max_output_tokens {
+        Some(limit) -> Some(int.min(limit, cap))
+        None -> Some(cap)
+      }
+    }
+  }
+}
+
+fn validate_compaction_finish(
+  finish: Option(llm.FinishReason),
+) -> Result(Nil, Error) {
+  case finish {
+    None | Some(llm.Stop) -> Ok(Nil)
+    Some(llm.ToolUse) ->
+      Error(InvalidModelOutput("compaction must not call tools"))
+    Some(llm.Paused) ->
+      Error(InvalidModelOutput("compaction response was paused"))
+    other -> validate_finish(other)
+  }
+}
+
+fn compaction_text(content: List(llm.Content)) -> Result(String, Error) {
+  content
+  |> list.try_fold("", fn(text, part) {
+    case part {
+      llm.Text(value) -> Ok(text <> value)
+      llm.Reasoning(..) -> Ok(text)
+      _ ->
+        Error(InvalidModelOutput(
+          "compaction output must contain only a handover summary",
+        ))
+    }
+  })
+}
+
+fn parse_handover(output: String) -> Result(String, Error) {
+  let open = "<handover>"
+  let close = "</handover>"
+  let output = string.trim(output)
+  case string.starts_with(output, open), string.ends_with(output, close) {
+    True, True -> {
+      let body =
+        output
+        |> string.drop_start(string.length(open))
+        |> string.drop_end(string.length(close))
+        |> string.trim
+      case
+        body == ""
+        || string.contains(body, open)
+        || string.contains(body, close)
+      {
+        True -> Error(InvalidModelOutput("compaction handover is malformed"))
+        False -> Ok(open <> "\n" <> body <> "\n" <> close)
+      }
+    }
+    _, _ ->
+      Error(InvalidModelOutput(
+        "compaction output must be wrapped in <handover> tags",
+      ))
+  }
 }
 
 fn update_or_start_text(
@@ -698,39 +894,81 @@ fn run_loop(
   router: CallbackRouter,
   observe: fn(Event) -> Result(Nil, Error),
 ) -> Nil {
-  let Active(state:, ..) = active
-  case run_round(active, router, observe) {
-    Error(error) -> {
-      let failed = State(..state, status: Failed(string.inspect(error)))
-      let Checkpointer(commit:) = checkpointer
-      case commit(state.revision, failed) {
-        Ok(CommitReceipt(state: committed, ..)) if committed.status == Ready -> {
-          let Active(config:, plugins:, ..) = active
-          run_loop(
-            Active(committed, config, plugins),
-            checkpointer,
-            router,
-            observe,
-          )
+  let Active(state:, config:, plugins:) = active
+  case compaction_target(state, config) {
+    Some(target) ->
+      case compact(active, target, observe) {
+        Error(error) -> {
+          let failed =
+            State(
+              ..state,
+              compaction_requested: int.max(state.compaction_requested, target),
+              last_compaction_error: Some(string.inspect(error)),
+            )
+          let Checkpointer(commit:) = checkpointer
+          let _ = commit(state.revision, failed)
+          Nil
         }
-        _ -> Nil
-      }
-    }
-    Ok(RoundResult(active:, state: next_state, disposition:)) -> {
-      let Checkpointer(commit:) = checkpointer
-      case commit(state.revision, next_state) {
-        Error(_) -> Nil
-        Ok(CommitReceipt(state: committed, ..)) -> {
-          let Active(config:, plugins:, ..) = active
-          let active = Active(committed, config, plugins)
-          case disposition, committed.status {
-            _, Ready -> run_loop(active, checkpointer, router, observe)
-            Continue, _ -> run_loop(active, checkpointer, router, observe)
-            Complete, _ -> Nil
+        Ok(#(_, compacted)) -> {
+          let Checkpointer(commit:) = checkpointer
+          case commit(state.revision, compacted) {
+            Error(_) -> Nil
+            Ok(CommitReceipt(state: committed, ..)) ->
+              run_loop(
+                Active(committed, config, plugins),
+                checkpointer,
+                router,
+                observe,
+              )
           }
         }
       }
-    }
+    None -> run_normal_loop(active, checkpointer, router, observe)
+  }
+}
+
+fn run_normal_loop(
+  active: Active,
+  checkpointer: Checkpointer,
+  router: CallbackRouter,
+  observe: fn(Event) -> Result(Nil, Error),
+) -> Nil {
+  let Active(state:, config:, plugins:) = active
+  case state.status {
+    Waiting | Completed | Failed(_) -> Nil
+    Ready ->
+      case run_round(active, router, observe) {
+        Error(error) -> {
+          let failed = State(..state, status: Failed(string.inspect(error)))
+          let Checkpointer(commit:) = checkpointer
+          case commit(state.revision, failed) {
+            Ok(CommitReceipt(state: committed, ..))
+              if committed.status == Ready
+            -> {
+              run_loop(
+                Active(committed, config, plugins),
+                checkpointer,
+                router,
+                observe,
+              )
+            }
+            _ -> Nil
+          }
+        }
+        Ok(RoundResult(state: next_state, ..)) -> {
+          let Checkpointer(commit:) = checkpointer
+          case commit(state.revision, next_state) {
+            Error(_) -> Nil
+            Ok(CommitReceipt(state: committed, ..)) ->
+              run_loop(
+                Active(committed, config, plugins),
+                checkpointer,
+                router,
+                observe,
+              )
+          }
+        }
+      }
   }
 }
 
@@ -792,6 +1030,12 @@ pub fn encode_state(state: State) -> Json {
     #("model_id", json.string(state.model_id)),
     #("round", json.int(state.round)),
     #("messages", json.array(state.messages, encode_message)),
+    #(
+      "context_messages",
+      json.nullable(state.context_messages, fn(messages) {
+        json.array(messages, encode_message)
+      }),
+    ),
     #("pending_messages", json.array(state.pending_messages, encode_message)),
     #("stats", encode_stats(state.stats)),
     #(
@@ -808,6 +1052,13 @@ pub fn encode_state(state: State) -> Json {
       "last_catalog_revision",
       json.nullable(state.last_catalog_revision, json.int),
     ),
+    #("last_context_tokens", json.nullable(state.last_context_tokens, json.int)),
+    #("compaction_requested", json.int(state.compaction_requested)),
+    #("compaction_completed", json.int(state.compaction_completed)),
+    #(
+      "last_compaction_error",
+      json.nullable(state.last_compaction_error, json.string),
+    ),
     #("status", encode_status(state.status)),
   ])
 }
@@ -819,6 +1070,11 @@ pub fn state_decoder() -> decode.Decoder(State) {
   use model_id <- decode.field("model_id", decode.string)
   use round <- decode.field("round", decode.int)
   use messages <- decode.field("messages", decode.list(of: message_decoder()))
+  use context_messages <- decode.optional_field(
+    "context_messages",
+    None,
+    decode.optional(decode.list(of: message_decoder())),
+  )
   use pending_messages <- decode.field(
     "pending_messages",
     decode.list(of: message_decoder()),
@@ -842,6 +1098,26 @@ pub fn state_decoder() -> decode.Decoder(State) {
     None,
     decode.optional(decode.int),
   )
+  use last_context_tokens <- decode.optional_field(
+    "last_context_tokens",
+    None,
+    decode.optional(decode.int),
+  )
+  use compaction_requested <- decode.optional_field(
+    "compaction_requested",
+    0,
+    decode.int,
+  )
+  use compaction_completed <- decode.optional_field(
+    "compaction_completed",
+    0,
+    decode.int,
+  )
+  use last_compaction_error <- decode.optional_field(
+    "last_compaction_error",
+    None,
+    decode.optional(decode.string),
+  )
   use status <- decode.field("status", status_decoder())
   decode.success(State(
     id,
@@ -850,11 +1126,16 @@ pub fn state_decoder() -> decode.Decoder(State) {
     model_id,
     round,
     messages,
+    context_messages,
     pending_messages,
     stats,
     dict.from_list(plugin_states),
     plugin_generation,
     last_catalog_revision,
+    last_context_tokens,
+    compaction_requested,
+    compaction_completed,
+    last_compaction_error,
     status,
   ))
 }

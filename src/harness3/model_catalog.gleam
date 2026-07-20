@@ -41,6 +41,7 @@ pub type Model {
     endpoint: String,
     model_type: ModelType,
     credentials: Credentials,
+    context_window_tokens: Int,
   )
 }
 
@@ -96,7 +97,7 @@ pub fn resume(storage: Storage, key: String) -> Result(Session, Error) {
     json.parse(body, catalog_decoder())
     |> result.map_error(fn(error) { DecodeFailed(string.inspect(error)) }),
   )
-  use _ <- result.try(validate(catalog))
+  use _ <- result.try(validate_loaded(catalog))
   Ok(Session(storage, key, catalog, object.metadata.version))
 }
 
@@ -203,19 +204,59 @@ fn validate_model(model: Model) -> Result(Nil, Error) {
     string.trim(model.id),
     string.trim(model.name),
     string.trim(model.endpoint),
-    string.trim(secret)
+    string.trim(secret),
+    model.context_window_tokens
   {
-    "", _, _, _ -> Error(InvalidCatalog("model id cannot be empty"))
-    _, "", _, _ -> Error(InvalidCatalog("model name cannot be empty"))
-    _, _, "", _ -> Error(InvalidCatalog("model endpoint cannot be empty"))
-    _, _, _, "" -> Error(InvalidCatalog("model credentials cannot be empty"))
-    _, _, _, _ -> Ok(Nil)
+    "", _, _, _, _ -> Error(InvalidCatalog("model id cannot be empty"))
+    _, "", _, _, _ -> Error(InvalidCatalog("model name cannot be empty"))
+    _, _, "", _, _ -> Error(InvalidCatalog("model endpoint cannot be empty"))
+    _, _, _, "", _ -> Error(InvalidCatalog("model credentials cannot be empty"))
+    _, _, _, _, tokens if tokens <= 0 ->
+      Error(InvalidCatalog("model context window must be positive"))
+    _, _, _, _, _ -> Ok(Nil)
   }
+}
+
+// Catalogs written before context windows were added decode with zero so an
+// owning application can resume and replace them from its authoritative model
+// configuration. New and committed catalogs must always use positive values.
+fn validate_loaded(catalog: Catalog) -> Result(Nil, Error) {
+  use _ <- result.try(
+    catalog.models
+    |> list.try_each(fn(model) {
+      let secret = credential_value(model.credentials)
+      case
+        string.trim(model.id),
+        string.trim(model.name),
+        string.trim(model.endpoint),
+        string.trim(secret),
+        model.context_window_tokens
+      {
+        "", _, _, _, _ -> Error(InvalidCatalog("model id cannot be empty"))
+        _, "", _, _, _ -> Error(InvalidCatalog("model name cannot be empty"))
+        _, _, "", _, _ ->
+          Error(InvalidCatalog("model endpoint cannot be empty"))
+        _, _, _, "", _ ->
+          Error(InvalidCatalog("model credentials cannot be empty"))
+        _, _, _, _, tokens if tokens < 0 ->
+          Error(InvalidCatalog("model context window cannot be negative"))
+        _, _, _, _, _ -> Ok(Nil)
+      }
+    }),
+  )
+  catalog.models
+  |> list.try_fold([], fn(ids, model) {
+    case list.contains(ids, model.id) {
+      True -> Error(DuplicateModel(model.id))
+      False -> Ok([model.id, ..ids])
+    }
+  })
+  |> result.map(fn(_) { Nil })
 }
 
 fn encode(catalog: Catalog) -> json.Json {
   json.object([
-    #("schema_version", json.int(1)),
+    #("schema_version", json.int(2)),
     #("revision", json.int(catalog.revision)),
     #("models", json.array(catalog.models, encode_model)),
   ])
@@ -231,6 +272,7 @@ fn encode_model(model: Model) -> json.Json {
     #("name", json.string(model.name)),
     #("endpoint", json.string(model.endpoint)),
     #("type", json.string(model_type_name(model.model_type))),
+    #("context_window_tokens", json.int(model.context_window_tokens)),
     #(
       "credentials",
       json.object([
@@ -290,7 +332,19 @@ fn model_decoder() -> decode.Decoder(Model) {
   use endpoint <- decode.field("endpoint", decode.string)
   use model_type <- decode.field("type", model_type_decoder())
   use credentials <- decode.field("credentials", credentials_decoder())
-  decode.success(Model(id, name, endpoint, model_type, credentials))
+  use context_window_tokens <- decode.optional_field(
+    "context_window_tokens",
+    0,
+    decode.int,
+  )
+  decode.success(Model(
+    id,
+    name,
+    endpoint,
+    model_type,
+    credentials,
+    context_window_tokens,
+  ))
 }
 
 fn catalog_decoder() -> decode.Decoder(Catalog) {
@@ -298,7 +352,7 @@ fn catalog_decoder() -> decode.Decoder(Catalog) {
   use revision <- decode.field("revision", decode.int)
   use models <- decode.field("models", decode.list(of: model_decoder()))
   case schema {
-    1 -> decode.success(Catalog(revision, models))
+    1 | 2 -> decode.success(Catalog(revision, models))
     _ -> decode.failure(Catalog(0, []), "unsupported catalog schema")
   }
 }

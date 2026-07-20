@@ -24,6 +24,7 @@ pub fn live_entries_force_stop_and_dead_entries_are_swept_test() {
       Ok(Nil)
     },
     fn(_, _) { Ok(Nil) },
+    fn(_) { Ok(1) },
   )
   assert list.contains(agent_group_registry.alive_ids(), live_id)
   assert agent_group_registry.force_stop(live_id) == Ok(Nil)
@@ -35,9 +36,13 @@ pub fn live_entries_force_stop_and_dead_entries_are_swept_test() {
     process.new_selector()
     |> process.select_specific_monitor(monitor, fn(message) { message })
     |> process.selector_receive(1000)
-  agent_group_registry.register(dead_id, dead, fn() { Ok(Nil) }, fn(_, _) {
-    Ok(Nil)
-  })
+  agent_group_registry.register(
+    dead_id,
+    dead,
+    fn() { Ok(Nil) },
+    fn(_, _) { Ok(Nil) },
+    fn(_) { Ok(1) },
+  )
 
   let alive = agent_group_registry.alive_ids()
   assert !list.contains(alive, live_id)

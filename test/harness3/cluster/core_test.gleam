@@ -87,12 +87,20 @@ pub fn membership_refresh_publishes_only_live_registered_agent_groups_test() {
   let live = process.spawn_unlinked(fn() { process.sleep_forever() })
   let dead = process.spawn_unlinked(fn() { Nil })
   process.sleep(10)
-  agent_group_registry.register(live_id, live, fn() { Ok(Nil) }, fn(_, _) {
-    Ok(Nil)
-  })
-  agent_group_registry.register(dead_id, dead, fn() { Ok(Nil) }, fn(_, _) {
-    Ok(Nil)
-  })
+  agent_group_registry.register(
+    live_id,
+    live,
+    fn() { Ok(Nil) },
+    fn(_, _) { Ok(Nil) },
+    fn(_) { Ok(1) },
+  )
+  agent_group_registry.register(
+    dead_id,
+    dead,
+    fn() { Ok(Nil) },
+    fn(_, _) { Ok(Nil) },
+    fn(_) { Ok(1) },
+  )
   use <- exception.defer(fn() {
     agent_group_registry.unregister(live_id, live)
     process.kill(live)

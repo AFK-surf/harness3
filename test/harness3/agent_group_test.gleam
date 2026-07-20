@@ -186,6 +186,7 @@ pub fn parallel_agents_commit_through_group_test() {
       endpoint: "https://example.test",
       model_type: model_catalog.OpenAIResponses,
       credentials: model_catalog.api_key("secret"),
+      context_window_tokens: 100_000,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(storage, "catalog", catalog)
@@ -257,6 +258,7 @@ pub fn linked_agent_crash_terminates_process_tree_test() {
       endpoint: "https://example.test",
       model_type: model_catalog.OpenAIResponses,
       credentials: model_catalog.api_key("secret"),
+      context_window_tokens: 100_000,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(storage, "catalog", catalog)
@@ -339,11 +341,16 @@ pub fn encrypted_reasoning_state_round_trip_test() {
           llm.Text("answer"),
         ]),
       ],
+      context_messages: None,
       pending_messages: [],
       stats: llm.Stats(10, 5, 2, 1),
       plugin_states: dict.from_list([#("plugin", "{\"count\":1}")]),
       plugin_generation: 3,
       last_catalog_revision: Some(4),
+      last_context_tokens: Some(15),
+      compaction_requested: 2,
+      compaction_completed: 1,
+      last_compaction_error: Some("retry"),
       status: agent.Ready,
     )
   let encoded = agent.encode_state(original) |> json.to_string
@@ -351,6 +358,10 @@ pub fn encrypted_reasoning_state_round_trip_test() {
   assert decoded.id == "agent"
   assert decoded.revision == 2
   assert decoded.stats == llm.Stats(10, 5, 2, 1)
+  assert decoded.last_context_tokens == Some(15)
+  assert decoded.compaction_requested == 2
+  assert decoded.compaction_completed == 1
+  assert decoded.last_compaction_error == Some("retry")
   let assert [
     llm.Message(
       llm.Assistant,
@@ -376,6 +387,7 @@ pub fn full_agent_loop_with_mocked_llm_test() {
       endpoint: "https://example.test",
       model_type: model_catalog.OpenAIResponses,
       credentials: model_catalog.api_key("secret"),
+      context_window_tokens: 100_000,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(storage, "catalog", catalog)
@@ -518,6 +530,7 @@ pub fn message_sent_to_active_agent_is_injected_after_current_call_test() {
       "https://example.test",
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
+      100_000,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -596,6 +609,7 @@ pub fn message_sent_to_inactive_agent_persists_and_starts_it_test() {
       "https://example.test",
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
+      100_000,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -651,6 +665,7 @@ pub fn plugin_callback_between_agents_test() {
       endpoint: "https://example.test",
       model_type: model_catalog.OpenAIResponses,
       credentials: model_catalog.api_key("secret"),
+      context_window_tokens: 100_000,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(storage, "catalog", catalog)
@@ -799,6 +814,7 @@ pub fn create_is_dormant_and_wake_registers_and_indexes_until_stop_test() {
       "https://example.test",
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
+      100_000,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -860,6 +876,7 @@ pub fn wake_loads_the_model_catalog_on_demand_test() {
       "https://example.test",
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
+      100_000,
     )
   let assert Ok(catalog) =
     model_catalog.put_model(model_catalog.new(), old_model)
@@ -915,6 +932,7 @@ pub fn concurrent_storage_update_terminates_and_unregisters_coordinator_test() {
       "https://example.test",
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
+      100_000,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -974,6 +992,7 @@ pub fn expired_lease_terminates_and_unregisters_coordinator_test() {
       "https://example.test",
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
+      100_000,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -1023,6 +1042,7 @@ pub fn ambiguous_successful_cas_is_idempotent_and_fences_next_commit_test() {
       "https://example.test",
       model_catalog.OpenAIResponses,
       model_catalog.api_key("secret"),
+      100_000,
     )
   let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
   let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
@@ -1098,6 +1118,7 @@ fn test_model() -> model_catalog.Model {
     "https://example.test",
     model_catalog.OpenAIResponses,
     model_catalog.api_key("secret"),
+    100_000,
   )
 }
 
@@ -1109,6 +1130,340 @@ fn completing_transport(text: String) -> agent.ModelTransport {
     let assert Ok(Nil) = consume(llm.MessageStop)
     Ok(Nil)
   })
+}
+
+fn contains_text_fragment(
+  messages: List(llm.Message),
+  fragment: String,
+) -> Bool {
+  list.any(messages, fn(message) {
+    let llm.Message(content:, ..) = message
+    list.any(content, fn(part) {
+      case part {
+        llm.Text(text) -> string.contains(text, fragment)
+        _ -> False
+      }
+    })
+  })
+}
+
+pub fn automatic_compaction_reuses_prefix_and_preserves_full_history_test() {
+  let root = temporary_root("automatic-compaction-test")
+  let backend = local.new(local.config(root))
+  let model = model_catalog.Model(..test_model(), context_window_tokens: 100)
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let inert_tool =
+    plugin.tool(
+      llm.Tool(
+        "cache_prefix_tool",
+        None,
+        json.object([#("type", json.string("object"))]),
+      ),
+      fn(state, context, _) {
+        Ok(plugin.hook_result(state, context, plugin.ToolOutput([], False)))
+      },
+    )
+  let cache_plugin =
+    plugin.new("cache-prefix", "{}")
+    |> plugin.with_system_prompt(plugin.SystemPromptSection(
+      "Cache prefix",
+      "Stable system prompt.",
+    ))
+    |> plugin.with_tool(inert_tool)
+  let assert Ok(registry) = plugin.registry([cache_plugin])
+  let calls = process.new_subject()
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      let release = process.new_subject()
+      process.send(calls, #(request, release))
+      let assert Ok(Nil) = process.receive(release, within: 5000)
+      let compacting =
+        contains_text_fragment(request.messages, "Create a handover summary")
+      let assert Ok(Nil) = consume(llm.MessageStart("message", "test-model"))
+      let assert Ok(Nil) =
+        consume(
+          llm.TextDelta(0, case compacting {
+            True -> "<handover>preserved summary</handover>"
+            False -> "normal answer"
+          }),
+        )
+      let assert Ok(Nil) =
+        consume(
+          llm.UsageReported(llm.Usage(
+            input_tokens: Some(case compacting {
+              True -> 82
+              False -> 79
+            }),
+            output_tokens: Some(case compacting {
+              True -> 4
+              False -> 1
+            }),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+          )),
+        )
+      let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+      let assert Ok(Nil) = consume(llm.MessageStop)
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/compact-auto", [profile], 10, 100)
+  let initial =
+    agent.State(..agent.state("agent", "model"), messages: [
+      llm.Message(llm.User, [llm.Text("original task")]),
+    ])
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("compact-auto", "catalog", [initial]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let monitor = process.monitor(agent_group.pid(group))
+
+  let assert Ok(#(normal_request, normal_release)) =
+    process.receive(calls, within: 2000)
+  let system =
+    llm.Message(llm.System, [
+      llm.Text("## Cache prefix\n\nStable system prompt."),
+    ])
+  assert normal_request.messages == [system, ..initial.messages]
+  assert list.length(normal_request.tools) == 1
+  process.send(normal_release, Nil)
+
+  let assert Ok(#(compaction_request, compaction_release)) =
+    process.receive(calls, within: 2000)
+  let assert Ok(during_compaction) = agent_group.snapshot(group)
+  let assert [uncompacted] = during_compaction.agents
+  assert list.take(
+      compaction_request.messages,
+      list.length(compaction_request.messages) - 1,
+    )
+    == [system, ..uncompacted.messages]
+  assert compaction_request.tools == normal_request.tools
+  assert compaction_request.max_output_tokens == Some(10)
+  process.send(compaction_release, Nil)
+
+  await_down(monitor)
+  let assert Ok(snapshot) = agent_group.load(config)
+  let assert [compacted] = snapshot.agents
+  assert compacted.messages
+    == [
+      llm.Message(llm.User, [llm.Text("original task")]),
+      llm.Message(llm.Assistant, [llm.Text("normal answer")]),
+    ]
+  let assert Some([llm.Message(llm.User, [llm.Text(active_context)])]) =
+    compacted.context_messages
+  assert string.contains(
+    active_context,
+    "<handover>\npreserved summary\n</handover>",
+  )
+  assert compacted.compaction_requested == 1
+  assert compacted.compaction_completed == 1
+  assert compacted.last_context_tokens == None
+  assert compacted.round == 1
+  assert compacted.stats == llm.Stats(161, 5, 0, 0)
+  remove_directory(root)
+}
+
+pub fn automatic_compaction_waits_until_eighty_percent_test() {
+  let root = temporary_root("compaction-threshold-test")
+  let backend = local.new(local.config(root))
+  let model = model_catalog.Model(..test_model(), context_window_tokens: 100)
+  let assert Ok(catalog) = model_catalog.put_model(model_catalog.new(), model)
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let calls = process.new_subject()
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      process.send(calls, request)
+      let assert Ok(Nil) = consume(llm.TextDelta(0, "below threshold"))
+      let assert Ok(Nil) =
+        consume(
+          llm.UsageReported(llm.Usage(
+            input_tokens: Some(78),
+            output_tokens: Some(1),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+          )),
+        )
+      let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/compact-threshold", [profile], 10, 20)
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("compact-threshold", "catalog", [
+        agent.state("agent", "model"),
+      ]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  await_down(process.monitor(agent_group.pid(group)))
+  let assert Ok(_) = process.receive(calls, within: 1000)
+  let assert Error(_) = process.receive(calls, within: 50)
+  let assert Ok(snapshot) = agent_group.load(config)
+  let assert [completed] = snapshot.agents
+  assert completed.context_messages == None
+  assert completed.last_context_tokens == Some(79)
+  assert completed.compaction_completed == 0
+  remove_directory(root)
+}
+
+pub fn manual_compaction_runs_for_dormant_agent_in_awake_group_test() {
+  let root = temporary_root("manual-compaction-test")
+  let backend = local.new(local.config(root))
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let calls = process.new_subject()
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      let release = process.new_subject()
+      process.send(calls, #(request, release))
+      let assert Ok(Nil) = process.receive(release, within: 5000)
+      let compacting =
+        contains_text_fragment(request.messages, "Create a handover summary")
+      let assert Ok(Nil) =
+        consume(
+          llm.TextDelta(0, case compacting {
+            True -> "<handover>manual summary</handover>"
+            False -> "handled after handover"
+          }),
+        )
+      let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/compact-manual", [profile], 10, 100)
+  let historic = llm.Message(llm.User, [llm.Text("historic request")])
+  let initial =
+    agent.State(
+      ..agent.state("agent", "model"),
+      messages: [historic],
+      status: agent.Waiting,
+    )
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("compact-manual", "catalog", [initial]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let monitor = process.monitor(agent_group.pid(group))
+  assert agent_group.request_compaction(group, "agent") == Ok(1)
+  let assert Ok(#(request, release)) = process.receive(calls, within: 2000)
+  assert list.take(request.messages, list.length(request.messages) - 1)
+    == [historic]
+  let assert Ok(Nil) =
+    agent_group.send_message(group, "agent", "arrived during compaction")
+  let assert Ok(in_flight) = agent_group.snapshot(group)
+  let assert [in_flight_agent] = in_flight.agents
+  assert list.length(in_flight_agent.pending_messages) == 1
+  process.send(release, Nil)
+  let assert Ok(#(continued_request, continued_release)) =
+    process.receive(calls, within: 2000)
+  assert contains_text_fragment(continued_request.messages, "manual summary")
+  assert contains_text_fragment(
+    continued_request.messages,
+    "arrived during compaction",
+  )
+  process.send(continued_release, Nil)
+  await_down(monitor)
+
+  let assert Ok(snapshot) = agent_group.load(config)
+  let assert [compacted] = snapshot.agents
+  assert compacted.messages
+    == [
+      historic,
+      llm.Message(llm.User, [llm.Text("arrived during compaction")]),
+      llm.Message(llm.Assistant, [llm.Text("handled after handover")]),
+    ]
+  assert compacted.status == agent.Completed
+  assert compacted.round == 1
+  assert compacted.compaction_completed == 1
+  let assert Some(context) = compacted.context_messages
+  assert contains_text_fragment(context, "manual summary")
+  remove_directory(root)
+}
+
+pub fn malformed_compaction_keeps_full_history_and_records_error_test() {
+  let root = temporary_root("failed-compaction-test")
+  let backend = local.new(local.config(root))
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let transport =
+    agent.model_transport(fn(_, _, consume) {
+      let assert Ok(Nil) = consume(llm.TextDelta(0, "summary without tags"))
+      let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile(
+      "agent",
+      registry,
+      transport,
+      None,
+      None,
+      observe,
+    )
+  let config =
+    agent_group.Config(backend, "groups/compact-failed", [profile], 10, 20)
+  let historic = llm.Message(llm.User, [llm.Text("must survive")])
+  let state =
+    agent.State(
+      ..agent.state("agent", "model"),
+      messages: [historic],
+      status: agent.Waiting,
+    )
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("compact-failed", "catalog", [state]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let monitor = process.monitor(agent_group.pid(group))
+  assert agent_group.request_compaction(group, "agent") == Ok(1)
+  await_down(monitor)
+  let assert Ok(snapshot) = agent_group.load(config)
+  let assert [failed] = snapshot.agents
+  assert failed.messages == [historic]
+  assert failed.context_messages == None
+  assert failed.compaction_requested == 1
+  assert failed.compaction_completed == 0
+  let assert Some(error) = failed.last_compaction_error
+  assert string.contains(error, "<handover> tags")
+  remove_directory(root)
 }
 
 pub fn resume_registered_deduplicates_and_loads_dormant_profiles_test() {

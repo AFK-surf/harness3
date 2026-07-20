@@ -72,6 +72,14 @@ pub fn plugin(storage: Storage, lease_duration_seconds: Int) -> core.RpcPlugin {
         route_message(storage, context, group_id, agent_id, message, visited)
       },
     ),
+    core.contextual_method(
+      compaction_method_name(),
+      compaction_decoder(),
+      fn(context, request) {
+        let #(group_id, agent_id, visited) = request
+        route_compaction(storage, context, group_id, agent_id, visited)
+      },
+    ),
     core.method(force_stop_method_name(), decode.string, fn(group_id) {
       agent_group_registry.force_stop(group_id)
       |> result.map(fn(_) { "ok" })
@@ -95,6 +103,14 @@ pub fn message_request(
   message: String,
 ) -> #(String, String, String, List(String)) {
   #(group_id, agent_id, message, [])
+}
+
+/// Builds an awake-only, host-routed per-agent compaction request.
+pub fn compaction_request(
+  group_id: String,
+  agent_id: String,
+) -> #(String, String, List(String)) {
+  #(group_id, agent_id, [])
 }
 
 fn load_group(
@@ -220,6 +236,54 @@ fn route_message(
     }
     Error(error) ->
       Error(core.HandlerError("message_failed", string.inspect(error)))
+  }
+}
+
+fn route_compaction(
+  backend: Storage,
+  context: core.RpcContext,
+  group_id: String,
+  agent_id: String,
+  visited: List(String),
+) -> Result(Int, core.RpcError) {
+  let current = core.context_token(context)
+  use _ <- result.try(check_loop(current, visited))
+  case agent_group_registry.request_compaction(group_id, agent_id) {
+    Ok(generation) -> Ok(generation)
+    Error(agent_group_registry.NotFound(_)) -> {
+      use nodes <- result.try(alive_memberships(backend))
+      use host <- result.try(
+        group_host(backend, group_id, nodes)
+        |> result.map_error(fn(error) {
+          case error {
+            core.HandlerError("not_running", _) ->
+              core.HandlerError("not_awake", "agent group is not awake")
+            error -> error
+          }
+        }),
+      )
+      use _ <- result.try(case host.token == current {
+        True ->
+          Error(core.HandlerError(
+            "not_awake",
+            "agent group is not awake on its indexed node",
+          ))
+        False -> check_redirect(host.token, visited)
+      })
+      core.call(
+        host.ip,
+        host.port,
+        host.token,
+        compaction_method_name(),
+        #(group_id, agent_id, [current, ..visited]),
+        decode.int,
+      )
+      |> result.map_error(fn(error) {
+        core.HandlerError("compaction_redirect_failed", string.inspect(error))
+      })
+    }
+    Error(error) ->
+      Error(core.HandlerError("compaction_failed", string.inspect(error)))
   }
 }
 
@@ -400,6 +464,17 @@ fn message_decoder() -> decode.Decoder(#(String, String, String, List(String))) 
   })
 }
 
+fn compaction_decoder() -> decode.Decoder(#(String, String, List(String))) {
+  decode.at([0], decode.string)
+  |> decode.then(fn(group_id) {
+    decode.at([1], decode.string)
+    |> decode.then(fn(agent_id) {
+      decode.at([2], decode.list(of: decode.string))
+      |> decode.map(fn(visited) { #(group_id, agent_id, visited) })
+    })
+  })
+}
+
 pub fn force_stop_method_name() -> String {
   "force_stop_agent_group"
 }
@@ -415,6 +490,12 @@ pub fn wake_method_name() -> String {
 
 pub fn message_method_name() -> String {
   "message_agent_group"
+}
+
+/// RPC that records compaction on the current host or forwards to it. It never
+/// wakes or resumes a dormant group.
+pub fn compaction_method_name() -> String {
+  "compact_agent_group"
 }
 
 type TimeUnit {

@@ -195,6 +195,7 @@ fn model_json(model: config.ModelConfig) -> json.Json {
     #("remote_id", json.string(model.remote_id)),
     #("endpoint", json.string(model.endpoint)),
     #("type", json.string(model_type_name(model.model_type))),
+    #("context_window_tokens", json.int(model.context_window_tokens)),
     #("max_tokens", option_int(model.max_output_tokens)),
   ])
 }
@@ -276,6 +277,19 @@ fn agent_json(state: agent.State, role: String) -> json.Json {
     #("revision", json.int(state.revision)),
     #("model_id", json.string(state.model_id)),
     #("pending_messages", json.int(list.length(state.pending_messages))),
+    #(
+      "compaction",
+      json.object([
+        #("requested", json.int(state.compaction_requested)),
+        #("completed", json.int(state.compaction_completed)),
+        #(
+          "pending",
+          json.bool(state.compaction_requested > state.compaction_completed),
+        ),
+        #("error", option_string(state.last_compaction_error)),
+        #("context_tokens", option_int(state.last_context_tokens)),
+      ]),
+    ),
     #(
       "stats",
       json.object([

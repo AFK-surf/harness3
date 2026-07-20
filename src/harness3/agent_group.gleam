@@ -6,6 +6,7 @@ import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/json
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
 import gleam/string
@@ -148,6 +149,11 @@ type Message {
     content: String,
     coordinator: Subject(Message),
     reply: Subject(Result(Nil, Error)),
+  )
+  RequestCompaction(
+    agent_id: String,
+    coordinator: Subject(Message),
+    reply: Subject(Result(Int, Error)),
   )
   Renew(subject: Subject(Message))
   Stop(reply: Subject(Result(Nil, Error)))
@@ -347,6 +353,10 @@ fn start_coordinator(
       send_message(handle, agent_id, message)
       |> result.map_error(string.inspect)
     },
+    fn(agent_id) {
+      request_compaction(handle, agent_id)
+      |> result.map_error(string.inspect)
+    },
   )
 
   // RECOVERY ORDERING INVARIANT: recovery deliberately snapshots the running
@@ -410,28 +420,35 @@ fn prepare_agents(
 ) -> Result(List(PreparedAgent), Error) {
   group.agents
   |> list.filter(fn(state) { state.status == agent.Ready })
-  |> list.try_map(fn(state) {
-    use profile <- result.try(find_profile(config.profiles, state.profile_id))
-    use model <- result.try(
-      model_catalog.lookup(catalog, state.model_id)
-      |> result.map_error(fn(_) { UnknownModel(state.id, state.model_id) }),
+  |> list.try_map(fn(state) { prepare_agent(config, state, catalog) })
+}
+
+fn prepare_agent(
+  config: Config,
+  state: agent.State,
+  catalog: model_catalog.Catalog,
+) -> Result(PreparedAgent, Error) {
+  use profile <- result.try(find_profile(config.profiles, state.profile_id))
+  use model <- result.try(
+    model_catalog.lookup(catalog, state.model_id)
+    |> result.map_error(fn(_) { UnknownModel(state.id, state.model_id) }),
+  )
+  let agent_config =
+    agent.Config(
+      provider: model_catalog.provider(model),
+      model_name: model.name,
+      catalog_revision: model_catalog.revision(catalog),
+      registry: profile.registry,
+      transport: profile.transport,
+      max_output_tokens: profile.max_output_tokens,
+      reasoning_effort: profile.reasoning_effort,
+      context_window_tokens: model.context_window_tokens,
     )
-    let agent_config =
-      agent.Config(
-        provider: model_catalog.provider(model),
-        model_name: model.name,
-        catalog_revision: model_catalog.revision(catalog),
-        registry: profile.registry,
-        transport: profile.transport,
-        max_output_tokens: profile.max_output_tokens,
-        reasoning_effort: profile.reasoning_effort,
-      )
-    use active <- result.try(
-      agent.activate(state, agent_config)
-      |> result.map_error(fn(error) { AgentActivationFailed(state.id, error) }),
-    )
-    Ok(PreparedAgent(state.id, active, profile))
-  })
+  use active <- result.try(
+    agent.activate(state, agent_config)
+    |> result.map_error(fn(error) { AgentActivationFailed(state.id, error) }),
+  )
+  Ok(PreparedAgent(state.id, active, profile))
 }
 
 fn launch_agent(group: Group, prepared: PreparedAgent) -> agent.Handle {
@@ -535,6 +552,17 @@ pub fn send_message(
   let Group(subject) = group
   process.call_forever(subject, fn(reply) {
     SendGroupMessage(agent_id, content, subject, reply)
+  })
+}
+
+/// Durably requests context compaction for one agent in an awake group.
+pub fn request_compaction(
+  group: Group,
+  agent_id: String,
+) -> Result(Int, Error) {
+  let Group(subject) = group
+  process.call_forever(subject, fn(reply) {
+    RequestCompaction(agent_id, subject, reply)
   })
 }
 
@@ -714,6 +742,24 @@ fn handle_message(
         }
       }
     }
+    RequestCompaction(agent_id, coordinator, reply) -> {
+      case request_agent_compaction(state, agent_id, coordinator) {
+        Error(error) -> {
+          process.send(reply, Error(error))
+          case error {
+            ConcurrentGroupUpdate | LostGroupOwnership -> {
+              abandon(state)
+              actor.stop()
+            }
+            _ -> actor.continue(state)
+          }
+        }
+        Ok(#(next, generation)) -> {
+          process.send(reply, Ok(generation))
+          actor.continue(next)
+        }
+      }
+    }
     Renew(subject) -> {
       case renew(state) {
         Ok(next) -> {
@@ -787,6 +833,76 @@ fn deliver_message(
   }
 }
 
+fn request_agent_compaction(
+  state: CoordinatorState,
+  agent_id: String,
+  coordinator: Subject(Message),
+) -> Result(#(CoordinatorState, Int), Error) {
+  use _ <- result.try(case state.owned {
+    True -> Ok(Nil)
+    False -> Error(LostGroupOwnership)
+  })
+  use current <- result.try(find_agent(state.group.agents, agent_id))
+  use _ <- result.try(case current.messages {
+    [] -> Error(InvalidMessage("agent session has no messages to compact"))
+    _ -> Ok(Nil)
+  })
+  let pending =
+    current.compaction_requested > current.compaction_completed
+    && current.last_compaction_error == None
+  let generation = case pending {
+    True -> current.compaction_requested
+    False ->
+      int.max(current.compaction_requested, current.compaction_completed) + 1
+  }
+  let replacement = agent.State(..current, compaction_requested: generation)
+  let running =
+    state.children
+    |> list.find(fn(child) { child.0 == agent_id })
+    |> result.map(fn(child) { process.is_alive(agent.pid(child.1)) })
+    |> result.unwrap(False)
+  case pending, running {
+    True, True -> Ok(#(state, generation))
+    _, True -> {
+      use state <- result.try(persist_agents(
+        state,
+        replace_agent(state.group.agents, replacement),
+      ))
+      Ok(#(state, generation))
+    }
+    _, False -> {
+      use catalog_session <- result.try(
+        model_catalog.resume(state.storage, state.group.model_catalog_key)
+        |> result.map_error(ModelCatalogFailed),
+      )
+      let catalog = model_catalog.catalog(catalog_session)
+      use prepared <- result.try(prepare_agent(
+        Config(
+          state.storage,
+          state.key,
+          state.profiles,
+          state.lease_duration_seconds,
+          state.minimum_lifetime_milliseconds,
+        ),
+        replacement,
+        catalog,
+      ))
+      use state <- result.try(persist_agents(
+        state,
+        replace_agent(state.group.agents, replacement),
+      ))
+      let child = make_agent(Group(coordinator), prepared)
+      let assert True = process.link(agent.pid(child))
+      agent.release(child)
+      let children = [
+        #(agent_id, child),
+        ..list.filter(state.children, fn(child) { child.0 != agent_id })
+      ]
+      Ok(#(CoordinatorState(..state, children:), generation))
+    }
+  }
+}
+
 fn queue_pending_message(
   state: CoordinatorState,
   current: agent.State,
@@ -818,6 +934,10 @@ fn inject_and_start(
       revision: current.revision + 1,
       messages: list.append(
         current.messages,
+        list.append(current.pending_messages, incoming),
+      ),
+      context_messages: append_context(
+        current.context_messages,
         list.append(current.pending_messages, incoming),
       ),
       pending_messages: [],
@@ -881,6 +1001,16 @@ fn replace_agent(
   })
 }
 
+fn append_context(
+  context: Option(List(llm.Message)),
+  messages: List(llm.Message),
+) -> Option(List(llm.Message)) {
+  case context {
+    None -> None
+    Some(context) -> Some(list.append(context, messages))
+  }
+}
+
 fn extend_claim(state: CoordinatorState) -> ExecutionState {
   Claimed(
     state.owner,
@@ -942,7 +1072,19 @@ fn do_commit_agent(
       ..new_agent,
       revision: agent_revision,
       messages: list.append(new_agent.messages, current.pending_messages),
+      context_messages: append_context(
+        new_agent.context_messages,
+        current.pending_messages,
+      ),
       pending_messages: [],
+      compaction_requested: int.max(
+        new_agent.compaction_requested,
+        current.compaction_requested,
+      ),
+      compaction_completed: int.max(
+        new_agent.compaction_completed,
+        current.compaction_completed,
+      ),
       status: case has_pending {
         True -> agent.Ready
         False -> new_agent.status
@@ -1321,6 +1463,7 @@ fn inject_pending(state: agent.State) -> agent.State {
         ..state,
         revision: state.revision + 1,
         messages: list.append(state.messages, pending),
+        context_messages: append_context(state.context_messages, pending),
         pending_messages: [],
         status: agent.Ready,
       )
