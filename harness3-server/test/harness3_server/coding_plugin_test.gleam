@@ -38,7 +38,7 @@ pub fn coding_tools_write_read_exec_and_reject_escape_test() {
   let assert Ok(#(runtime, plugin.ToolOutput(is_error: False, ..))) =
     plugin.invoke_tool(
       runtime,
-      "Write",
+      "coding.write",
       invocation("write", [
         #("path", json.string("nested/proof.txt")),
         #("content", json.string("hello\n")),
@@ -47,7 +47,7 @@ pub fn coding_tools_write_read_exec_and_reject_escape_test() {
   let assert Ok(#(runtime, read_output)) =
     plugin.invoke_tool(
       runtime,
-      "Read",
+      "coding.read",
       invocation("read", [
         #("path", json.string("nested/proof.txt")),
       ]),
@@ -57,7 +57,7 @@ pub fn coding_tools_write_read_exec_and_reject_escape_test() {
   let assert Ok(#(runtime, exec_output)) =
     plugin.invoke_tool(
       runtime,
-      "Exec",
+      "coding.exec",
       invocation("exec", [
         #("command", json.string("cat nested/proof.txt")),
       ]),
@@ -67,7 +67,7 @@ pub fn coding_tools_write_read_exec_and_reject_escape_test() {
   let assert Ok(#(_, escaped)) =
     plugin.invoke_tool(
       runtime,
-      "Write",
+      "coding.write",
       invocation("escape", [
         #("path", json.string("../outside.txt")),
         #("content", json.string("no")),
@@ -114,7 +114,7 @@ pub fn message_agent_says_replies_arrive_without_polling_test() {
   )) =
     plugin.invoke_tool(
       runtime,
-      "MessageAgent",
+      "team.message_agent",
       invocation("message", [
         #("agent_id", json.string("researcher")),
         #("message", json.string("Investigate the failure")),

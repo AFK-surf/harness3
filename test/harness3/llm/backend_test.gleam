@@ -20,7 +20,7 @@ fn multimodal_request() -> llm.Request {
     ],
     tools: [
       llm.Tool(
-        "lookup",
+        "test.lookup",
         Some("Look something up"),
         json.object([#("type", json.string("object"))]),
       ),
@@ -84,7 +84,7 @@ pub fn tool_call_replay_request_test() {
       messages: [
         llm.Message(llm.User, [llm.Text("hi")]),
         llm.Message(llm.Assistant, [
-          llm.ToolCall("call_1", "lookup", json.object([])),
+          llm.ToolCall("call_1", "test.lookup", json.object([])),
         ]),
         llm.Message(llm.ToolRole, [
           llm.ToolResult("call_1", [llm.Text("ok")], False),
@@ -139,9 +139,9 @@ pub fn anthropic_buffered_tool_use_test() {
     llm.decode_response(
       provider,
       200,
-      "{\"id\":\"msg_1\",\"model\":\"claude-test\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"lookup\",\"input\":{\"query\":\"cats\"}}],\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}",
+      "{\"id\":\"msg_1\",\"model\":\"claude-test\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"test.lookup\",\"input\":{\"query\":\"cats\"}}],\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}",
     )
-  assert list.contains(events, llm.ToolCallStart(0, "toolu_1", "lookup"))
+  assert list.contains(events, llm.ToolCallStart(0, "toolu_1", "test.lookup"))
   assert list.contains(
     events,
     llm.ToolCallArgumentsDelta(0, "{\"query\":\"cats\"}"),
@@ -229,7 +229,7 @@ pub fn responses_replay_preserves_interleaved_item_order_test() {
           ["first"],
           Some(llm.OpenAIEncryptedReasoning("rs_1", "cipher-first")),
         ),
-        llm.ToolCall("call_1", "lookup", json.object([])),
+        llm.ToolCall("call_1", "test.lookup", json.object([])),
         llm.Reasoning(
           ["second"],
           Some(llm.OpenAIEncryptedReasoning("rs_2", "cipher-second")),
@@ -301,13 +301,13 @@ pub fn chat_completions_tool_call_indices_test() {
     llm.decode_response(
       provider,
       200,
-      "{\"id\":\"chatcmpl_1\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Let me check\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}},{\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}",
+      "{\"id\":\"chatcmpl_1\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Let me check\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"test.lookup\",\"arguments\":\"{}\"}},{\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"test.lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}",
     )
   // Text stays at the choice index; tool calls take the following indices so
   // parallel calls never collapse onto one block.
   assert list.contains(events, llm.TextDelta(0, "Let me check"))
-  assert list.contains(events, llm.ToolCallStart(2, "call_1", "lookup"))
-  assert list.contains(events, llm.ToolCallStart(3, "call_2", "lookup"))
+  assert list.contains(events, llm.ToolCallStart(2, "call_1", "test.lookup"))
+  assert list.contains(events, llm.ToolCallStart(3, "call_2", "test.lookup"))
   assert list.contains(events, llm.Finished(llm.ToolUse))
 }
 
@@ -441,7 +441,7 @@ pub fn chat_completions_reasoning_replay_test() {
     llm.request("test-model", [
       llm.Message(llm.Assistant, [
         llm.Reasoning(["Prior ", "thinking"], None),
-        llm.ToolCall("call_1", "lookup", json.object([])),
+        llm.ToolCall("call_1", "test.lookup", json.object([])),
       ]),
       llm.Message(llm.ToolRole, [
         llm.ToolResult("call_1", [llm.Text("ok")], False),

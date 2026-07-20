@@ -40,7 +40,7 @@ pub fn dependency_activation_and_tool_test() {
     |> plugin.with_tool(
       plugin.tool(
         llm.Tool(
-          "caller_tool",
+          "caller.tool",
           None,
           json.object([#("type", json.string("object"))]),
         ),
@@ -60,7 +60,7 @@ pub fn dependency_activation_and_tool_test() {
   assert plugin.tools(runtime)
     == [
       llm.Tool(
-        "caller_tool",
+        "caller.tool",
         None,
         json.object([#("type", json.string("object"))]),
       ),
@@ -72,7 +72,7 @@ pub fn dependency_activation_and_tool_test() {
   let assert Ok(#(runtime, plugin.ToolOutput([llm.Text("done")], False))) =
     plugin.invoke_tool(
       runtime,
-      "caller_tool",
+      "caller.tool",
       plugin.ToolInvocation("call_1", "{}"),
     )
   assert dict.get(plugin.encoded_states(runtime), "caller")

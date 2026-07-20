@@ -190,7 +190,7 @@ fn tool_decoder(server_id: String) -> decode.Decoder(configuration.Tool) {
   decode.success(configuration.Tool(
     server_id:,
     name:,
-    exposed_name: configuration.exposed_tool_name(server_id, name),
+    broker_name: configuration.broker_tool_name(server_id, name),
     description:,
     input_schema:,
     output_schema:,

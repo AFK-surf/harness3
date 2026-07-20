@@ -23,7 +23,7 @@ pub fn workspace(workspace: String) -> plugin.Plugin {
     "Workspace tools",
     "The shared workspace root is `"
       <> workspace
-      <> "`. Use Read, Write, and Exec to inspect, change, and verify it. Tool paths are relative to this workspace.",
+      <> "`. Use `coding.read`, `coding.write`, and `coding.exec` to inspect, change, and verify it. Tool paths are relative to this workspace.",
   ))
   |> plugin.with_tool(read_tool(workspace))
   |> plugin.with_tool(write_tool(workspace))
@@ -48,9 +48,9 @@ pub fn collaboration(
       <> role
       <> ".\n\n"
       <> capability_instructions
-      <> " Your permitted MessageAgent recipients are: "
+      <> " Your permitted `team.message_agent` recipients are: "
       <> string.join(teammates, ", ")
-      <> ". MessageAgent rejects every other recipient. Subagents communicate only with the lead; the lead may communicate with every subagent. Messages are durable and wake the target agent. Coordinate explicitly and report concrete results.",
+      <> ". `team.message_agent` rejects every other recipient. Subagents communicate only with the lead; the lead may communicate with every subagent. Messages are durable and wake the target agent. Coordinate explicitly and report concrete results.",
   ))
   |> plugin.with_tool(message_tool(group_id, agent_id, teammates))
 }
@@ -58,7 +58,7 @@ pub fn collaboration(
 fn read_tool(workspace: String) -> plugin.Tool {
   plugin.tool(
     llm.Tool(
-      "Read",
+      "coding.read",
       Some("Read a UTF-8 file from the shared workspace with line numbers."),
       object_schema(
         [
@@ -76,7 +76,7 @@ fn read_tool(workspace: String) -> plugin.Tool {
           Ok(tool_result(
             state,
             context,
-            "Invalid Read arguments: " <> string.inspect(error),
+            "Invalid coding.read arguments: " <> string.inspect(error),
             True,
           ))
         Ok(ReadArguments(path, offset, limit)) ->
@@ -119,7 +119,7 @@ fn read_tool(workspace: String) -> plugin.Tool {
 fn write_tool(workspace: String) -> plugin.Tool {
   plugin.tool(
     llm.Tool(
-      "Write",
+      "coding.write",
       Some("Create or replace a UTF-8 file in the shared workspace."),
       object_schema(
         [
@@ -136,7 +136,7 @@ fn write_tool(workspace: String) -> plugin.Tool {
           Ok(tool_result(
             state,
             context,
-            "Invalid Write arguments: " <> string.inspect(error),
+            "Invalid coding.write arguments: " <> string.inspect(error),
             True,
           ))
         Ok(WriteArguments(path, content)) ->
@@ -183,7 +183,7 @@ fn write_tool(workspace: String) -> plugin.Tool {
 fn exec_tool(workspace: String) -> plugin.Tool {
   plugin.tool(
     llm.Tool(
-      "Exec",
+      "coding.exec",
       Some("Run a shell command in the shared workspace."),
       object_schema(
         [
@@ -204,7 +204,7 @@ fn exec_tool(workspace: String) -> plugin.Tool {
           Ok(tool_result(
             state,
             context,
-            "Invalid Exec arguments: " <> string.inspect(error),
+            "Invalid coding.exec arguments: " <> string.inspect(error),
             True,
           ))
         Ok(ExecArguments(command, timeout_seconds)) -> {
@@ -243,7 +243,7 @@ fn message_tool(
 ) -> plugin.Tool {
   plugin.tool(
     llm.Tool(
-      "MessageAgent",
+      "team.message_agent",
       Some("Send a durable message to a teammate and wake that agent."),
       object_schema(
         [
@@ -260,7 +260,7 @@ fn message_tool(
           Ok(tool_result(
             state,
             context,
-            "Invalid MessageAgent arguments: " <> string.inspect(error),
+            "Invalid team.message_agent arguments: " <> string.inspect(error),
             True,
           ))
         Ok(MessageArguments(target, message)) ->

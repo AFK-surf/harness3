@@ -773,11 +773,11 @@ fn capability_instructions(kind: AgentKind) -> String {
     CodingAgent ->
       "You can inspect and modify the shared workspace, run commands with the installed coding tools, and read, write, list, delete, or create transfer URLs for durable cloud-storage objects shared by this agent group."
     ResearchAgent ->
-      "You have no filesystem, workspace, shell, or MCP tools. You can use MessageAgent only to report to the lead, and you can read, write, list, delete, or create transfer URLs for durable cloud-storage objects shared by this agent group."
+      "You have no filesystem, workspace, shell, or MCP tools. You can use `team.message_agent` only to report to the lead, and you can use the `cloud_storage.*` tools to read, write, list, delete, or create transfer URLs for durable objects shared by this agent group."
     McpSpecialist(configuration_id) ->
       "You are the MCP specialist for global configuration `"
       <> configuration_id
-      <> "`. You have MessageAgent (to report to the lead), mcp.list (to inspect tools from currently reachable external servers), mcp.call (to invoke a listed tool), and read/write/list/delete/transfer-URL access to durable cloud-storage objects shared by this agent group. You have no direct filesystem or shell access."
+      <> "`. You have `team.message_agent` (to report to the lead), `mcp.list` (to inspect tools from currently reachable external servers), `mcp.call` (to invoke a listed tool), and the `cloud_storage.*` tools for durable objects shared by this agent group. You have no direct filesystem or shell access."
   }
 }
 
@@ -809,7 +809,7 @@ fn team(size: Int, mcp_configuration_id: Option(String)) -> List(AgentSpec) {
       McpSpecialist(id),
       "MCP research specialist for global configuration `"
         <> id
-        <> "`. Has MessageAgent access only to the lead, mcp.list and mcp.call access to tools discovered from currently reachable external servers, and shared durable cloud-storage access; has no filesystem or shell access.",
+        <> "`. Has `team.message_agent` access only to the lead, `mcp.list` and `mcp.call` access to tools discovered from currently reachable external servers, and `cloud_storage.*` access to shared durable objects; has no filesystem or shell access.",
     )
     None -> #(
       ResearchAgent,
@@ -819,18 +819,18 @@ fn team(size: Int, mcp_configuration_id: Option(String)) -> List(AgentSpec) {
   [
     AgentSpec(
       "lead",
-      "Lead engineer. Has Read, Write, and Exec access to the selected workspace, shared durable cloud-storage access, and messaging access to every subagent; owns implementation, delegation, and verification.",
+      "Lead engineer. Has `coding.read`, `coding.write`, and `coding.exec` access to the selected workspace, `cloud_storage.*` access to shared durable objects, and `team.message_agent` access to every subagent; owns implementation, delegation, and verification.",
       CodingAgent,
     ),
     AgentSpec("researcher", researcher_role, researcher_kind),
     AgentSpec(
       "implementer",
-      "Implementation specialist. Has Read, Write, and Exec access to the selected workspace and shared durable cloud-storage access; can message only the lead agent.",
+      "Implementation specialist. Has `coding.read`, `coding.write`, and `coding.exec` access to the selected workspace and `cloud_storage.*` access to shared durable objects; `team.message_agent` can target only the lead agent.",
       CodingAgent,
     ),
     AgentSpec(
       "reviewer",
-      "Reviewer and test engineer. Has Read, Write, and Exec access to the selected workspace and shared durable cloud-storage access; can message only the lead agent.",
+      "Reviewer and test engineer. Has `coding.read`, `coding.write`, and `coding.exec` access to the selected workspace and `cloud_storage.*` access to shared durable objects; `team.message_agent` can target only the lead agent.",
       CodingAgent,
     ),
   ]

@@ -177,7 +177,7 @@ pub fn each_agent_owns_its_own_connections_test() {
         json.object([
           #(
             "tool",
-            json.string(configuration.exposed_tool_name("search", "search_web")),
+            json.string(configuration.broker_tool_name("search", "search_web")),
           ),
           #("arguments", json.object([])),
         ])
@@ -423,7 +423,10 @@ pub fn runtime_discovers_and_broker_invokes_available_tools_test() {
       connector,
     )
   let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
-  let exposed = configuration.exposed_tool_name("search", "search_web")
+  let broker_name = configuration.broker_tool_name("search", "search_web")
+  assert string.starts_with(broker_name, "mcp.server_search_tool_search_web_")
+  assert !string.contains(broker_name, "__")
+  assert string.lowercase(broker_name) == broker_name
 
   let value = mcp_plugin.new(mcp_runtime, current)
   let assert Ok(registry) = harness_plugin.registry([value])
@@ -443,7 +446,7 @@ pub fn runtime_discovers_and_broker_invokes_available_tools_test() {
       list_name,
       harness_plugin.ToolInvocation("list", "{}"),
     )
-  assert string.contains(listing, exposed)
+  assert string.contains(listing, broker_name)
   assert string.contains(listing, "search_web")
   let assert Ok(#(
     _,
@@ -458,7 +461,7 @@ pub fn runtime_discovers_and_broker_invokes_available_tools_test() {
       harness_plugin.ToolInvocation(
         "call",
         json.object([
-          #("tool", json.string(exposed)),
+          #("tool", json.string(broker_name)),
           #("arguments", json.object([#("query", json.string("MCP"))])),
         ])
           |> json.to_string,

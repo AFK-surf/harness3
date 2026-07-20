@@ -137,6 +137,8 @@ not produce event N+1 until `consume` of event N has returned (backpressure cont
 
 - A `Plugin` has a name, declared dependencies, an initial JSON state string,
   system-prompt sections, tools, named callbacks, and activation hooks.
+- Codebase-owned model tools use `snake_case_namespace.snake_case_name`. This is
+  a naming convention, not a registry validation rule for application plugins.
 - `registry(plugins)` validates: unique plugin names, dependencies present, unique
   callback names per plugin, unique tool names *globally*, valid initial JSON state, and
   computes a topological activation order (cycle → error).
@@ -189,8 +191,8 @@ not produce event N+1 until `consume` of event N has returned (backpressure cont
   they may have side effects.
 - `Tool.input_schema` and `Tool.output_schema` are typed `json.Json` values produced by
   object-only decoders. Catalog persistence and `mcp.list` reuse those values directly;
-  there is no string-to-JSON cast. Server/tool names are deterministically namespaced
-  and hash-suffixed into stable broker identifiers.
+  there is no string-to-JSON cast. Server/tool names become deterministic,
+  snake-case `mcp.*` broker identifiers with hash suffixes.
 - The model sees exactly two static broker tools: `mcp.list` returns the tools from
   reachable servers, their typed schemas, and any server failures; `mcp.call` invokes
   one identifier returned by `mcp.list` with an argument object.
@@ -200,10 +202,11 @@ not produce event N+1 until `consume` of event N has returned (backpressure cont
   Its web API and UI can add or remove servers with CAS-backed durable updates; those
   updates invalidate live connections and discovery state for the affected
   configuration. Management responses omit binding values. A configured team
-  assigns the researcher `mcp.list`, `mcp.call`, `MessageAgent`, and group cloud-storage
-  tools, but no filesystem or shell capability. Coding agents receive Read/Write/Exec,
-  `MessageAgent`, and group cloud-storage tools, but no MCP tools. The lead may message
-  all subagents; every subagent's `MessageAgent`
+  assigns the researcher `mcp.list`, `mcp.call`, `team.message_agent`, and group
+  `cloud_storage.*` tools, but no filesystem or shell capability. Coding agents
+  receive `coding.read`, `coding.write`, `coding.exec`, `team.message_agent`, and
+  `cloud_storage.*`, but no MCP tools. The lead may message all subagents; every
+  subagent's `team.message_agent`
   allow-list contains only the lead, preventing direct peer-to-peer subagent
   communication. Without an MCP configuration, the researcher remains a separate
   message-and-cloud-storage-only profile and is not granted local filesystem or shell

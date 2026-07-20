@@ -105,7 +105,7 @@ fn write(
   content: String,
 ) -> plugin.Runtime {
   let #(runtime, output) =
-    invoke(runtime, "cloud_storage_write", [
+    invoke(runtime, "cloud_storage.write", [
       #("key", json.string(key)),
       #("content", json.string(content)),
     ])
@@ -125,18 +125,18 @@ pub fn cloud_storage_exposes_scoped_text_crud_tools_test() {
     })
   assert tool_names
     == [
-      "cloud_storage_read",
-      "cloud_storage_write",
-      "cloud_storage_list",
-      "cloud_storage_delete",
-      "cloud_storage_get_url",
+      "cloud_storage.read",
+      "cloud_storage.write",
+      "cloud_storage.list",
+      "cloud_storage.delete",
+      "cloud_storage.get_url",
     ]
   assert string.contains(plugin.system_prompt(runtime), "shared")
   assert dict.get(plugin.encoded_states(runtime), "cloud_storage") == Ok("{}")
 
   let runtime = write(runtime, "notes/計畫.txt", "first")
   let #(runtime, read) =
-    invoke(runtime, "cloud_storage_read", [
+    invoke(runtime, "cloud_storage.read", [
       #("key", json.string("notes/計畫.txt")),
     ])
   assert_success(read)
@@ -144,13 +144,13 @@ pub fn cloud_storage_exposes_scoped_text_crud_tools_test() {
 
   let runtime = write(runtime, "notes/計畫.txt", "replacement")
   let #(runtime, read) =
-    invoke(runtime, "cloud_storage_read", [
+    invoke(runtime, "cloud_storage.read", [
       #("key", json.string("notes/計畫.txt")),
     ])
   assert output_text(read) == "replacement"
 
   let #(runtime, direct_url) =
-    invoke(runtime, "cloud_storage_get_url", [
+    invoke(runtime, "cloud_storage.get_url", [
       #("key", json.string("notes/計畫.txt")),
       #("operation", json.string("download")),
     ])
@@ -166,17 +166,17 @@ pub fn cloud_storage_exposes_scoped_text_crud_tools_test() {
   assert string.ends_with(url, "/notes/%E8%A8%88%E7%95%AB.txt")
 
   let #(runtime, deleted) =
-    invoke(runtime, "cloud_storage_delete", [
+    invoke(runtime, "cloud_storage.delete", [
       #("key", json.string("notes/計畫.txt")),
     ])
   assert_success(deleted)
   let #(runtime, deleted_again) =
-    invoke(runtime, "cloud_storage_delete", [
+    invoke(runtime, "cloud_storage.delete", [
       #("key", json.string("notes/計畫.txt")),
     ])
   assert_success(deleted_again)
   let #(_, missing) =
-    invoke(runtime, "cloud_storage_read", [
+    invoke(runtime, "cloud_storage.read", [
       #("key", json.string("notes/計畫.txt")),
     ])
   assert_error(missing)
@@ -197,7 +197,7 @@ pub fn listing_is_sorted_paginated_live_and_group_scoped_test() {
   let runtime_b = write(runtime_b, "notes/a.txt", "private B")
 
   let #(runtime_a, first_output) =
-    invoke(runtime_a, "cloud_storage_list", [
+    invoke(runtime_a, "cloud_storage.list", [
       #("prefix", json.string("notes/")),
       #("limit", json.int(2)),
     ])
@@ -211,12 +211,12 @@ pub fn listing_is_sorted_paginated_live_and_group_scoped_test() {
 
   // Keyset pagination must keep working if the boundary object is deleted.
   let #(runtime_a, deleted) =
-    invoke(runtime_a, "cloud_storage_delete", [
+    invoke(runtime_a, "cloud_storage.delete", [
       #("key", json.string("notes/m.txt")),
     ])
   assert_success(deleted)
   let #(runtime_a, second_output) =
-    invoke(runtime_a, "cloud_storage_list", [
+    invoke(runtime_a, "cloud_storage.list", [
       #("cursor", json.string(next_cursor)),
       #("limit", json.int(1)),
     ])
@@ -225,7 +225,7 @@ pub fn listing_is_sorted_paginated_live_and_group_scoped_test() {
   assert object_keys(second_objects) == ["notes/z.txt"]
 
   let #(_, conflict) =
-    invoke(runtime_a, "cloud_storage_list", [
+    invoke(runtime_a, "cloud_storage.list", [
       #("prefix", json.string("other")),
       #("cursor", json.string(next_cursor)),
     ])
@@ -233,18 +233,18 @@ pub fn listing_is_sorted_paginated_live_and_group_scoped_test() {
   assert string.contains(output_text(conflict), "does not match")
 
   let #(runtime_b, group_b_page) =
-    invoke(runtime_b, "cloud_storage_list", [
+    invoke(runtime_b, "cloud_storage.list", [
       #("prefix", json.string("notes/")),
     ])
   let Page(objects: group_b_objects, ..) = page(group_b_page)
   assert object_keys(group_b_objects) == ["notes/a.txt"]
 
   let #(_, group_a_read) =
-    invoke(runtime_a, "cloud_storage_read", [
+    invoke(runtime_a, "cloud_storage.read", [
       #("key", json.string("notes/a.txt")),
     ])
   let #(_, group_b_read) =
-    invoke(runtime_b, "cloud_storage_read", [
+    invoke(runtime_b, "cloud_storage.read", [
       #("key", json.string("notes/a.txt")),
     ])
   assert output_text(group_a_read) == "a"
@@ -263,7 +263,7 @@ pub fn invalid_keys_cursors_limits_and_non_utf8_objects_are_tool_errors_test() {
     ["", "/absolute", "../outside", "a//b", "a/./b", "a/../b", "a\\b", "a/"],
     fn(key) {
       let #(_, output) =
-        invoke(runtime, "cloud_storage_write", [
+        invoke(runtime, "cloud_storage.write", [
           #("key", json.string(key)),
           #("content", json.string("no")),
         ])
@@ -272,28 +272,28 @@ pub fn invalid_keys_cursors_limits_and_non_utf8_objects_are_tool_errors_test() {
   )
 
   let #(_, bad_prefix) =
-    invoke(runtime, "cloud_storage_list", [
+    invoke(runtime, "cloud_storage.list", [
       #("prefix", json.string("a//")),
     ])
   assert_error(bad_prefix)
   let #(_, bad_cursor) =
-    invoke(runtime, "cloud_storage_list", [
+    invoke(runtime, "cloud_storage.list", [
       #("cursor", json.string("not-a-cursor")),
     ])
   assert_error(bad_cursor)
   let #(_, small_limit) =
-    invoke(runtime, "cloud_storage_list", [#("limit", json.int(0))])
+    invoke(runtime, "cloud_storage.list", [#("limit", json.int(0))])
   assert_error(small_limit)
   let #(_, large_limit) =
-    invoke(runtime, "cloud_storage_list", [#("limit", json.int(1001))])
+    invoke(runtime, "cloud_storage.list", [#("limit", json.int(1001))])
   assert_error(large_limit)
   let #(_, forged_cursor) =
-    invoke(runtime, "cloud_storage_list", [
+    invoke(runtime, "cloud_storage.list", [
       #("cursor", json.string(cursor.encode("notes/", "elsewhere.txt"))),
     ])
   assert_error(forged_cursor)
   let #(_, bad_operation) =
-    invoke(runtime, "cloud_storage_get_url", [
+    invoke(runtime, "cloud_storage.get_url", [
       #("key", json.string("object.txt")),
       #("operation", json.string("delete")),
     ])
@@ -302,7 +302,7 @@ pub fn invalid_keys_cursors_limits_and_non_utf8_objects_are_tool_errors_test() {
   let assert Ok(#(_, malformed_arguments)) =
     plugin.invoke_tool(
       runtime,
-      "cloud_storage_read",
+      "cloud_storage.read",
       plugin.ToolInvocation("bad-json", "[]"),
     )
   assert_error(malformed_arguments)
@@ -312,14 +312,14 @@ pub fn invalid_keys_cursors_limits_and_non_utf8_objects_are_tool_errors_test() {
   let assert Ok(_) =
     storage.put(backend, backend_key, <<255, 254>>, storage.Unconditional)
   let #(_, binary_read) =
-    invoke(runtime, "cloud_storage_read", [
+    invoke(runtime, "cloud_storage.read", [
       #("key", json.string("binary.dat")),
     ])
   assert_error(binary_read)
   assert string.contains(output_text(binary_read), "not UTF-8")
 
   // Empty prefix is valid and lists the complete logical group namespace.
-  let #(_, all_objects) = invoke(runtime, "cloud_storage_list", [])
+  let #(_, all_objects) = invoke(runtime, "cloud_storage.list", [])
   let Page(objects:, ..) = page(all_objects)
   assert object_keys(objects) == ["binary.dat"]
 
@@ -330,14 +330,14 @@ pub fn storage_backend_failures_are_recoverable_tool_errors_test() {
   let backend = failing_storage()
   let runtime = activate(backend, "offline-group")
   let operations = [
-    #("cloud_storage_read", [#("key", json.string("object.txt"))]),
-    #("cloud_storage_write", [
+    #("cloud_storage.read", [#("key", json.string("object.txt"))]),
+    #("cloud_storage.write", [
       #("key", json.string("object.txt")),
       #("content", json.string("body")),
     ]),
-    #("cloud_storage_list", []),
-    #("cloud_storage_delete", [#("key", json.string("object.txt"))]),
-    #("cloud_storage_get_url", [
+    #("cloud_storage.list", []),
+    #("cloud_storage.delete", [#("key", json.string("object.txt"))]),
+    #("cloud_storage.get_url", [
       #("key", json.string("object.txt")),
       #("operation", json.string("download")),
     ]),
@@ -378,7 +378,7 @@ pub fn cloud_transfer_urls_are_requested_with_five_minute_ttl_test() {
     })
   let runtime = activate(backend, "url-group")
   let #(_, output) =
-    invoke(runtime, "cloud_storage_get_url", [
+    invoke(runtime, "cloud_storage.get_url", [
       #("key", json.string("export.txt")),
       #("operation", json.string("upload")),
     ])

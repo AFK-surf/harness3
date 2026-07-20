@@ -86,12 +86,12 @@ discovered independently. Unavailable servers are excluded, so server startup
 and agent availability do not depend on external services. The model receives
 only `mcp.list`, which reports reachable tools and failures, and `mcp.call`,
 which invokes an identifier returned by `mcp.list`. The researcher keeps durable
-teammate messaging but has no workspace, file-write, or shell tools.
+`team.message_agent` access but has no workspace, file-write, or shell tools.
 Without MCP, the researcher remains least-privilege and receives
-`MessageAgent` plus the group cloud-storage tools; it never falls back to local
-filesystem or shell tools. Every agent receives `cloud_storage_read`,
-`cloud_storage_write`, `cloud_storage_list`, `cloud_storage_delete`, and
-`cloud_storage_get_url`. These tools share durable objects within one session
+`team.message_agent` plus the group cloud-storage tools; it never falls back to
+local filesystem or shell tools. Every agent receives `cloud_storage.read`,
+`cloud_storage.write`, `cloud_storage.list`, `cloud_storage.delete`, and
+`cloud_storage.get_url`. These tools share durable objects within one session
 while keeping different sessions isolated. The lead, implementer, and reviewer
 retain the coding tools and do not receive MCP
 access. Session metadata and plugin state store the configuration ID, while the
@@ -135,7 +135,7 @@ gleam run
 | `HARNESS3_MODEL_TIMEOUT_MS` | `300000` |
 | `HARNESS3_MAX_OUTPUT_TOKENS` | `8192` |
 
-`Exec` deliberately gives coding agents a shell inside the selected workspace.
+`coding.exec` deliberately gives coding agents a shell inside the selected workspace.
 Keep the default loopback bind unless the surrounding environment provides
 authentication and isolation.
 

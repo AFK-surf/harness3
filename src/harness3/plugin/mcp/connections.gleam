@@ -89,7 +89,7 @@ pub fn list(
 
 pub fn call(
   connections: Connections,
-  exposed_name: String,
+  broker_name: String,
   arguments: String,
 ) -> #(Connections, Result(protocol.CallResult, String)) {
   let #(next, discovered) = ensure_discovered(connections)
@@ -97,7 +97,7 @@ pub fn call(
     use _ <- result.try(discovered)
     use #(connection, tool, timeout) <- result.try(prepare_call(
       next,
-      exposed_name,
+      broker_name,
     ))
     client.call_tool(connection, tool.name, arguments, timeout)
   }
@@ -258,15 +258,15 @@ fn validate_server_tools(
 
 fn prepare_call(
   connections: Connections,
-  exposed_name: String,
+  broker_name: String,
 ) -> Result(#(client.Connection, configuration.Tool, Int), String) {
   use configuration <- result.try(case connections.configuration {
     Some(configuration) -> Ok(configuration)
     None -> Error("MCP configuration is unavailable")
   })
   use tool <- result.try(
-    list.find(connections.tools, fn(tool) { tool.exposed_name == exposed_name })
-    |> result.map_error(fn(_) { "unknown MCP tool: " <> exposed_name }),
+    list.find(connections.tools, fn(tool) { tool.broker_name == broker_name })
+    |> result.map_error(fn(_) { "unknown MCP tool: " <> broker_name }),
   )
   use server <- result.try(
     list.find(configuration.servers, fn(server) { server.id == tool.server_id })

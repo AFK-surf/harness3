@@ -272,7 +272,7 @@ fn encode_listing(listing: connections.Listing) -> json.Json {
 
 fn encode_tool(tool: configuration.Tool) -> json.Json {
   json.object([
-    #("tool", json.string(tool.exposed_name)),
+    #("tool", json.string(tool.broker_name)),
     #("server_id", json.string(tool.server_id)),
     #("name", json.string(tool.name)),
     #("description", json.nullable(tool.description, json.string)),

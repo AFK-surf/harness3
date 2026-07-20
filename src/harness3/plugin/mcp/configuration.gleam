@@ -45,7 +45,7 @@ pub type Tool {
   Tool(
     server_id: String,
     name: String,
-    exposed_name: String,
+    broker_name: String,
     description: Option(String),
     input_schema: json.Json,
     output_schema: Option(json.Json),
@@ -87,17 +87,64 @@ pub fn resolve_bindings(
   })
 }
 
-pub fn exposed_tool_name(server_id: String, tool_name: String) -> String {
+pub fn broker_tool_name(server_id: String, tool_name: String) -> String {
   let readable =
-    "mcp__" <> sanitize_name(server_id) <> "__" <> sanitize_name(tool_name)
+    "server_"
+    <> snake_case_part(server_id)
+    <> "_tool_"
+    <> snake_case_part(tool_name)
   let digest =
     crypto.hash(
       crypto.Sha256,
       bit_array.from_string(server_id <> "\u{0}" <> tool_name),
     )
     |> bit_array.base16_encode
+    |> string.lowercase
     |> string.slice(0, 12)
-  string.slice(readable, 0, 49) <> "__" <> digest
+  "mcp." <> string.slice(readable, 0, 46) <> "_" <> digest
+}
+
+fn snake_case_part(value: String) -> String {
+  value
+  |> string.lowercase
+  |> string.to_graphemes
+  |> collapse_name_separators([], False)
+  |> trim_trailing_separator
+  |> string.concat
+}
+
+fn collapse_name_separators(
+  remaining: List(String),
+  accumulated: List(String),
+  separated: Bool,
+) -> List(String) {
+  case remaining {
+    [] -> accumulated
+    [grapheme, ..rest] ->
+      case is_snake_grapheme(grapheme), list.is_empty(accumulated), separated {
+        True, _, _ ->
+          collapse_name_separators(
+            rest,
+            list.append(accumulated, [grapheme]),
+            False,
+          )
+        False, True, _ | False, _, True ->
+          collapse_name_separators(rest, accumulated, separated)
+        False, False, False ->
+          collapse_name_separators(rest, list.append(accumulated, ["_"]), True)
+      }
+  }
+}
+
+fn trim_trailing_separator(value: List(String)) -> List(String) {
+  case list.reverse(value) {
+    ["_", ..rest] -> list.reverse(rest)
+    _ -> value
+  }
+}
+
+fn is_snake_grapheme(value: String) -> Bool {
+  string.contains("abcdefghijklmnopqrstuvwxyz0123456789", value)
 }
 
 fn sanitize_name(value: String) -> String {

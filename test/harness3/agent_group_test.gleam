@@ -434,7 +434,7 @@ pub fn full_agent_loop_with_mocked_llm_test() {
   let tool =
     plugin.tool(
       llm.Tool(
-        "record_call",
+        "stateful.record_call",
         None,
         json.object([#("type", json.string("object"))]),
       ),
@@ -453,7 +453,7 @@ pub fn full_agent_loop_with_mocked_llm_test() {
     plugin.new("stateful", "{\"calls\":0}")
     |> plugin.with_system_prompt(plugin.SystemPromptSection(
       "Stateful tool",
-      "Call record_call once.",
+      "Call stateful.record_call once.",
     ))
     |> plugin.with_tool(tool)
   let assert Ok(registry) = plugin.registry([stateful_plugin])
@@ -464,12 +464,13 @@ pub fn full_agent_loop_with_mocked_llm_test() {
       assert list.length(tools) == 1
       let assert [llm.Message(llm.System, [llm.Text(system_prompt)]), ..] =
         messages
-      assert system_prompt == "## Stateful tool\n\nCall record_call once."
+      assert system_prompt
+        == "## Stateful tool\n\nCall stateful.record_call once."
       case contains_tool_result(messages) {
         False -> {
           let assert Ok(Nil) = consume(llm.MessageStart("first", "test-model"))
           let assert Ok(Nil) =
-            consume(llm.ToolCallStart(0, "call_1", "record_call"))
+            consume(llm.ToolCallStart(0, "call_1", "stateful.record_call"))
           let assert Ok(Nil) = consume(llm.ToolCallArgumentsDelta(0, "{}"))
           let assert Ok(Nil) = consume(llm.ContentStop(0))
           let assert Ok(Nil) = consume(llm.Finished(llm.ToolUse))
@@ -731,7 +732,7 @@ pub fn plugin_callback_between_agents_test() {
     |> plugin.with_tool(
       plugin.tool(
         llm.Tool(
-          "call_receiver",
+          "caller_plugin.call_receiver",
           None,
           json.object([#("type", json.string("object"))]),
         ),
@@ -761,7 +762,11 @@ pub fn plugin_callback_between_agents_test() {
         False -> {
           let assert Ok(Nil) = consume(llm.MessageStart("call", "test-model"))
           let assert Ok(Nil) =
-            consume(llm.ToolCallStart(0, "remote_1", "call_receiver"))
+            consume(llm.ToolCallStart(
+              0,
+              "remote_1",
+              "caller_plugin.call_receiver",
+            ))
           let assert Ok(Nil) = consume(llm.ToolCallArgumentsDelta(0, "{}"))
           let assert Ok(Nil) = consume(llm.ContentStop(0))
           let assert Ok(Nil) = consume(llm.Finished(llm.ToolUse))
@@ -1092,7 +1097,7 @@ pub fn ambiguous_successful_cas_is_idempotent_and_fences_next_commit_test() {
   let tool =
     plugin.tool(
       llm.Tool(
-        "continue_once",
+        "tool.continue_once",
         None,
         json.object([#("type", json.string("object"))]),
       ),
@@ -1112,7 +1117,7 @@ pub fn ambiguous_successful_cas_is_idempotent_and_fences_next_commit_test() {
         False -> {
           let assert Ok(Nil) = consume(llm.MessageStart("first", "test-model"))
           let assert Ok(Nil) =
-            consume(llm.ToolCallStart(0, "call", "continue_once"))
+            consume(llm.ToolCallStart(0, "call", "tool.continue_once"))
           let assert Ok(Nil) = consume(llm.ToolCallArgumentsDelta(0, "{}"))
           let assert Ok(Nil) = consume(llm.ContentStop(0))
           let assert Ok(Nil) = consume(llm.Finished(llm.ToolUse))
@@ -1198,7 +1203,7 @@ pub fn automatic_compaction_reuses_prefix_and_preserves_full_history_test() {
   let inert_tool =
     plugin.tool(
       llm.Tool(
-        "cache_prefix_tool",
+        "cache_prefix.inert",
         None,
         json.object([#("type", json.string("object"))]),
       ),
@@ -1207,7 +1212,7 @@ pub fn automatic_compaction_reuses_prefix_and_preserves_full_history_test() {
       },
     )
   let cache_plugin =
-    plugin.new("cache-prefix", "{}")
+    plugin.new("cache_prefix", "{}")
     |> plugin.with_system_prompt(plugin.SystemPromptSection(
       "Cache prefix",
       "Stable system prompt.",

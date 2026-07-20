@@ -95,11 +95,11 @@ fn tool_names(profile: agent_profile.AgentProfile) -> List(String) {
 fn assert_cloud_storage_tools(names: List(String)) -> Nil {
   list.each(
     [
-      "cloud_storage_read",
-      "cloud_storage_write",
-      "cloud_storage_list",
-      "cloud_storage_delete",
-      "cloud_storage_get_url",
+      "cloud_storage.read",
+      "cloud_storage.write",
+      "cloud_storage.list",
+      "cloud_storage.delete",
+      "cloud_storage.get_url",
     ],
     fn(name) {
       assert list.contains(names, name)
@@ -185,18 +185,18 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let lead_tools = tool_names(lead_profile)
   let researcher_tools = tool_names(researcher_profile)
   let implementer_tools = tool_names(implementer_profile)
-  let exposed = mcp_configuration.exposed_tool_name("evidence", "lookup")
-  assert list.contains(lead_tools, "Read")
-  assert list.contains(lead_tools, "MessageAgent")
+  let broker_name = mcp_configuration.broker_tool_name("evidence", "lookup")
+  assert list.contains(lead_tools, "coding.read")
+  assert list.contains(lead_tools, "team.message_agent")
   assert_cloud_storage_tools(lead_tools)
   assert_cloud_storage_tools(researcher_tools)
   assert_cloud_storage_tools(implementer_tools)
-  assert !list.contains(lead_tools, exposed)
-  assert list.contains(researcher_tools, "MessageAgent")
+  assert !list.contains(lead_tools, broker_name)
+  assert list.contains(researcher_tools, "team.message_agent")
   assert list.contains(researcher_tools, "mcp.list")
   assert list.contains(researcher_tools, "mcp.call")
-  assert !list.contains(researcher_tools, exposed)
-  assert !list.contains(researcher_tools, "Read")
+  assert !list.contains(researcher_tools, broker_name)
+  assert !list.contains(researcher_tools, "coding.read")
   let assert Ok(researcher_runtime) =
     plugin.activate(researcher_profile.registry, plugin.empty_states())
   let assert Ok(lead_runtime) =
@@ -204,7 +204,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let assert Ok(#(_, plugin.ToolOutput(is_error: False, ..))) =
     plugin.invoke_tool(
       lead_runtime,
-      "cloud_storage_write",
+      "cloud_storage.write",
       plugin.ToolInvocation(
         "write-shared-object",
         json.object([
@@ -223,7 +223,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   )) =
     plugin.invoke_tool(
       researcher_runtime,
-      "cloud_storage_read",
+      "cloud_storage.read",
       plugin.ToolInvocation(
         "read-shared-object",
         "{\"key\":\"handoff/shared.txt\"}",
@@ -238,11 +238,11 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
       "mcp.list",
       plugin.ToolInvocation("list-tools", "{}"),
     )
-  assert string.contains(listing, exposed)
+  assert string.contains(listing, broker_name)
   let assert Ok(#(_, plugin.ToolOutput(is_error: True, ..))) =
     plugin.invoke_tool(
       researcher_runtime,
-      "MessageAgent",
+      "team.message_agent",
       plugin.ToolInvocation(
         "blocked-peer-message",
         "{\"agent_id\":\"implementer\",\"message\":\"bypass lead\"}",
@@ -287,12 +287,12 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let researcher_without_mcp_tools = tool_names(researcher_without_mcp)
   assert researcher_without_mcp_tools
     == [
-      "MessageAgent",
-      "cloud_storage_read",
-      "cloud_storage_write",
-      "cloud_storage_list",
-      "cloud_storage_delete",
-      "cloud_storage_get_url",
+      "team.message_agent",
+      "cloud_storage.read",
+      "cloud_storage.write",
+      "cloud_storage.list",
+      "cloud_storage.delete",
+      "cloud_storage.get_url",
     ]
   let assert Ok(Nil) =
     service.stop_session(without_mcp, without_mcp_metadata.id)
@@ -375,11 +375,11 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
       let llm.Tool(name:, ..) = tool
       name
     })
-  assert list.contains(offline_tools, "MessageAgent")
+  assert list.contains(offline_tools, "team.message_agent")
   assert list.contains(offline_tools, "mcp.list")
   assert list.contains(offline_tools, "mcp.call")
   assert_cloud_storage_tools(offline_tools)
-  assert !list.contains(offline_tools, "Read")
+  assert !list.contains(offline_tools, "coding.read")
   let assert Ok(#(
     _,
     plugin.ToolOutput(content: [llm.Text(offline_listing)], is_error: False),
