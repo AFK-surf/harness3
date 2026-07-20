@@ -18,6 +18,7 @@ through storage objects (CAS writes, leases) plus token-authenticated HTTP RPC.
 | `llm/anthropic_messages`, `llm/openai_chat_completions`, `llm/openai_responses` | Provider adapters: build HTTP requests, decode buffered/streamed responses into neutral events |
 | `model_catalog` | Durable, versioned catalog of models (id → name/endpoint/type/credentials), CAS-committed |
 | `plugin` | Plugin registry/runtime: system-prompt sections, tools, callbacks, activation hooks, JSON state per plugin |
+| `plugin/cloud_storage/*` | Agent-group-scoped durable text-object CRUD, pagination, and direct transfer URLs |
 | `plugin/mcp/*` | Reusable MCP configuration/catalog, client, stdio and Streamable HTTP transports, per-agent connections, and harness plugin adapter |
 | `agent` | Single agent: round loop (LLM call → tool execution → commit), streaming accumulator, plugin host actor, durable state (de)serialization |
 | `agent_profile` | Node-local ETS registry of installed profiles (id → plugin registry, transport, observer, limits) |
@@ -154,7 +155,21 @@ not produce event N+1 until `consume` of event N has returned (backpressure cont
 - Tool invocation resolves the tool by global name, runs the owning plugin's hook, and
   returns `ToolOutput(content, is_error)`.
 
-### 4.1 MCP plugin
+### 4.1 Cloud storage plugin
+
+- `cloud_storage.new(storage, group_id)` gives an agent read, write, list, delete,
+  and direct upload/download URL tools over a namespace isolated to that agent group.
+  Logical keys are safe relative paths; group IDs are hashed before becoming backend
+  prefixes, preventing traversal or access to another group's objects.
+- Objects handled directly by the tools are UTF-8 text. Listing is lexicographic and
+  keyset-paginated with opaque cursors. Transfer URLs are backend-provided and expire
+  after five minutes where supported.
+- `harness3-server` installs a separately constructed cloud-storage plugin in every
+  agent profile, using the session ID as the common group scope. Coding, non-MCP
+  research, and MCP specialist agents therefore share durable objects within a session
+  while sessions remain isolated.
+
+### 4.2 MCP plugin
 
 - MCP configuration is application-owned and durable through a CAS catalog analogous
   to the model catalog. Configurations contain one or more servers; plugin state and
@@ -181,12 +196,14 @@ not produce event N+1 until `consume` of event N has returned (backpressure cont
   Its web API and UI can add or remove servers with CAS-backed durable updates; those
   updates invalidate live connections and discovery state for the affected
   configuration. Management responses omit binding values. A configured team
-  assigns the researcher `mcp.list`, `mcp.call`, and `MessageAgent`, but no filesystem
-  or shell capability. Coding agents receive Read/Write/Exec plus `MessageAgent`, but no
-  MCP tools. The lead may message all subagents; every subagent's `MessageAgent`
+  assigns the researcher `mcp.list`, `mcp.call`, `MessageAgent`, and group cloud-storage
+  tools, but no filesystem or shell capability. Coding agents receive Read/Write/Exec,
+  `MessageAgent`, and group cloud-storage tools, but no MCP tools. The lead may message
+  all subagents; every subagent's `MessageAgent`
   allow-list contains only the lead, preventing direct peer-to-peer subagent
   communication. Without an MCP configuration, the researcher remains a separate
-  message-only profile and is not granted local filesystem or shell tools.
+  message-and-cloud-storage-only profile and is not granted local filesystem or shell
+  tools.
 
 ## 5. Model catalog
 

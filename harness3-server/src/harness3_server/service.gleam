@@ -16,6 +16,7 @@ import harness3/agent_group_registry
 import harness3/agent_profile
 import harness3/model_catalog
 import harness3/plugin
+import harness3/plugin/cloud_storage
 import harness3/plugin/mcp
 import harness3/plugin/mcp/catalog as mcp_catalog
 import harness3/plugin/mcp/configuration as mcp_configuration
@@ -649,17 +650,22 @@ fn group_config(
           message_targets,
           capability_instructions(spec.kind),
         )
+      let group_storage = cloud_storage.new(service.storage, metadata.id)
       use plugins <- result.try(case spec.kind {
         CodingAgent ->
-          Ok([collaboration, coding_plugin.workspace(metadata.workspace)])
-        ResearchAgent -> Ok([collaboration])
+          Ok([
+            collaboration,
+            group_storage,
+            coding_plugin.workspace(metadata.workspace),
+          ])
+        ResearchAgent -> Ok([collaboration, group_storage])
         McpSpecialist(configuration_id) -> {
           use configuration <- result.try(mcp.configuration(
             service.mcp_runtime,
             configuration_id,
           ))
           let specialist = mcp.plugin(service.mcp_runtime, configuration)
-          Ok([collaboration, specialist])
+          Ok([collaboration, group_storage, specialist])
         }
       })
       use registry <- result.try(
@@ -690,13 +696,13 @@ fn group_config(
 fn capability_instructions(kind: AgentKind) -> String {
   case kind {
     CodingAgent ->
-      "You can inspect and modify the shared workspace and run commands with the installed coding tools."
+      "You can inspect and modify the shared workspace, run commands with the installed coding tools, and read, write, list, delete, or create transfer URLs for durable cloud-storage objects shared by this agent group."
     ResearchAgent ->
-      "You have no filesystem, workspace, shell, or MCP tools. Your only tool is MessageAgent, and you can use it only to report to the lead."
+      "You have no filesystem, workspace, shell, or MCP tools. You can use MessageAgent only to report to the lead, and you can read, write, list, delete, or create transfer URLs for durable cloud-storage objects shared by this agent group."
     McpSpecialist(configuration_id) ->
       "You are the MCP specialist for global configuration `"
       <> configuration_id
-      <> "`. You have only MessageAgent (to report to the lead), mcp.list (to inspect tools from currently reachable external servers), and mcp.call (to invoke a listed tool). You have no direct filesystem or shell access."
+      <> "`. You have MessageAgent (to report to the lead), mcp.list (to inspect tools from currently reachable external servers), mcp.call (to invoke a listed tool), and read/write/list/delete/transfer-URL access to durable cloud-storage objects shared by this agent group. You have no direct filesystem or shell access."
   }
 }
 
@@ -728,28 +734,28 @@ fn team(size: Int, mcp_configuration_id: Option(String)) -> List(AgentSpec) {
       McpSpecialist(id),
       "MCP research specialist for global configuration `"
         <> id
-        <> "`. Has MessageAgent access only to the lead plus mcp.list and mcp.call access to tools discovered from currently reachable external servers; has no filesystem or shell access.",
+        <> "`. Has MessageAgent access only to the lead, mcp.list and mcp.call access to tools discovered from currently reachable external servers, and shared durable cloud-storage access; has no filesystem or shell access.",
     )
     None -> #(
       ResearchAgent,
-      "Researcher without an MCP configuration. Has no filesystem, workspace, shell, or external MCP access; can only message the lead agent.",
+      "Researcher without an MCP configuration. Has shared durable cloud-storage access and can message only the lead agent; has no filesystem, workspace, shell, or external MCP access.",
     )
   }
   [
     AgentSpec(
       "lead",
-      "Lead engineer. Has Read, Write, and Exec access to the selected workspace and can message every subagent; owns implementation, delegation, and verification.",
+      "Lead engineer. Has Read, Write, and Exec access to the selected workspace, shared durable cloud-storage access, and messaging access to every subagent; owns implementation, delegation, and verification.",
       CodingAgent,
     ),
     AgentSpec("researcher", researcher_role, researcher_kind),
     AgentSpec(
       "implementer",
-      "Implementation specialist. Has Read, Write, and Exec access to the selected workspace and can message only the lead agent.",
+      "Implementation specialist. Has Read, Write, and Exec access to the selected workspace and shared durable cloud-storage access; can message only the lead agent.",
       CodingAgent,
     ),
     AgentSpec(
       "reviewer",
-      "Reviewer and test engineer. Has Read, Write, and Exec access to the selected workspace and can message only the lead agent.",
+      "Reviewer and test engineer. Has Read, Write, and Exec access to the selected workspace and shared durable cloud-storage access; can message only the lead agent.",
       CodingAgent,
     ),
   ]

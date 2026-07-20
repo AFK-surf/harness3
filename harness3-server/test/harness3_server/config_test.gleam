@@ -91,6 +91,21 @@ fn tool_names(profile: agent_profile.AgentProfile) -> List(String) {
   })
 }
 
+fn assert_cloud_storage_tools(names: List(String)) -> Nil {
+  list.each(
+    [
+      "cloud_storage_read",
+      "cloud_storage_write",
+      "cloud_storage_list",
+      "cloud_storage_delete",
+      "cloud_storage_get_url",
+    ],
+    fn(name) {
+      assert list.contains(names, name)
+    },
+  )
+}
+
 pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let root = temporary_root("harness3-server-config-test")
   let models_path = root <> "/models.json"
@@ -150,16 +165,21 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     service.AgentSpec(kind: service.CodingAgent, ..),
   ] = metadata.agents
 
-  let assert Ok([lead_profile, researcher_profile]) =
+  let assert Ok([lead_profile, researcher_profile, implementer_profile]) =
     agent_profile.profiles([
       metadata.id <> ":lead",
       metadata.id <> ":researcher",
+      metadata.id <> ":implementer",
     ])
   let lead_tools = tool_names(lead_profile)
   let researcher_tools = tool_names(researcher_profile)
+  let implementer_tools = tool_names(implementer_profile)
   let exposed = mcp_configuration.exposed_tool_name("evidence", "lookup")
   assert list.contains(lead_tools, "Read")
   assert list.contains(lead_tools, "MessageAgent")
+  assert_cloud_storage_tools(lead_tools)
+  assert_cloud_storage_tools(researcher_tools)
+  assert_cloud_storage_tools(implementer_tools)
   assert !list.contains(lead_tools, exposed)
   assert list.contains(researcher_tools, "MessageAgent")
   assert list.contains(researcher_tools, "mcp.list")
@@ -168,6 +188,36 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   assert !list.contains(researcher_tools, "Read")
   let assert Ok(researcher_runtime) =
     plugin.activate(researcher_profile.registry, plugin.empty_states())
+  let assert Ok(lead_runtime) =
+    plugin.activate(lead_profile.registry, plugin.empty_states())
+  let assert Ok(#(_, plugin.ToolOutput(is_error: False, ..))) =
+    plugin.invoke_tool(
+      lead_runtime,
+      "cloud_storage_write",
+      plugin.ToolInvocation(
+        "write-shared-object",
+        json.object([
+          #("key", json.string("handoff/shared.txt")),
+          #("content", json.string("shared between profiles")),
+        ])
+          |> json.to_string,
+      ),
+    )
+  let assert Ok(#(
+    _,
+    plugin.ToolOutput(
+      content: [llm.Text("shared between profiles")],
+      is_error: False,
+    ),
+  )) =
+    plugin.invoke_tool(
+      researcher_runtime,
+      "cloud_storage_read",
+      plugin.ToolInvocation(
+        "read-shared-object",
+        "{\"key\":\"handoff/shared.txt\"}",
+      ),
+    )
   let assert Ok(#(
     _,
     plugin.ToolOutput(content: [llm.Text(listing)], is_error: False),
@@ -223,7 +273,16 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     agent_profile.profiles([
       without_mcp_metadata.id <> ":researcher",
     ])
-  assert tool_names(researcher_without_mcp) == ["MessageAgent"]
+  let researcher_without_mcp_tools = tool_names(researcher_without_mcp)
+  assert researcher_without_mcp_tools
+    == [
+      "MessageAgent",
+      "cloud_storage_read",
+      "cloud_storage_write",
+      "cloud_storage_list",
+      "cloud_storage_delete",
+      "cloud_storage_get_url",
+    ]
   let assert Ok(Nil) =
     service.stop_session(without_mcp, without_mcp_metadata.id)
   let managed_server =
@@ -308,6 +367,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   assert list.contains(offline_tools, "MessageAgent")
   assert list.contains(offline_tools, "mcp.list")
   assert list.contains(offline_tools, "mcp.call")
+  assert_cloud_storage_tools(offline_tools)
   assert !list.contains(offline_tools, "Read")
   let assert Ok(#(
     _,

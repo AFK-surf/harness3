@@ -87,9 +87,13 @@ and agent availability do not depend on external services. The model receives
 only `mcp.list`, which reports reachable tools and failures, and `mcp.call`,
 which invokes an identifier returned by `mcp.list`. The researcher keeps durable
 teammate messaging but has no workspace, file-write, or shell tools.
-Without MCP, the researcher remains least-privilege and receives only
-`MessageAgent`; it never falls back to local filesystem or shell tools. The
-lead, implementer, and reviewer retain the coding tools and do not receive MCP
+Without MCP, the researcher remains least-privilege and receives
+`MessageAgent` plus the group cloud-storage tools; it never falls back to local
+filesystem or shell tools. Every agent receives `cloud_storage_read`,
+`cloud_storage_write`, `cloud_storage_list`, `cloud_storage_delete`, and
+`cloud_storage_get_url`. These tools share durable objects within one session
+while keeping different sessions isolated. The lead, implementer, and reviewer
+retain the coding tools and do not receive MCP
 access. Session metadata and plugin state store the configuration ID, while the
 global catalog owns the actual server settings. The lead can message every
 subagent; subagents can message only the lead, so there is no direct
