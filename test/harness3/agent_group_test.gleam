@@ -2429,6 +2429,9 @@ pub fn resume_registered_deduplicates_and_loads_dormant_profiles_test() {
       config,
       agent_group.new("shared", "catalog", [waiting_a, waiting_b]),
     )
+  // Registering node capabilities is the application's job; create no longer
+  // writes to the registry.
+  agent_profile.install([shared])
 
   let assert Ok(loaded) =
     agent_group.resume_registered(backend, "groups/shared", 10)
@@ -2484,6 +2487,7 @@ pub fn resume_registered_tolerates_missing_terminal_profiles_test() {
       config,
       agent_group.new("missing-profile", "catalog", [revivable, orphaned]),
     )
+  agent_profile.install([installed])
 
   // A terminal agent whose profile is not installed must not block resuming.
   let assert Ok(loaded) =
@@ -3057,13 +3061,12 @@ fn handle_commit_failures(
     RecordPut(storage.IfUnchanged(_), reply) -> {
       let should_fail = seen > 0
       process.send(reply, should_fail)
-      actor.continue(#(
-        seen + 1,
-        case should_fail {
+      actor.continue(
+        #(seen + 1, case should_fail {
           True -> failures + 1
           False -> failures
-        },
-      ))
+        }),
+      )
     }
     RecordPut(_, reply) -> {
       process.send(reply, False)

@@ -23,6 +23,7 @@ import harness3/plugin/cloud_storage/scope
 import harness3/plugin/mcp
 import harness3/plugin/mcp/catalog as mcp_catalog
 import harness3/plugin/mcp/configuration as mcp_configuration
+import harness3/plugin/mcp/connections as mcp_connections
 import harness3/storage.{type Storage}
 import harness3_server/cloud_storage_workspaces as storage_workspaces
 import harness3_server/coding_plugin
@@ -191,15 +192,13 @@ pub fn workspace_root(service: Service) -> String {
   service.workspace_root
 }
 
+/// Lists MCP configurations from the durable catalog, the same source agents
+/// load from, so the management view is identical on every node.
 pub fn mcp_configurations(
   service: Service,
-) -> List(mcp_configuration.Configuration) {
-  service.mcp_runtime
-  |> mcp.catalog
-  |> mcp_catalog.configurations
-  |> list.filter(fn(configuration) {
-    configuration.id != all_mcp_configuration_id
-  })
+) -> Result(List(mcp_configuration.Configuration), String) {
+  read_mcp_catalog(service.storage)
+  |> result.map(mcp_catalog.configurations)
 }
 
 pub fn stop(service: Service) -> Nil {
@@ -555,15 +554,6 @@ pub fn request_compaction(
   use session <- result.try(load_group_view(service, id))
   let Session(metadata:, ..) = session
   use _ <- result.try(validate_agent(metadata, agent_id))
-  // Install this session's profiles before the wake RPC may choose this node.
-  // Resuming is read-only and leaves the group dormant.
-  use group_config <- result.try(group_config(service, metadata))
-  use _ <- result.try(
-    agent_group.resume(group_config)
-    |> result.map_error(fn(error) {
-      "could not prepare session for compaction: " <> string.inspect(error)
-    }),
-  )
   use _ <- result.try(
     cluster_call(
       service,
@@ -614,7 +604,7 @@ fn deliver_registered(
 
 pub fn stop_session(service: Service, id: String) -> Result(Nil, String) {
   use session <- result.try(load_group_view(service, id))
-  let Session(metadata:, group:) = session
+  let Session(group:, ..) = session
   use _ <- result.try(case group.execution {
     agent_group.Claimed(..) ->
       cluster_call(
@@ -627,7 +617,6 @@ pub fn stop_session(service: Service, id: String) -> Result(Nil, String) {
       |> result.map_error(fn(error) { "could not stop session: " <> error })
     agent_group.Idle(_) | agent_group.Completed(_) -> Ok(Nil)
   })
-  let _ = metadata
   Ok(Nil)
 }
 
@@ -711,14 +700,7 @@ fn start_mcp(backend: Storage) -> Result(mcp.Runtime, String) {
       mcp.stop(runtime)
       Error(error)
     }
-    Ok(Nil) ->
-      case refresh_all_mcp_configuration(runtime) {
-        Ok(Nil) -> Ok(runtime)
-        Error(error) -> {
-          mcp.stop(runtime)
-          Error(error)
-        }
-      }
+    Ok(Nil) -> Ok(runtime)
   }
 }
 
@@ -773,9 +755,6 @@ pub fn add_mcp_server(
     },
     3,
   ))
-  use _ <- result.try(mcp.put_configuration(service.mcp_runtime, configuration))
-  use _ <- result.try(refresh_all_mcp_configuration(service.mcp_runtime))
-  refresh_mcp_profile(service)
   Ok(configuration)
 }
 
@@ -824,9 +803,6 @@ pub fn update_mcp_server(
     },
     3,
   ))
-  use _ <- result.try(mcp.put_configuration(service.mcp_runtime, configuration))
-  use _ <- result.try(refresh_all_mcp_configuration(service.mcp_runtime))
-  refresh_mcp_profile(service)
   Ok(configuration)
 }
 
@@ -867,15 +843,28 @@ pub fn remove_mcp_server(
     },
     3,
   ))
-  use _ <- result.try(mcp.put_configuration(service.mcp_runtime, configuration))
-  use _ <- result.try(refresh_all_mcp_configuration(service.mcp_runtime))
-  refresh_mcp_profile(service)
   Ok(configuration)
 }
 
-fn refresh_all_mcp_configuration(runtime: mcp.Runtime) -> Result(Nil, String) {
-  runtime
-  |> mcp.catalog
+/// The durable MCP catalog, absent-tolerant: the catalog object is created
+/// lazily on the first mutation, so a missing object is an empty catalog.
+fn read_mcp_catalog(backend: Storage) -> Result(mcp_catalog.Catalog, String) {
+  case mcp_catalog.resume(backend, mcp_catalog_key) {
+    Ok(session) -> Ok(mcp_catalog.catalog(session))
+    Error(mcp_catalog.StorageFailed(storage.NotFound(_))) ->
+      Ok(mcp_catalog.new())
+    Error(error) ->
+      Error("could not load MCP catalog: " <> string.inspect(error))
+  }
+}
+
+/// Folds every server from every enabled configuration into the single
+/// aggregate configuration agents use, namespacing server IDs with an
+/// injective source-configuration prefix.
+fn aggregate_configuration(
+  catalog: mcp_catalog.Catalog,
+) -> mcp_configuration.Configuration {
+  catalog
   |> mcp_catalog.configurations
   |> list.filter(fn(configuration) {
     configuration.id != all_mcp_configuration_id && configuration.enabled
@@ -896,7 +885,21 @@ fn refresh_all_mcp_configuration(runtime: mcp.Runtime) -> Result(Nil, String) {
       servers:,
     )
   }
-  |> fn(configuration) { mcp.put_configuration(runtime, configuration) }
+}
+
+/// The MCP specialist plugin's configuration loader: reads the durable
+/// catalog from storage on every activation and discovery, so catalog edits
+/// reach agents on every node with no profile or runtime synchronization. A
+/// storage failure is never an authoritative revocation, so live transports
+/// are left alone.
+fn mcp_configuration_loader(
+  backend: Storage,
+) -> fn() -> Result(mcp_configuration.Configuration, mcp_connections.LoadError) {
+  fn() {
+    read_mcp_catalog(backend)
+    |> result.map(aggregate_configuration)
+    |> result.map_error(mcp_connections.Unavailable)
+  }
 }
 
 fn aggregate_server_id(configuration_id: String, server_id: String) -> String {
@@ -1244,7 +1247,7 @@ fn validate_update(
     use _ <- result.try(case normalized.kind {
       CodingAgent | ResearchAgent -> Ok(Nil)
       McpSpecialist ->
-        mcp.configuration(service.mcp_runtime, all_mcp_configuration_id)
+        read_mcp_catalog(service.storage)
         |> result.map(fn(_) { Nil })
     })
     Ok([normalized, ..validated])
@@ -1253,8 +1256,8 @@ fn validate_update(
 }
 
 fn has_mcp_servers(service: Service) -> Bool {
-  case mcp.configuration(service.mcp_runtime, all_mcp_configuration_id) {
-    Ok(configuration) -> !list.is_empty(configuration.servers)
+  case read_mcp_catalog(service.storage) {
+    Ok(catalog) -> !list.is_empty(aggregate_configuration(catalog).servers)
     Error(_) -> False
   }
 }
@@ -1410,11 +1413,7 @@ fn kind_profiles(
   let collaboration = coding_plugin.collaboration()
   let group_storage =
     cloud_storage.new_resolved(backend, session_scope_resolver(backend))
-  use mcp_config <- result.try(mcp.configuration(
-    mcp_runtime,
-    all_mcp_configuration_id,
-  ))
-  let specialist = mcp.plugin(mcp_runtime, mcp_config)
+  let specialist = mcp.plugin(mcp_runtime, mcp_configuration_loader(backend))
   list.try_map(
     [
       #(coding_profile_id, [
@@ -1480,18 +1479,6 @@ fn install_agent_profiles(
   ))
   agent_profile.install(profiles)
   Ok(Nil)
-}
-
-/// The MCP specialist profile embeds a configuration snapshot; re-install the
-/// kind profiles after any MCP catalog change so newly activated agents see
-/// the updated server set.
-fn refresh_mcp_profile(service: Service) -> Nil {
-  case
-    kind_profiles(service.storage, service.mcp_runtime, service.model_transport)
-  {
-    Ok(profiles) -> agent_profile.install(profiles)
-    Error(_) -> Nil
-  }
 }
 
 fn group_attributes(metadata: SessionMetadata) -> dict.Dict(String, String) {

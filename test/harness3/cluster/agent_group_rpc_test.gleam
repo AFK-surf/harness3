@@ -70,6 +70,8 @@ pub fn wake_rpc_is_idempotent_and_precedes_routed_compaction_test() {
   let config = agent_group.Config(backend, "groups/rpc", [profile], 10, 100)
   let assert Ok(_) =
     agent_group.create(config, agent_group.new("rpc-group", "catalog", [state]))
+  // The RPC resume path reads the node's registry; create no longer installs.
+  agent_profile.install([profile])
 
   let assert Ok(host) =
     core.config(backend, "127.0.0.1", 0)
@@ -272,6 +274,7 @@ pub fn stop_rpc_finalizes_a_crashed_owner_group_test() {
       config,
       agent_group.new("crashed-group", "catalog", [state]),
     )
+  agent_profile.install([profile])
   let assert Ok(loaded) = agent_group.resume(config)
   let assert Ok(running) =
     agent_group.wake_detached(loaded, "dead-owner", fn() { Nil })
@@ -384,6 +387,7 @@ pub fn inject_rpc_forwards_to_awake_host_and_queues_tool_call_test() {
       config,
       agent_group.new("rpc-inject-group", "catalog", [state]),
     )
+  agent_profile.install([profile])
 
   let assert Ok(host) =
     core.config(backend, "127.0.0.1", 0)

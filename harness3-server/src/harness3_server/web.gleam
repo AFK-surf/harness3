@@ -67,18 +67,19 @@ fn handle(
         ]),
       )
     http.Get, ["api", "mcp", "configurations"] ->
-      json_response(
-        200,
-        json.object([
-          #(
-            "configurations",
-            json.array(
-              service.mcp_configurations(service),
-              mcp_configuration_json,
-            ),
-          ),
-        ]),
-      )
+      case service.mcp_configurations(service) {
+        Error(error) -> error_response(500, error)
+        Ok(configurations) ->
+          json_response(
+            200,
+            json.object([
+              #(
+                "configurations",
+                json.array(configurations, mcp_configuration_json),
+              ),
+            ]),
+          )
+      }
     http.Post, ["api", "mcp", "servers"] ->
       add_mcp_server(service, request.body)
     http.Put,

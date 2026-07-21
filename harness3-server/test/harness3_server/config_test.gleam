@@ -214,7 +214,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let assert Ok(second) = service.start()
   assert list.length(service.models(first)) == 3
   assert service.workspace_root(second) == workspace
-  let assert [mcp_configuration] = service.mcp_configurations(second)
+  let assert Ok([mcp_configuration]) = service.mcp_configurations(second)
   assert mcp_configuration.id == "research"
   let assert [mcp_server] = mcp_configuration.servers
   assert mcp_server.id == "evidence"
@@ -424,9 +424,12 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   service.stop(second)
 
   let assert Ok(after_seed_restart) = service.start()
-  let assert Ok(after_seed_configuration) =
+  let assert Ok(after_seed_configurations) =
     service.mcp_configurations(after_seed_restart)
-    |> list.find(fn(configuration) { configuration.id == "research" })
+  let assert Ok(after_seed_configuration) =
+    list.find(after_seed_configurations, fn(configuration) {
+      configuration.id == "research"
+    })
   assert list.contains(after_seed_configuration.servers, seeded_ui_server)
   let assert Ok(service.Session(
     metadata: persisted_edit,
@@ -484,7 +487,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
       managed_server,
     )
   assert added.servers == [managed_server]
-  let assert [live_added] = service.mcp_configurations(without_mcp)
+  let assert Ok([live_added]) = service.mcp_configurations(without_mcp)
   assert live_added.servers == [managed_server]
   let assert Error(duplicate_error) =
     service.add_mcp_server(
@@ -540,19 +543,19 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   service.stop(without_mcp)
 
   let assert Ok(after_add_restart) = service.start()
-  let assert [persisted_web_configuration] =
+  let assert Ok([persisted_web_configuration]) =
     service.mcp_configurations(after_add_restart)
   assert persisted_web_configuration.id == "web-managed"
   assert persisted_web_configuration.servers == [updated_server]
   let assert Ok(after_remove) =
     service.remove_mcp_server(after_add_restart, "web-managed", "web-added")
   assert after_remove.servers == []
-  let assert [live_removed] = service.mcp_configurations(after_add_restart)
+  let assert Ok([live_removed]) = service.mcp_configurations(after_add_restart)
   assert live_removed.servers == []
   service.stop(after_add_restart)
 
   let assert Ok(after_remove_restart) = service.start()
-  let assert [empty_web_configuration] =
+  let assert Ok([empty_web_configuration]) =
     service.mcp_configurations(after_remove_restart)
   assert empty_web_configuration.id == "web-managed"
   assert empty_web_configuration.servers == []

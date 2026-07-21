@@ -242,7 +242,6 @@ type Delivery {
 
 pub fn create(config: Config, group: AgentGroup) -> Result(LoadedGroup, Error) {
   use _ <- result.try(validate(config, group))
-  agent_profile.install(config.profiles)
   let body = encode_group(group) |> json.to_string |> bit_array.from_string
   use metadata <- result.try(
     case
@@ -259,6 +258,10 @@ pub fn create(config: Config, group: AgentGroup) -> Result(LoadedGroup, Error) {
   Ok(LoadedGroup(config, group, metadata.version))
 }
 
+/// Loads a group with an explicit profile list. Neither `create` nor `resume`
+/// writes to the node's profile registry: registering profiles as node
+/// capabilities (for `resume_registered` and the recovery RPC path) is the
+/// application's responsibility, via `agent_profile.install`.
 pub fn resume(config: Config) -> Result(LoadedGroup, Error) {
   use object <- result.try(
     storage.get(config.storage, config.object_key)
@@ -266,7 +269,6 @@ pub fn resume(config: Config) -> Result(LoadedGroup, Error) {
   )
   use group <- result.try(decode_group_body(object.body))
   use _ <- result.try(validate(config, group))
-  agent_profile.install(config.profiles)
   Ok(LoadedGroup(config, group, object.metadata.version))
 }
 

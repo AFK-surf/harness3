@@ -15,54 +15,46 @@ import harness3/plugin/mcp/runtime
 
 const plugin_name = "mcp"
 
-type State {
-  State(configuration_id: String)
-}
-
 type BrokerCall {
   BrokerCall(tool: String, arguments: json.Json)
 }
 
+/// Supplies the plugin's MCP configuration. Called at every activation (to
+/// validate that the configuration is loadable before the agent runs) and on
+/// every connection discovery, so configuration edits reach running agents
+/// without the plugin holding any snapshot. Typically reads a durable
+/// catalog. `Unavailable` means the catalog could not be reached and leaves
+/// live transports alone; `Revoked` is authoritative and tears them down.
+pub type ConfigurationLoader =
+  fn() -> Result(configuration.Configuration, connections.LoadError)
+
 pub fn new(
   mcp_runtime: runtime.Runtime,
-  configuration: configuration.Configuration,
+  load: ConfigurationLoader,
 ) -> plugin.Plugin {
-  plugin.new(plugin_name, encode_state(State(configuration.id)))
+  plugin.new(plugin_name, "{}")
   |> plugin.with_system_prompt(plugin.SystemPromptSection(
     "MCP specialist",
-    "You have brokered access to the external resources in global MCP configuration `"
-      <> configuration.id
-      <> "` ("
-      <> configuration.label
-      <> "). Use `mcp.list` to inspect the tools currently available from reachable MCP servers, then use `mcp.call` with one of the returned identifiers. Unreachable servers are excluded. You have no filesystem or shell access. External tools may read or change remote systems, so use them deliberately and report concrete sources and results to the lead agent.",
+    "You have brokered access to external MCP resources. Use `mcp.list` to inspect the tools currently available from reachable MCP servers, then use `mcp.call` with one of the returned identifiers. Unreachable servers are excluded. You have no filesystem or shell access. External tools may read or change remote systems, so use them deliberately and report concrete sources and results to the lead agent.",
   ))
   |> plugin.on_activate(
-    plugin.activation_hook(fn(state, context) {
-      use decoded <- result.try(
-        json.parse(state, state_decoder())
-        |> result.map_error(fn(error) {
-          plugin.InvalidState(plugin_name, string.inspect(error))
-        }),
-      )
-      use _ <- result.try(case decoded.configuration_id == configuration.id {
-        True -> Ok(Nil)
-        False ->
-          Error(plugin.InvalidState(
-            plugin_name,
-            "persisted configuration ID does not match the installed profile",
-          ))
-      })
+    plugin.activation_hook(fn(_state, context) {
       // Activation runs inside the group coordinator, which also services its
-      // own lease renewal, so it must never touch MCP servers. Only the
-      // configuration is validated here; connections are opened lazily by the
+      // own lease renewal, so it must never touch MCP servers. The
+      // configuration is loaded fresh here — validating that the catalog is
+      // reachable before the agent runs; connections are opened lazily by the
       // tools below, which run in this agent's own plugin host.
       use _ <- result.try(
-        runtime.configuration(mcp_runtime, configuration.id)
+        load()
         |> result.map_error(fn(error) {
-          plugin.HookFailed(plugin_name, "activation", error)
+          let reason = case error {
+            connections.Unavailable(reason) -> reason
+            connections.Revoked(reason) -> reason
+          }
+          plugin.HookFailed(plugin_name, "activation", reason)
         }),
       )
-      Ok(plugin.hook_result(encode_state(State(configuration.id)), context, Nil))
+      Ok(plugin.hook_result("{}", context, Nil))
     }),
   )
   |> plugin.on_release(
@@ -79,13 +71,13 @@ pub fn new(
       }
     }),
   )
-  |> plugin.with_tool(list_tool(mcp_runtime, configuration.id))
-  |> plugin.with_tool(call_tool(mcp_runtime, configuration.id))
+  |> plugin.with_tool(list_tool(mcp_runtime, load))
+  |> plugin.with_tool(call_tool(mcp_runtime, load))
 }
 
 fn list_tool(
   mcp_runtime: runtime.Runtime,
-  configuration_id: String,
+  load: ConfigurationLoader,
 ) -> plugin.Tool {
   plugin.tool(
     llm.Tool(
@@ -113,23 +105,18 @@ fn list_tool(
           // makes the transports the agent's own: they are linked to the host
           // and die with it.
           let #(context, output) =
-            with_connections(
-              mcp_runtime,
-              configuration_id,
-              context,
-              fn(connections) {
-                let #(connections, listing) = connections.list(connections)
-                let output = case listing {
-                  Ok(listing) ->
-                    plugin.ToolOutput(
-                      [llm.Text(listing |> encode_listing |> json.to_string)],
-                      False,
-                    )
-                  Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
-                }
-                #(connections, output)
-              },
-            )
+            with_connections(mcp_runtime, load, context, fn(connections) {
+              let #(connections, listing) = connections.list(connections)
+              let output = case listing {
+                Ok(listing) ->
+                  plugin.ToolOutput(
+                    [llm.Text(listing |> encode_listing |> json.to_string)],
+                    False,
+                  )
+                Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
+              }
+              #(connections, output)
+            })
           Ok(plugin.hook_result(state, context, output))
         }
       }
@@ -139,7 +126,7 @@ fn list_tool(
 
 fn call_tool(
   mcp_runtime: runtime.Runtime,
-  configuration_id: String,
+  load: ConfigurationLoader,
 ) -> plugin.Tool {
   plugin.tool(
     llm.Tool(
@@ -191,24 +178,19 @@ fn call_tool(
           ),
         )
         Ok(call) ->
-          with_connections(
-            mcp_runtime,
-            configuration_id,
-            context,
-            fn(connections) {
-              let #(connections, outcome) =
-                connections.call(
-                  connections,
-                  call.tool,
-                  json.to_string(call.arguments),
-                )
-              let output = case outcome {
-                Ok(result) -> call_output(result)
-                Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
-              }
-              #(connections, output)
-            },
-          )
+          with_connections(mcp_runtime, load, context, fn(connections) {
+            let #(connections, outcome) =
+              connections.call(
+                connections,
+                call.tool,
+                json.to_string(call.arguments),
+              )
+            let output = case outcome {
+              Ok(result) -> call_output(result)
+              Error(error) -> plugin.ToolOutput([llm.Text(error)], True)
+            }
+            #(connections, output)
+          })
       }
       Ok(plugin.hook_result(state, context, output))
     },
@@ -224,7 +206,7 @@ fn call_tool(
 /// die with it.
 fn with_connections(
   mcp_runtime: runtime.Runtime,
-  configuration_id: String,
+  load: ConfigurationLoader,
   context: plugin.Context,
   use_connections: fn(connections.Connections) ->
     #(connections.Connections, plugin.ToolOutput),
@@ -235,7 +217,7 @@ fn with_connections(
       #(plugin.set_resource(context, to_dynamic(connections)), output)
     }
     None ->
-      case runtime.connection_spec(mcp_runtime, configuration_id) {
+      case runtime.loader_spec(mcp_runtime, load) {
         Error(error) -> #(context, plugin.ToolOutput([llm.Text(error)], True))
         Ok(spec) -> {
           let #(connections, output) = use_connections(connections.new(spec))
@@ -309,23 +291,6 @@ fn call_output(result: protocol.CallResult) -> plugin.ToolOutput {
     content -> content
   }
   plugin.ToolOutput(content, result.is_error)
-}
-
-fn encode_state(state: State) -> String {
-  json.object([
-    #("schema_version", json.int(2)),
-    #("configuration_id", json.string(state.configuration_id)),
-  ])
-  |> json.to_string
-}
-
-fn state_decoder() -> decode.Decoder(State) {
-  use schema <- decode.field("schema_version", decode.int)
-  use configuration_id <- decode.field("configuration_id", decode.string)
-  case schema {
-    2 -> decode.success(State(configuration_id))
-    _ -> decode.failure(State(""), "unsupported MCP plugin state schema")
-  }
 }
 
 fn broker_call_decoder() -> decode.Decoder(BrokerCall) {

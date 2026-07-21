@@ -27,9 +27,9 @@ pub fn configuration(
 
 pub fn plugin(
   mcp_runtime: Runtime,
-  configuration: Configuration,
+  load: mcp_plugin.ConfigurationLoader,
 ) -> plugin.Plugin {
-  mcp_plugin.new(mcp_runtime, configuration)
+  mcp_plugin.new(mcp_runtime, load)
 }
 
 pub fn catalog(mcp_runtime: Runtime) -> catalog.Catalog {

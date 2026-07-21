@@ -249,8 +249,11 @@ event-consumer failures are permanent.
 ### 4.2 MCP plugin
 
 - MCP configuration is application-owned and durable through a CAS catalog analogous
-  to the model catalog. Configurations contain one or more servers; plugin state and
-  server session metadata reference a configuration by stable ID. Credentials may be
+  to the model catalog. Configurations contain one or more servers and are referenced
+  by stable ID. The broker plugin itself is stateless (its durable state is empty):
+  it is constructed with a configuration *loader*, called at every activation and on
+  every connection discovery, so configuration edits reach running agents without the
+  plugin holding a snapshot. Credentials may be
   literal or environment-variable bindings. Stdio executables and working directories
   must be absolute; HTTP endpoints must be absolute HTTP(S) URLs.
 - The runtime supports MCP 2025-11-25 over newline-delimited stdio and Streamable HTTP.
@@ -273,10 +276,13 @@ event-consumer failures are permanent.
   Its web API and UI can add, edit, or remove servers with CAS-backed durable
   updates. Management responses return complete transport settings and bindings,
   including literal HTTP header values; the UI masks literal values by default and
-  can reveal them in plaintext for editing. Harness3-server folds every server
-  from every enabled configuration into a stable runtime-only aggregate
-  configuration, namespacing server IDs with an injective source-configuration
-  prefix. The agent editor therefore exposes one MCP researcher resource profile,
+  can reveal them in plaintext for editing; the management listing reads the
+  durable catalog, the same source agents load from. Harness3-server folds
+  every server from every enabled configuration into a stable aggregate
+  configuration, computed on demand from the durable catalog and namespacing
+  server IDs with an injective source-configuration prefix — the aggregate is
+  never stored, in the catalog or in the runtime. The agent editor therefore
+  exposes one MCP researcher resource profile,
   not one profile per configuration. A configured team assigns that researcher
   `mcp.list`, `mcp.call`, `team.message_agent`, and the session's
   `cloud_storage.*` tools, but no filesystem or shell capability. Coding agents
@@ -293,9 +299,14 @@ event-consumer failures are permanent.
   on the node without a prior HTTP touch. Session-specific configuration
   (workspace root, role, kind, roster, cloud storage association) reaches the
   generic plugins through the durable group/agent attributes and the
-  activation host. Profiles are never uninstalled on session stop. The MCP
-  researcher profile embeds an MCP configuration snapshot and is re-installed
-  after every MCP catalog mutation.
+  activation host. Profiles are installed exactly once, at boot, and never
+  uninstalled or rewritten: the MCP researcher plugin holds no configuration
+  at all — a loader reads the durable MCP catalog from storage at every agent
+  activation (validating it is loadable before the agent runs) and on every
+  connection discovery, so catalog edits reach agents on every node with no
+  profile or runtime synchronization. A loader failure surfaces as
+  `Unavailable` and leaves live transports alone; only an authoritative
+  `Revoked` answer tears them down.
 
 ## 5. Model catalog
 
@@ -460,8 +471,10 @@ match a concurrent same-owner claim from the same wall-clock second.
 
 ### 7.2 Lifecycle
 
-- `create` — validate, install profiles, `IfAbsent` write. Creating is dormant: no
-  processes, no registry entry, no index entry.
+- `create` — validate, `IfAbsent` write. Creating is dormant: no processes, no
+  registry entry, no index entry. Neither `create` nor `resume` writes to the
+  node's profile registry — registering profiles as node capabilities is the
+  application's responsibility (`agent_profile.install`).
 - `resume` / `resume_registered` — load + validate; `resume_registered` reconstructs the
   profile list from the node's installed profiles (only for agents in Ready status).
 - **Updates (`GroupUpdate`)** — a durable update *command* for the roster

@@ -123,7 +123,11 @@ pub fn activation_never_touches_mcp_servers_test() {
     )
   let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
   let assert Ok(registry) =
-    harness_plugin.registry([mcp_plugin.new(mcp_runtime, current)])
+    harness_plugin.registry([
+      mcp_plugin.new(mcp_runtime, fn() {
+        runtime.load_configuration(mcp_runtime, "research")
+      }),
+    ])
   let assert Ok(_) =
     harness_plugin.activate(registry, harness_plugin.empty_states())
   runtime.stop(mcp_runtime)
@@ -146,7 +150,11 @@ pub fn each_agent_owns_its_own_connections_test() {
 
   // Two agents, each with its own activated plugin runtime.
   let assert Ok(registry) =
-    harness_plugin.registry([mcp_plugin.new(mcp_runtime, current)])
+    harness_plugin.registry([
+      mcp_plugin.new(mcp_runtime, fn() {
+        runtime.load_configuration(mcp_runtime, "research")
+      }),
+    ])
   let assert Ok(agent_a) =
     harness_plugin.activate(registry, harness_plugin.empty_states())
   let assert Ok(agent_b) =
@@ -216,7 +224,11 @@ pub fn edited_configuration_reaches_a_running_agent_test() {
     )
   let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
   let assert Ok(registry) =
-    harness_plugin.registry([mcp_plugin.new(mcp_runtime, current)])
+    harness_plugin.registry([
+      mcp_plugin.new(mcp_runtime, fn() {
+        runtime.load_configuration(mcp_runtime, "research")
+      }),
+    ])
   let assert Ok(agent) =
     harness_plugin.activate(registry, harness_plugin.empty_states())
 
@@ -280,7 +292,11 @@ pub fn releasing_the_plugin_closes_its_transports_test() {
     )
   let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
   let assert Ok(registry) =
-    harness_plugin.registry([mcp_plugin.new(mcp_runtime, current)])
+    harness_plugin.registry([
+      mcp_plugin.new(mcp_runtime, fn() {
+        runtime.load_configuration(mcp_runtime, "research")
+      }),
+    ])
   let assert Ok(agent) =
     harness_plugin.activate(registry, harness_plugin.empty_states())
   let assert Ok(#(agent, harness_plugin.ToolOutput(is_error: False, ..))) =
@@ -311,7 +327,11 @@ pub fn revoking_a_configuration_closes_its_transports_test() {
     )
   let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
   let assert Ok(registry) =
-    harness_plugin.registry([mcp_plugin.new(mcp_runtime, current)])
+    harness_plugin.registry([
+      mcp_plugin.new(mcp_runtime, fn() {
+        runtime.load_configuration(mcp_runtime, "research")
+      }),
+    ])
   let assert Ok(agent) =
     harness_plugin.activate(registry, harness_plugin.empty_states())
   let assert Ok(#(agent, harness_plugin.ToolOutput(is_error: False, ..))) =
@@ -428,7 +448,10 @@ pub fn runtime_discovers_and_broker_invokes_available_tools_test() {
   assert !string.contains(broker_name, "__")
   assert string.lowercase(broker_name) == broker_name
 
-  let value = mcp_plugin.new(mcp_runtime, current)
+  let value =
+    mcp_plugin.new(mcp_runtime, fn() {
+      runtime.load_configuration(mcp_runtime, "research")
+    })
   let assert Ok(registry) = harness_plugin.registry([value])
   let assert Ok(plugin_runtime) =
     harness_plugin.activate(registry, harness_plugin.empty_states())
@@ -539,7 +562,11 @@ pub fn discovery_excludes_failed_servers_without_failing_test() {
     )
   let assert Ok(current) = runtime.configuration(mcp_runtime, "mixed")
   let assert Ok(registry) =
-    harness_plugin.registry([mcp_plugin.new(mcp_runtime, current)])
+    harness_plugin.registry([
+      mcp_plugin.new(mcp_runtime, fn() {
+        runtime.load_configuration(mcp_runtime, "mixed")
+      }),
+    ])
   let assert Ok(plugin_runtime) =
     harness_plugin.activate(registry, harness_plugin.empty_states())
   let assert Ok(#(
@@ -604,7 +631,7 @@ pub fn composio_streamable_http_smoke_test() {
         catalog.put_configuration(catalog.new(), configuration)
       let assert Ok(mcp_runtime) = runtime.start(value, envoy.get, fn() { 0 })
       let assert Ok(spec) =
-        runtime.connection_spec(mcp_runtime, "composio-smoke")
+        runtime.loader_spec(mcp_runtime, fn() { Ok(configuration) })
       let #(connections, listed) = connections.list(connections.new(spec))
       let assert Ok(listing) = listed
       assert !list.is_empty(listing.tools)

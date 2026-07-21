@@ -44,10 +44,9 @@ type Message {
     configuration_id: String,
     reply: Subject(Result(configuration.Configuration, String)),
   )
-  GetConnectionSpec(
-    configuration_id: String,
-    reply: Subject(Result(connections.Spec, String)),
-    runtime: Subject(Message),
+  GetLoaderSpec(
+    load: fn() -> Result(configuration.Configuration, connections.LoadError),
+    reply: Subject(connections.Spec),
   )
   Stop
 }
@@ -113,20 +112,42 @@ pub fn configuration(
   |> result.flatten
 }
 
-/// Resolves everything an agent needs to open its own connections. The caller
-/// opens them itself, so the transports belong to the caller's process.
-pub fn connection_spec(
+/// Looks up a configuration with load-error semantics: a dead runtime is a
+/// retryable `Unavailable`, while "gone or disabled" is an authoritative
+/// `Revoked` — the only answer that may tear down an agent's live
+/// transports.
+pub fn load_configuration(
   runtime: Runtime,
   configuration_id: String,
+) -> Result(configuration.Configuration, connections.LoadError) {
+  let Runtime(subject) = runtime
+  case
+    exception.rescue(fn() {
+      process.call(subject, 5000, fn(reply) {
+        GetConfiguration(configuration_id, reply)
+      })
+    })
+  {
+    Error(_) -> Error(connections.Unavailable("MCP runtime is unavailable"))
+    Ok(Error(reason)) -> Error(connections.Revoked(reason))
+    Ok(Ok(configuration)) -> Ok(configuration)
+  }
+}
+
+/// Resolves everything an agent needs to open its own connections, with the
+/// configuration supplied by the caller's loader — re-read on every discovery
+/// so configuration edits reach agents that are already running. Transports,
+/// environment resolution, and the clock come from this runtime; the caller
+/// opens the connections itself, so they belong to the caller's process.
+pub fn loader_spec(
+  runtime: Runtime,
+  load: fn() -> Result(configuration.Configuration, connections.LoadError),
 ) -> Result(connections.Spec, String) {
   let Runtime(subject) = runtime
   exception.rescue(fn() {
-    process.call(subject, 5000, fn(reply) {
-      GetConnectionSpec(configuration_id, reply, subject)
-    })
+    process.call(subject, 5000, fn(reply) { GetLoaderSpec(load, reply) })
   })
   |> result.map_error(fn(_) { "MCP runtime is unavailable" })
-  |> result.flatten
 }
 
 pub fn stop(runtime: Runtime) -> Nil {
@@ -158,44 +179,19 @@ fn handle_message(
       process.send(reply, enabled_configuration(state, configuration_id))
       actor.continue(state)
     }
-    GetConnectionSpec(configuration_id, reply, runtime) -> {
+    GetLoaderSpec(load, reply) -> {
       process.send(
         reply,
-        enabled_configuration(state, configuration_id)
-          |> result.map(fn(_) {
-            connections.Spec(
-              // Re-read on every discovery so configuration edits reach
-              // agents that are already running.
-              fn() { configuration_of(runtime, configuration_id) },
-              state.connector,
-              state.resolve_environment,
-              state.now_seconds,
-            )
-          }),
+        connections.Spec(
+          load,
+          state.connector,
+          state.resolve_environment,
+          state.now_seconds,
+        ),
       )
       actor.continue(state)
     }
     Stop -> actor.stop()
-  }
-}
-
-/// Distinguishes an authoritative answer ("this configuration is gone or
-/// disabled") from a failure to reach the registry at all. Only the former may
-/// tear down an agent's live transports.
-fn configuration_of(
-  runtime: Subject(Message),
-  configuration_id: String,
-) -> Result(configuration.Configuration, connections.LoadError) {
-  case
-    exception.rescue(fn() {
-      process.call(runtime, 5000, fn(reply) {
-        GetConfiguration(configuration_id, reply)
-      })
-    })
-  {
-    Error(_) -> Error(connections.Unavailable("MCP runtime is unavailable"))
-    Ok(Error(reason)) -> Error(connections.Revoked(reason))
-    Ok(Ok(configuration)) -> Ok(configuration)
   }
 }
 
