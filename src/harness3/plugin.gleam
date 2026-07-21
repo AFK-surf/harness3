@@ -46,6 +46,25 @@ pub type HookResult(value) {
   HookResult(state: String, context: Context, value: value)
 }
 
+/// The durable identity of the agent a plugin runtime is activated for:
+/// which agent it is, the application-owned attributes persisted on it and on
+/// its group, and the other agents in the group (`peers` excludes the agent
+/// itself). Generic plugins read their per-session configuration from here
+/// instead of closing over it at construction time.
+pub type Host {
+  Host(
+    group_id: String,
+    agent_id: String,
+    agent_attributes: Dict(String, String),
+    group_attributes: Dict(String, String),
+    peers: List(#(String, Dict(String, String))),
+  )
+}
+
+pub fn empty_host() -> Host {
+  Host("", "", dict.new(), dict.new(), [])
+}
+
 pub opaque type Context {
   Context(
     registry: Registry,
@@ -53,7 +72,15 @@ pub opaque type Context {
     resources: Dict(String, Dynamic),
     current: String,
     agent_callback: Option(AgentCallback),
+    host: Host,
   )
+}
+
+/// The activating agent's durable identity, as passed to `activate_hosted`.
+/// `activate` provides an empty host.
+pub fn host(context: Context) -> Host {
+  let Context(host:, ..) = context
+  host
 }
 
 pub type AgentCallback =
@@ -111,12 +138,17 @@ pub fn release_hook(run: fn(String, Context) -> Nil) -> ReleaseHook {
   ReleaseHook(run)
 }
 
+type PromptSource {
+  StaticPrompt(section: SystemPromptSection)
+  DynamicPrompt(build: fn(String, Context) -> SystemPromptSection)
+}
+
 pub opaque type Plugin {
   Plugin(
     name: String,
     dependencies: List(String),
     initial_state: String,
-    system_prompt_sections: List(SystemPromptSection),
+    system_prompt_sections: List(PromptSource),
     tools: List(Tool),
     callback_hooks: List(CallbackHook),
     activation_hooks: List(ActivationHook),
@@ -138,7 +170,26 @@ pub fn with_system_prompt(
 ) -> Plugin {
   Plugin(
     ..plugin,
-    system_prompt_sections: list.append(plugin.system_prompt_sections, [section]),
+    system_prompt_sections: list.append(plugin.system_prompt_sections, [
+      StaticPrompt(section),
+    ]),
+  )
+}
+
+/// Registers a system-prompt section computed from the plugin's current state
+/// and context (including the `Host`) each time the prompt is built, so one
+/// plugin instance can serve agents with different durable configuration.
+/// The builder must be total: content unavailable at build time should
+/// surface in the section text (and as tool errors), not raise.
+pub fn with_dynamic_system_prompt(
+  plugin: Plugin,
+  build: fn(String, Context) -> SystemPromptSection,
+) -> Plugin {
+  Plugin(
+    ..plugin,
+    system_prompt_sections: list.append(plugin.system_prompt_sections, [
+      DynamicPrompt(build),
+    ]),
   )
 }
 
@@ -316,6 +367,16 @@ pub fn activate(
   registry: Registry,
   persisted_states: Dict(String, String),
 ) -> Result(Runtime, Error) {
+  activate_hosted(registry, persisted_states, empty_host())
+}
+
+/// Activates the registry for a specific agent, exposing its durable
+/// identity to hooks and dynamic prompt sections via `host(context)`.
+pub fn activate_hosted(
+  registry: Registry,
+  persisted_states: Dict(String, String),
+  agent_host: Host,
+) -> Result(Runtime, Error) {
   let Registry(ordered:, ..) = registry
   // Keep state belonging to unavailable plugins as opaque dormant data. This
   // lets a group pass through a node with an older plugin set without losing
@@ -329,7 +390,7 @@ pub fn activate(
       Ok(dict.insert(states, plugin.name, state))
     }),
   )
-  let context = Context(registry, states, dict.new(), "", None)
+  let context = Context(registry, states, dict.new(), "", None, agent_host)
   use context <- result.try(list.try_fold(ordered, context, activate_plugin))
   Ok(Runtime(context))
 }
@@ -460,8 +521,21 @@ pub fn tools(runtime: Runtime) -> List(llm.Tool) {
 }
 
 pub fn system_prompt_sections(runtime: Runtime) -> List(SystemPromptSection) {
-  let Runtime(context: Context(registry: Registry(ordered:, ..), ..)) = runtime
-  list.flat_map(ordered, fn(plugin) { plugin.system_prompt_sections })
+  let Runtime(context:) = runtime
+  let Context(registry: Registry(ordered:, ..), ..) = context
+  list.flat_map(ordered, fn(plugin) {
+    let plugin_context = Context(..context, current: plugin.name)
+    list.filter_map(plugin.system_prompt_sections, fn(source) {
+      case source {
+        StaticPrompt(section) -> Ok(section)
+        DynamicPrompt(build) ->
+          case current_state(plugin_context) {
+            Ok(state) -> Ok(build(state, plugin_context))
+            Error(_) -> Error(Nil)
+          }
+      }
+    })
+  })
 }
 
 pub fn system_prompt(runtime: Runtime) -> String {

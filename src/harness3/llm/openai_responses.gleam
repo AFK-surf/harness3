@@ -476,7 +476,10 @@ fn response_decoder() -> decode.Decoder(ResponseData) {
 
 /// Decodes a buffered (non-SSE) Responses API body, or the error envelope of
 /// a non-2xx response. Public for the Codex provider's error path.
-pub fn decode_response(status: Int, body: String) -> Result(List(Event), Error) {
+pub fn decode_response(
+  status: Int,
+  body: String,
+) -> Result(List(Event), Error) {
   case status >= 200 && status < 300 {
     False -> Error(decode_api_error(status, body))
     True -> {

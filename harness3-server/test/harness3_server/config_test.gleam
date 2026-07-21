@@ -91,6 +91,45 @@ fn unavailable_mcp_config_json() -> String {
   |> json.to_string
 }
 
+/// Looks up an agent's registered profile through its durable state, the
+/// way `resume_registered` does, and returns state, group, and profile.
+fn agent_profile_of(
+  running: service.Service,
+  session_id: String,
+  agent_id: String,
+) -> #(agent.State, agent_group.AgentGroup, agent_profile.AgentProfile) {
+  let assert Ok(service.Session(group:, ..)) =
+    service.get_session(running, session_id)
+  let assert Ok(state) =
+    list.find(group.agents, fn(state) { state.id == agent_id })
+  let assert Ok([profile]) = agent_profile.profiles([state.profile_id])
+  #(state, group, profile)
+}
+
+/// Activates a profile hosted on the agent's durable identity, as a real
+/// worker would.
+fn hosted_runtime(
+  group: agent_group.AgentGroup,
+  state: agent.State,
+  profile: agent_profile.AgentProfile,
+) -> plugin.Runtime {
+  let assert Ok(runtime) =
+    plugin.activate_hosted(
+      profile.registry,
+      plugin.empty_states(),
+      plugin.Host(
+        group_id: group.id,
+        agent_id: state.id,
+        agent_attributes: state.attributes,
+        group_attributes: group.attributes,
+        peers: group.agents
+          |> list.filter(fn(peer) { peer.id != state.id })
+          |> list.map(fn(peer) { #(peer.id, peer.attributes) }),
+      ),
+    )
+  runtime
+}
+
 fn tool_names(profile: agent_profile.AgentProfile) -> List(String) {
   let assert Ok(runtime) =
     plugin.activate(profile.registry, plugin.empty_states())
@@ -233,18 +272,22 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     service.update_session(
       second,
       metadata.id,
-      service.UpdateInput("Named while active", metadata.agents, service.KeepAssociation),
+      service.UpdateInput(
+        "Named while active",
+        metadata.agents,
+        service.KeepAssociation,
+      ),
     )
   assert renamed.title == "Named while active"
   let assert agent_group.Claimed(..) = renamed_group.execution
   assert list.contains(agent_group_registry.alive_ids(), metadata.id)
 
-  let assert Ok([lead_profile, researcher_profile, implementer_profile]) =
-    agent_profile.profiles([
-      metadata.id <> ":lead",
-      metadata.id <> ":researcher",
-      metadata.id <> ":implementer",
-    ])
+  let #(lead_agent, host_group, lead_profile) =
+    agent_profile_of(second, metadata.id, "lead")
+  let #(researcher_agent, _, researcher_profile) =
+    agent_profile_of(second, metadata.id, "researcher")
+  let #(_, _, implementer_profile) =
+    agent_profile_of(second, metadata.id, "implementer")
   let lead_tools = tool_names(lead_profile)
   let researcher_tools = tool_names(researcher_profile)
   let implementer_tools = tool_names(implementer_profile)
@@ -263,10 +306,9 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   assert list.contains(researcher_tools, "mcp.call")
   assert !list.contains(researcher_tools, broker_name)
   assert !list.contains(researcher_tools, "coding.read")
-  let assert Ok(researcher_runtime) =
-    plugin.activate(researcher_profile.registry, plugin.empty_states())
-  let assert Ok(lead_runtime) =
-    plugin.activate(lead_profile.registry, plugin.empty_states())
+  let researcher_runtime =
+    hosted_runtime(host_group, researcher_agent, researcher_profile)
+  let lead_runtime = hosted_runtime(host_group, lead_agent, lead_profile)
   let assert Ok(#(_, plugin.ToolOutput(is_error: False, ..))) =
     plugin.invoke_tool(
       lead_runtime,
@@ -342,7 +384,11 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     service.update_session(
       second,
       metadata.id,
-      service.UpdateInput("Edited coding team", desired_agents, service.KeepAssociation),
+      service.UpdateInput(
+        "Edited coding team",
+        desired_agents,
+        service.KeepAssociation,
+      ),
     )
   assert edited.title == "Edited coding team"
   let assert [edited_lead, _, edited_verifier] = edited.agents
@@ -356,7 +402,10 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   assert lead_state.model_id == "test/model-2"
   assert verifier_state.id == "verifier"
   assert verifier_state.status == agent.Waiting
-  let assert Ok([_]) = agent_profile.profiles([metadata.id <> ":verifier"])
+  list.each(edited_group.agents, fn(state) {
+    let assert Ok([_]) = agent_profile.profiles([state.profile_id])
+  })
+  assert verifier_state.profile_id == lead_state.profile_id
   let assert Error(_) = agent_profile.profiles([metadata.id <> ":implementer"])
 
   let assert Ok(Nil) = service.stop_session(second, metadata.id)
@@ -399,10 +448,8 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     )
   let assert [_, service.AgentSpec(kind: service.ResearchAgent, ..)] =
     without_mcp_metadata.agents
-  let assert Ok([researcher_without_mcp]) =
-    agent_profile.profiles([
-      without_mcp_metadata.id <> ":researcher",
-    ])
+  let #(_, _, researcher_without_mcp) =
+    agent_profile_of(without_mcp, without_mcp_metadata.id, "researcher")
   let researcher_without_mcp_tools = tool_names(researcher_without_mcp)
   assert researcher_without_mcp_tools
     == [
@@ -527,10 +574,10 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     )
   let assert [_, service.AgentSpec(kind: service.McpSpecialist, ..)] =
     offline_metadata.agents
-  let assert Ok([offline_profile]) =
-    agent_profile.profiles([offline_metadata.id <> ":researcher"])
-  let assert Ok(offline_runtime) =
-    plugin.activate(offline_profile.registry, plugin.empty_states())
+  let #(offline_agent, offline_group, offline_profile) =
+    agent_profile_of(with_offline_mcp, offline_metadata.id, "researcher")
+  let offline_runtime =
+    hosted_runtime(offline_group, offline_agent, offline_profile)
   let offline_tools =
     plugin.tools(offline_runtime)
     |> list.map(fn(tool) {

@@ -131,7 +131,24 @@ pub type Config {
     max_output_tokens: Option(Int),
     reasoning_effort: Option(String),
     context_window_tokens: Int,
+    group_context: GroupContext,
   )
+}
+
+/// Group-level durable identity exposed to plugins at activation, combined
+/// with the agent's own id and attributes into a `plugin.Host`. `peers` lists
+/// the other agents in the group as id/attributes pairs, excluding this
+/// agent. Embedders running a lone agent use `solo_group_context`.
+pub type GroupContext {
+  GroupContext(
+    group_id: String,
+    group_attributes: Dict(String, String),
+    peers: List(#(String, Dict(String, String))),
+  )
+}
+
+pub fn solo_group_context() -> GroupContext {
+  GroupContext("", dict.new(), [])
 }
 
 pub type Error {
@@ -206,8 +223,19 @@ type PluginMessage {
 }
 
 pub fn activate(state: State, config: Config) -> Result(Active, Error) {
+  let GroupContext(group_id:, group_attributes:, peers:) = config.group_context
   use runtime <- result.try(
-    plugin.activate(config.registry, state.plugin_states)
+    plugin.activate_hosted(
+      config.registry,
+      state.plugin_states,
+      plugin.Host(
+        group_id:,
+        agent_id: state.id,
+        agent_attributes: state.attributes,
+        group_attributes:,
+        peers:,
+      ),
+    )
     |> result.map_error(PluginError),
   )
   use host <- result.try(start_plugin_host(runtime, state.plugin_generation))

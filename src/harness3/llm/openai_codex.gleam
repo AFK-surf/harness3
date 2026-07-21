@@ -103,9 +103,10 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
         }),
       )
     })
-  use message_items <- result.try(
-    list.try_map(input_messages, openai_responses.encode_message_items),
-  )
+  use message_items <- result.try(list.try_map(
+    input_messages,
+    openai_responses.encode_message_items,
+  ))
   use tools <- result.try(
     list.try_map(tools, fn(tool) {
       let llm.Tool(name:, description:, input_schema:) = tool
@@ -190,7 +191,9 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
 /// Moves the system prompt out of the message list: the Codex backend wants
 /// it in the top-level `instructions` field and rejects system-role input
 /// items. Multiple system messages join with a blank line.
-fn split_instructions(messages: List(llm.Message)) -> #(String, List(llm.Message)) {
+fn split_instructions(
+  messages: List(llm.Message),
+) -> #(String, List(llm.Message)) {
   let #(system_texts, rest) =
     list.partition(messages, fn(message) {
       let llm.Message(role:, ..) = message

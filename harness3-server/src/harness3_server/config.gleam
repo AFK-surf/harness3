@@ -212,10 +212,7 @@ fn read_store_models(
     |> result.map_error(fn(_) { "no openai-codex entry in models store" }),
   )
   decode.run(entry, {
-    use models <- decode.field(
-      "models",
-      decode.list(of: store_model_decoder()),
-    )
+    use models <- decode.field("models", decode.list(of: store_model_decoder()))
     decode.success(models)
   })
   |> result.map_error(fn(error) { string.inspect(error) })

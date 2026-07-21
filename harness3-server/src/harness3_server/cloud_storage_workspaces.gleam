@@ -118,7 +118,10 @@ pub fn put_workspace(
   Ok(Catalog(..catalog, workspaces:))
 }
 
-pub fn remove_workspace(catalog: Catalog, id: String) -> Result(Catalog, Error) {
+pub fn remove_workspace(
+  catalog: Catalog,
+  id: String,
+) -> Result(Catalog, Error) {
   use _ <- result.try(lookup(catalog, id))
   Ok(
     Catalog(
@@ -199,7 +202,9 @@ pub fn validate_workspace(value: Workspace) -> Result(Workspace, Error) {
   use _ <- result.try(case reserved_overlap(prefix) {
     Ok(reserved) ->
       Error(InvalidWorkspace(
-        "workspace prefix overlaps harness-internal namespace `" <> reserved <> "`",
+        "workspace prefix overlaps harness-internal namespace `"
+        <> reserved
+        <> "`",
       ))
     Error(_) -> Ok(Nil)
   })
@@ -214,7 +219,10 @@ fn sanitize(value: String) -> String {
   value
   |> string.to_graphemes
   |> list.filter(fn(character) {
-    string.contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-", character)
+    string.contains(
+      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-",
+      character,
+    )
   })
   |> string.join("")
 }

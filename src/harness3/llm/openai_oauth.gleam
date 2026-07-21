@@ -81,7 +81,9 @@ pub fn describe_error(error: Error) -> String {
 pub fn load(path: String) -> Result(Credentials, Error) {
   use body <- result.try(
     simplifile.read(path)
-    |> result.map_error(fn(error) { ReadFailed(simplifile.describe_error(error)) }),
+    |> result.map_error(fn(error) {
+      ReadFailed(simplifile.describe_error(error))
+    }),
   )
   decode_credentials(body)
 }
@@ -137,9 +139,10 @@ fn jwt_account_id(access: String) -> Result(String, Nil) {
     bit_array.base64_url_decode(pad_base64(payload))
     |> result.map_error(fn(_) { Nil }),
   )
-  use body <- result.try(bit_array.to_string(decoded) |> result.map_error(fn(_) {
-    Nil
-  }))
+  use body <- result.try(
+    bit_array.to_string(decoded)
+    |> result.map_error(fn(_) { Nil }),
+  )
   json.parse(body, {
     use auth <- decode.field(jwt_claim_path, {
       use account_id <- decode.field("chatgpt_account_id", decode.string)
@@ -218,7 +221,8 @@ fn merge(
   refreshed: Refreshed,
   now_milliseconds: Int,
 ) -> Credentials {
-  let expires_in = option.unwrap(refreshed.expires_in, default_expires_in_seconds)
+  let expires_in =
+    option.unwrap(refreshed.expires_in, default_expires_in_seconds)
   Credentials(
     access: refreshed.access,
     refresh: option.unwrap(refreshed.refresh, credentials.refresh),
@@ -234,7 +238,9 @@ fn merge(
 pub fn persist(path: String, credentials: Credentials) -> Result(Nil, Error) {
   use body <- result.try(
     simplifile.read(path)
-    |> result.map_error(fn(error) { ReadFailed(simplifile.describe_error(error)) }),
+    |> result.map_error(fn(error) {
+      ReadFailed(simplifile.describe_error(error))
+    }),
   )
   use entries <- result.try(
     json.parse(body, decode.dict(decode.string, decode.dynamic))
@@ -251,11 +257,15 @@ pub fn persist(path: String, credentials: Credentials) -> Result(Nil, Error) {
     |> json.to_string
   use _ <- result.try(
     simplifile.write(path, encoded)
-    |> result.map_error(fn(error) { WriteFailed(simplifile.describe_error(error)) }),
+    |> result.map_error(fn(error) {
+      WriteFailed(simplifile.describe_error(error))
+    }),
   )
   // OAuth files hold bearer tokens; keep them owner-only like Pi does.
   simplifile.set_permissions_octal(path, 0o600)
-  |> result.map_error(fn(error) { WriteFailed(simplifile.describe_error(error)) })
+  |> result.map_error(fn(error) {
+    WriteFailed(simplifile.describe_error(error))
+  })
 }
 
 fn encode_credentials(credentials: Credentials) -> json.Json {

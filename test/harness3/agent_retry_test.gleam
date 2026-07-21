@@ -31,6 +31,7 @@ fn config(transport: agent.ModelTransport) -> agent.Config {
     max_output_tokens: None,
     reasoning_effort: None,
     context_window_tokens: model.context_window_tokens,
+    group_context: agent.solo_group_context(),
   )
 }
 

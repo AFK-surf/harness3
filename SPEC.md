@@ -177,6 +177,20 @@ event-consumer failures are permanent.
   dependency order. **Dormant-state preservation:** persisted state for plugins *not* in
   the registry is carried through untouched, so a group can pass through a node with a
   smaller plugin set without losing state.
+- `activate_hosted(registry, persisted_states, host)` additionally exposes the
+  activating agent's durable identity — `Host(group_id, agent_id,
+  agent_attributes, group_attributes, peers)`, where `peers` lists the group's
+  other agents as id/attributes pairs — to every hook, tool, and dynamic
+  prompt section via `host(context)`. `activate` provides an empty host. This
+  is the channel through which one generic plugin instance serves agents whose
+  per-session configuration lives in durable attributes. Agents activated
+  through `agent_group` are always hosted on their group's identity.
+- System-prompt sections are static (`with_system_prompt`) or dynamic
+  (`with_dynamic_system_prompt`): a dynamic section is computed from the
+  plugin's current state and context (including the host) every time the
+  prompt is built, and must be total — unavailable content belongs in the
+  section text, not in a raised error. A dynamic section whose plugin has no
+  valid state is omitted.
 - A plugin may also register a **release hook** (`on_release`), run by the agent's
   plugin host before it stops, to release ephemeral resources. Hooks are isolated
   from each other (a raising hook cannot skip the rest, nor make the host exit
@@ -204,6 +218,11 @@ event-consumer failures are permanent.
   relative paths resolved under it, so agents cannot traverse outside their
   prefix or into another namespace. Plugins built with the same prefix share
   objects; different prefixes stay isolated.
+- `cloud_storage.new_resolved(storage, resolve)` defers the scope to a
+  per-invocation resolver over the invoking agent's context (typically its
+  durable group attributes), so one plugin instance serves agents whose
+  workspaces differ or change. A resolution error fails that invocation with
+  an explanatory tool error while leaving the agent runnable.
 - Objects handled directly by the tools are UTF-8 text. Listing is lexicographic and
   keyset-paginated with opaque cursors. Transfer URLs are backend-provided and expire
   after five minutes where supported.
@@ -216,19 +235,16 @@ event-consumer failures are permanent.
   `harness3-server/`) are rejected. Each session records an optional
   workspace association in its group attributes (an empty-string upsert
   clears it); associated sessions resolve the workspace's current prefix
-  whenever their profiles are built, while unassociated sessions get an
-  isolated namespace at `plugins/cloud_storage/sessions/<session id>/objects/`.
+  per tool invocation through the resolver-based plugin, while unassociated
+  sessions get an isolated namespace at
+  `plugins/cloud_storage/sessions/<session id>/objects/`.
   A workspace cannot be deleted while a session
   references it (the reference check re-runs inside the removal's commit
-  retry loop), its stored objects are never deleted with it, and changing
-  a session's association stops and re-wakes the team like a roster change
-  because running agents hold their scope in an activated plugin. If a
+  retry loop), and its stored objects are never deleted with it. If a
   reference nonetheless dangles — an association landing in the same instant
-  as a removal's final write — wake and message paths fail with a repair
-  hint, and the edit path can still re-point or clear the dead association:
-  reconstructing a session's pre-edit profiles tolerates the missing
-  workspace (falling back to the isolated namespace) because the plugin is
-  stateless.
+  as a removal's final write — the session stays runnable and editable:
+  `cloud_storage.*` invocations fail with a repair hint until the edit path
+  re-points or clears the dead association.
 
 ### 4.2 MCP plugin
 
@@ -271,6 +287,15 @@ event-consumer failures are permanent.
   communication. Without an MCP configuration, the researcher remains a separate
   message-and-cloud-storage-only profile and is not granted local filesystem or shell
   tools.
+- harness3-server's three profiles (coding workspace, isolated researcher, MCP
+  researcher) are static node capabilities registered at boot, before the
+  cluster node advertises itself, so the recovery RPC path can place any group
+  on the node without a prior HTTP touch. Session-specific configuration
+  (workspace root, role, kind, roster, cloud storage association) reaches the
+  generic plugins through the durable group/agent attributes and the
+  activation host. Profiles are never uninstalled on session stop. The MCP
+  researcher profile embeds an MCP configuration snapshot and is re-installed
+  after every MCP catalog mutation.
 
 ## 5. Model catalog
 
@@ -306,7 +331,8 @@ include the synthesized system prompt.
 
 Each round (the loop is internal to the worker; there is no public single-round entry
 point):
-1. Builds the request: plugin system prompt (all sections joined as `## name\n\nbody`)
+1. Builds the request: plugin system prompt (all sections joined as `## name\n\nbody`,
+   dynamic sections evaluated against the plugin's current state and the agent's host)
    prepended as a System message when non-empty; tools = all plugin tools.
 2. Runs the transport; retryable LLM failures repeat the identical request forever with
    exponential backoff capped at 10 s. Each attempt gets a fresh per-round accumulator;

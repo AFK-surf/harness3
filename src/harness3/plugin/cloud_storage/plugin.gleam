@@ -45,21 +45,34 @@ type ListedObject {
   ListedObject(key: String, size: Int, modified_at_seconds: Int)
 }
 
+/// Resolves the storage scope for one tool invocation from the invoking
+/// agent's context (typically its durable group attributes). Returning an
+/// error fails that invocation with an explanatory tool error while leaving
+/// the agent runnable.
+pub type ScopeResolver =
+  fn(plugin.Context) -> Result(Scope, String)
+
 pub fn new(storage: Storage, scope: Scope) -> plugin.Plugin {
+  new_resolved(storage, fn(_) { Ok(scope) })
+}
+
+/// A cloud-storage plugin whose scope is resolved per invocation, so one
+/// plugin instance serves agents whose workspaces differ or change.
+pub fn new_resolved(storage: Storage, resolve: ScopeResolver) -> plugin.Plugin {
   plugin.new(plugin_name, "{}")
   |> plugin.with_system_prompt(plugin.SystemPromptSection(
     "Cloud storage",
     "You have durable UTF-8 text-object storage in a cloud storage workspace shared with every agent configured for the same workspace. Keys are safe relative paths. Use `cloud_storage.list` repeatedly with its opaque cursor until next_cursor is null. Writes replace existing content, deletes are idempotent, and `cloud_storage.get_url` provides direct upload or download access.",
   ))
-  |> plugin.with_tool(read_tool(storage, scope))
-  |> plugin.with_tool(write_tool(storage, scope))
-  |> plugin.with_tool(list_tool(storage, scope))
-  |> plugin.with_tool(delete_tool(storage, scope))
-  |> plugin.with_tool(url_tool(storage, scope))
+  |> plugin.with_tool(read_tool(storage, resolve))
+  |> plugin.with_tool(write_tool(storage, resolve))
+  |> plugin.with_tool(list_tool(storage, resolve))
+  |> plugin.with_tool(delete_tool(storage, resolve))
+  |> plugin.with_tool(url_tool(storage, resolve))
 }
 
-fn read_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
-  plugin.tool(
+fn read_tool(storage: Storage, resolve: ScopeResolver) -> plugin.Tool {
+  scoped_tool(
     llm.Tool(
       "cloud_storage.read",
       Some("Read a UTF-8 text object from the cloud storage workspace."),
@@ -68,9 +81,9 @@ fn read_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
         ["key"],
       ),
     ),
-    fn(state, context, invocation) {
-      let plugin.ToolInvocation(arguments:, ..) = invocation
-      let output = case json.parse(arguments, key_arguments_decoder()) {
+    resolve,
+    fn(storage_scope, arguments) {
+      case json.parse(arguments, key_arguments_decoder()) {
         Error(error) ->
           error_output(
             "Invalid cloud_storage.read arguments: " <> string.inspect(error),
@@ -92,13 +105,12 @@ fn read_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
               }
           }
       }
-      Ok(plugin.hook_result(state, context, output))
     },
   )
 }
 
-fn write_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
-  plugin.tool(
+fn write_tool(storage: Storage, resolve: ScopeResolver) -> plugin.Tool {
+  scoped_tool(
     llm.Tool(
       "cloud_storage.write",
       Some(
@@ -112,9 +124,9 @@ fn write_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
         ["key", "content"],
       ),
     ),
-    fn(state, context, invocation) {
-      let plugin.ToolInvocation(arguments:, ..) = invocation
-      let output = case json.parse(arguments, write_arguments_decoder()) {
+    resolve,
+    fn(storage_scope, arguments) {
+      case json.parse(arguments, write_arguments_decoder()) {
         Error(error) ->
           error_output(
             "Invalid cloud_storage.write arguments: " <> string.inspect(error),
@@ -136,13 +148,12 @@ fn write_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
               }
           }
       }
-      Ok(plugin.hook_result(state, context, output))
     },
   )
 }
 
-fn list_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
-  plugin.tool(
+fn list_tool(storage: Storage, resolve: ScopeResolver) -> plugin.Tool {
+  scoped_tool(
     llm.Tool(
       "cloud_storage.list",
       Some(
@@ -170,22 +181,21 @@ fn list_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
         [],
       ),
     ),
-    fn(state, context, invocation) {
-      let plugin.ToolInvocation(arguments:, ..) = invocation
-      let output = case json.parse(arguments, list_arguments_decoder()) {
+    resolve,
+    fn(storage_scope, arguments) {
+      case json.parse(arguments, list_arguments_decoder()) {
         Error(error) ->
           error_output(
             "Invalid cloud_storage.list arguments: " <> string.inspect(error),
           )
         Ok(arguments) -> list_objects(storage, storage_scope, arguments)
       }
-      Ok(plugin.hook_result(state, context, output))
     },
   )
 }
 
-fn delete_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
-  plugin.tool(
+fn delete_tool(storage: Storage, resolve: ScopeResolver) -> plugin.Tool {
+  scoped_tool(
     llm.Tool(
       "cloud_storage.delete",
       Some(
@@ -196,9 +206,9 @@ fn delete_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
         ["key"],
       ),
     ),
-    fn(state, context, invocation) {
-      let plugin.ToolInvocation(arguments:, ..) = invocation
-      let output = case json.parse(arguments, key_arguments_decoder()) {
+    resolve,
+    fn(storage_scope, arguments) {
+      case json.parse(arguments, key_arguments_decoder()) {
         Error(error) ->
           error_output(
             "Invalid cloud_storage.delete arguments: " <> string.inspect(error),
@@ -226,13 +236,12 @@ fn delete_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
               }
           }
       }
-      Ok(plugin.hook_result(state, context, output))
     },
   )
 }
 
-fn url_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
-  plugin.tool(
+fn url_tool(storage: Storage, resolve: ScopeResolver) -> plugin.Tool {
+  scoped_tool(
     llm.Tool(
       "cloud_storage.get_url",
       Some(
@@ -249,9 +258,9 @@ fn url_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
         ["key", "operation"],
       ),
     ),
-    fn(state, context, invocation) {
-      let plugin.ToolInvocation(arguments:, ..) = invocation
-      let output = case json.parse(arguments, url_arguments_decoder()) {
+    resolve,
+    fn(storage_scope, arguments) {
+      case json.parse(arguments, url_arguments_decoder()) {
         Error(error) ->
           error_output(
             "Invalid cloud_storage.get_url arguments: " <> string.inspect(error),
@@ -296,9 +305,27 @@ fn url_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
               }
           }
       }
-      Ok(plugin.hook_result(state, context, output))
     },
   )
+}
+
+/// A stateless tool: the scope is resolved before the body runs (resolution
+/// failure becomes the tool's error output), and the body maps raw arguments
+/// to output without touching plugin state.
+fn scoped_tool(
+  definition: llm.Tool,
+  resolve: ScopeResolver,
+  run: fn(Scope, String) -> plugin.ToolOutput,
+) -> plugin.Tool {
+  plugin.tool(definition, fn(state, context, invocation) {
+    let plugin.ToolInvocation(arguments:, ..) = invocation
+    let output = case resolve(context) {
+      Error(error) ->
+        error_output("Cloud storage workspace unavailable: " <> error)
+      Ok(storage_scope) -> run(storage_scope, arguments)
+    }
+    Ok(plugin.hook_result(state, context, output))
+  })
 }
 
 fn list_objects(

@@ -151,6 +151,7 @@ pub fn worker_checkpoints_tool_call_and_running_before_invocation_test() {
       max_output_tokens: None,
       reasoning_effort: None,
       context_window_tokens: current_model.context_window_tokens,
+      group_context: agent.solo_group_context(),
     )
   let initial =
     agent.State(..agent.state("agent", "model"), messages: [
@@ -281,6 +282,7 @@ fn assert_observer_failure_is_durable(fail_on_finished: Bool) {
       max_output_tokens: None,
       reasoning_effort: None,
       context_window_tokens: current_model.context_window_tokens,
+      group_context: agent.solo_group_context(),
     )
   let initial =
     agent.State(..agent.state("agent", "model"), messages: [

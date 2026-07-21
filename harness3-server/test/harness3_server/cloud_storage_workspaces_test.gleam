@@ -1,7 +1,9 @@
 import envoy
 import gleam/bit_array
 import gleam/crypto
+import gleam/erlang/process
 import gleam/json
+import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
 import harness3/agent_profile
@@ -12,6 +14,33 @@ import harness3/storage/local
 import harness3_server/cloud_storage_workspaces as storage_workspaces
 import harness3_server/service
 import simplifile
+
+/// The wake RPC routes through the recovery leader, which is elected
+/// asynchronously after service start; a request racing the first election
+/// fails on the missing leader lock. Retry until the election has settled.
+fn request_compaction_after_election(
+  running: service.Service,
+  session_id: String,
+  agent_id: String,
+  attempts: Int,
+) -> Result(Int, String) {
+  case service.request_compaction(running, session_id, agent_id) {
+    Error(error) if attempts > 1 ->
+      case string.contains(error, "recovery-leader") {
+        True -> {
+          process.sleep(100)
+          request_compaction_after_election(
+            running,
+            session_id,
+            agent_id,
+            attempts - 1,
+          )
+        }
+        False -> Error(error)
+      }
+    outcome -> outcome
+  }
+}
 
 fn temporary_root(label: String) -> String {
   "/tmp/"
@@ -88,8 +117,7 @@ pub fn catalog_round_trips_through_storage_with_cas_test() {
   let assert Error(storage_workspaces.StorageFailed(storage.NotFound(_))) =
     storage_workspaces.resume(backend, key)
 
-  let workspace =
-    storage_workspaces.Workspace("alpha", "Alpha", "team/alpha/")
+  let workspace = storage_workspaces.Workspace("alpha", "Alpha", "team/alpha/")
   let assert Ok(session) =
     storage_workspaces.create(backend, key, storage_workspaces.new())
   let assert Ok(next) =
@@ -143,10 +171,34 @@ fn unset_service_environment() -> Nil {
   envoy.unset("HARNESS3_STORAGE")
 }
 
-fn lead_runtime(session_id: String) -> plugin.Runtime {
-  let assert Ok([lead_profile]) = agent_profile.profiles([session_id <> ":lead"])
+/// Activates the lead agent's registered profile the way a real worker
+/// would: hosted on the session's durable group identity, so the generic
+/// plugins resolve the session's workspace and storage scope from attributes.
+fn lead_runtime(
+  running: service.Service,
+  session_id: String,
+) -> plugin.Runtime {
+  let assert Ok(sessions) = service.list_sessions(running)
+  let assert Ok(service.Session(group:, ..)) =
+    list.find(sessions, fn(session) {
+      let service.Session(metadata:, ..) = session
+      metadata.id == session_id
+    })
+  let assert Ok(lead) =
+    list.find(group.agents, fn(agent) { agent.id == "lead" })
+  let assert Ok([lead_profile]) = agent_profile.profiles([lead.profile_id])
   let assert Ok(runtime) =
-    plugin.activate(lead_profile.registry, plugin.empty_states())
+    plugin.activate_hosted(
+      lead_profile.registry,
+      plugin.empty_states(),
+      plugin.Host(
+        group_id: group.id,
+        agent_id: lead.id,
+        agent_attributes: lead.attributes,
+        group_attributes: group.attributes,
+        peers: [],
+      ),
+    )
   runtime
 }
 
@@ -171,10 +223,7 @@ fn storage_write(
   runtime
 }
 
-fn storage_read(
-  runtime: plugin.Runtime,
-  key: String,
-) -> plugin.ToolOutput {
+fn storage_read(runtime: plugin.Runtime, key: String) -> plugin.ToolOutput {
   let assert Ok(#(_, output)) =
     plugin.invoke_tool(
       runtime,
@@ -188,10 +237,8 @@ fn storage_read(
 }
 
 fn assert_reads(runtime: plugin.Runtime, key: String, content: String) -> Nil {
-  let assert plugin.ToolOutput(
-    content: [llm.Text(found)],
-    is_error: False,
-  ) = storage_read(runtime, key)
+  let assert plugin.ToolOutput(content: [llm.Text(found)], is_error: False) =
+    storage_read(runtime, key)
   assert found == content
 }
 
@@ -211,8 +258,7 @@ pub fn sessions_share_storage_through_their_associated_workspace_test() {
 
   let assert Ok(shared) =
     service.add_cloud_storage_workspace(running, "shared", "Shared team", "")
-  assert shared.prefix
-    == "plugins/cloud_storage/workspaces/shared/objects/"
+  assert shared.prefix == "plugins/cloud_storage/workspaces/shared/objects/"
   let assert Ok(custom) =
     service.add_cloud_storage_workspace(running, "custom", "Custom", "teams/x")
   assert custom.prefix == "teams/x/"
@@ -255,14 +301,17 @@ pub fn sessions_share_storage_through_their_associated_workspace_test() {
 
   // Associated sessions share objects; an unassociated session stays on its
   // own isolated namespace.
-  let first_lead = lead_runtime(first.metadata.id)
+  let first_lead = lead_runtime(running, first.metadata.id)
   let _ = storage_write(first_lead, "notes/shared.txt", "for the team")
   assert_reads(
-    lead_runtime(second.metadata.id),
+    lead_runtime(running, second.metadata.id),
     "notes/shared.txt",
     "for the team",
   )
-  assert_missing(lead_runtime(isolated.metadata.id), "notes/shared.txt")
+  assert_missing(
+    lead_runtime(running, isolated.metadata.id),
+    "notes/shared.txt",
+  )
   let assert Ok(_) =
     storage.get(
       local.new(local.config(data_path)),
@@ -271,7 +320,7 @@ pub fn sessions_share_storage_through_their_associated_workspace_test() {
 
   // The isolated session's objects live under its own per-session namespace.
   let backend = local.new(local.config(data_path))
-  let isolated_lead = lead_runtime(isolated.metadata.id)
+  let isolated_lead = lead_runtime(running, isolated.metadata.id)
   let _ = storage_write(isolated_lead, "notes/private.txt", "only this session")
   let assert Ok(_) =
     storage.get(
@@ -300,7 +349,7 @@ pub fn sessions_share_storage_through_their_associated_workspace_test() {
       ),
     )
   assert moved.cloud_storage_workspace == Some("custom")
-  assert_missing(lead_runtime(second.metadata.id), "notes/shared.txt")
+  assert_missing(lead_runtime(running, second.metadata.id), "notes/shared.txt")
 
   // KeepAssociation leaves the workspace alone across a plain rename.
   let assert Ok(service.Session(metadata: renamed, ..)) =
@@ -342,11 +391,10 @@ pub fn sessions_share_storage_through_their_associated_workspace_test() {
   let assert Error(compaction_error) =
     service.request_compaction(running, first.metadata.id, "lead")
   assert string.contains(compaction_error, "no messages to compact")
-  let repointed_lead = lead_runtime(first.metadata.id)
+  let repointed_lead = lead_runtime(running, first.metadata.id)
   assert_missing(repointed_lead, "notes/shared.txt")
   let _ = storage_write(repointed_lead, "notes/new.txt", "moved")
-  let assert Ok(_) =
-    storage.get(backend, "teams/repointed/notes/new.txt")
+  let assert Ok(_) = storage.get(backend, "teams/repointed/notes/new.txt")
 
   // Removing the last reference unblocks removal; the stored objects stay.
   let assert Ok(_) =
@@ -416,7 +464,10 @@ pub fn a_session_whose_workspace_vanished_stays_repairable_test() {
   // both sessions still carry the association attribute.
   let backend = local.new(local.config(data_path))
   let assert Ok(catalog_session) =
-    storage_workspaces.resume(backend, "harness3-server/cloud-storage-workspaces")
+    storage_workspaces.resume(
+      backend,
+      "harness3-server/cloud-storage-workspaces",
+    )
   let assert Ok(narrowed) =
     storage_workspaces.remove_workspace(
       storage_workspaces.catalog(catalog_session),
@@ -424,13 +475,22 @@ pub fn a_session_whose_workspace_vanished_stays_repairable_test() {
     )
   let assert Ok(_) = storage_workspaces.commit(catalog_session, narrowed)
 
-  // Wake and attribute paths refuse to run the misconfigured session and say
-  // how to fix it.
+  // The dangling association no longer blocks waking or editing the session:
+  // the storage scope is resolved per tool invocation, so the
+  // misconfiguration surfaces as an actionable tool error while the session
+  // itself stays runnable and repairable.
   let assert Error(wake_error) =
-    service.request_compaction(running, repoint_target.metadata.id, "lead")
-  assert string.contains(wake_error, "unknown cloud storage workspace")
-  assert string.contains(wake_error, "re-point or clear")
-  let assert Error(rename_error) =
+    request_compaction_after_election(
+      running,
+      repoint_target.metadata.id,
+      "lead",
+      50,
+    )
+  assert string.contains(wake_error, "no messages to compact")
+  let assert plugin.ToolOutput(content: [llm.Text(dangling)], is_error: True) =
+    storage_read(lead_runtime(running, repoint_target.metadata.id), "any.txt")
+  assert string.contains(dangling, "re-point or clear")
+  let assert Ok(_) =
     service.update_session(
       running,
       repoint_target.metadata.id,
@@ -440,7 +500,6 @@ pub fn a_session_whose_workspace_vanished_stays_repairable_test() {
         service.KeepAssociation,
       ),
     )
-  assert string.contains(rename_error, "unknown cloud storage workspace")
 
   // Re-pointing repairs the first session.
   let assert Ok(service.Session(metadata: repointed, ..)) =
@@ -454,7 +513,12 @@ pub fn a_session_whose_workspace_vanished_stays_repairable_test() {
       ),
     )
   assert repointed.cloud_storage_workspace == Some("custom")
-  let _ = storage_write(lead_runtime(repointed.id), "fixed.txt", "re-pointed")
+  let _ =
+    storage_write(
+      lead_runtime(running, repointed.id),
+      "fixed.txt",
+      "re-pointed",
+    )
   let assert Ok(_) = storage.get(backend, "t/custom/fixed.txt")
 
   // Clearing repairs the second.
@@ -469,13 +533,12 @@ pub fn a_session_whose_workspace_vanished_stays_repairable_test() {
       ),
     )
   assert cleared.cloud_storage_workspace == None
-  let _ = storage_write(lead_runtime(cleared.id), "fixed.txt", "cleared")
+  let _ =
+    storage_write(lead_runtime(running, cleared.id), "fixed.txt", "cleared")
   let assert Ok(_) =
     storage.get(
       backend,
-      "plugins/cloud_storage/sessions/"
-        <> cleared.id
-        <> "/objects/fixed.txt",
+      "plugins/cloud_storage/sessions/" <> cleared.id <> "/objects/fixed.txt",
     )
 
   let assert Ok(Nil) = service.stop_session(running, repointed.id)

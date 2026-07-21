@@ -19,6 +19,7 @@ import harness3/cluster/core
 import harness3/model_catalog
 import harness3/plugin
 import harness3/plugin/cloud_storage
+import harness3/plugin/cloud_storage/scope
 import harness3/plugin/mcp
 import harness3/plugin/mcp/catalog as mcp_catalog
 import harness3/plugin/mcp/configuration as mcp_configuration
@@ -46,15 +47,15 @@ const title_attribute = "title"
 
 const prompt_attribute = "prompt"
 
-const workspace_attribute = "workspace"
+const workspace_attribute = coding_plugin.workspace_attribute
 
 const cloud_storage_workspace_attribute = "cloud_storage_workspace"
 
 const created_at_attribute = "created_at"
 
-const role_attribute = "role"
+const role_attribute = coding_plugin.role_attribute
 
-const kind_attribute = "kind"
+const kind_attribute = coding_plugin.kind_attribute
 
 const lease_seconds = 30
 
@@ -138,6 +139,25 @@ pub fn start() -> Result(Service, String) {
   use root <- result.try(resolve_workspace_root())
   use _ <- result.try(install_catalog(storage, models))
   use mcp_runtime <- result.try(start_mcp(storage))
+  let model_transport =
+    transport.buffered_http(config.environment_int(
+      "HARNESS3_MODEL_TIMEOUT_MS",
+      300_000,
+    ))
+  // Agent profiles are static node capabilities; per-session configuration
+  // reaches the plugins through durable group/agent attributes. They must be
+  // registered before the cluster node advertises itself: the recovery
+  // leader may dispatch a resume RPC at this node the moment membership is
+  // published.
+  use _ <- result.try(
+    case install_agent_profiles(storage, mcp_runtime, model_transport) {
+      Ok(Nil) -> Ok(Nil)
+      Error(error) -> {
+        mcp.stop(mcp_runtime)
+        Error("could not install agent profiles: " <> error)
+      }
+    },
+  )
   let cluster =
     core.config(
       storage,
@@ -158,10 +178,7 @@ pub fn start() -> Result(Service, String) {
         workspace_root: root,
         mcp_runtime:,
         cluster:,
-        model_transport: transport.buffered_http(config.environment_int(
-          "HARNESS3_MODEL_TIMEOUT_MS",
-          300_000,
-        )),
+        model_transport:,
       ))
   }
 }
@@ -292,25 +309,25 @@ pub fn update_session(
     )
   let association_changed =
     association != current_metadata.cloud_storage_workspace
-  use _ <- result.try(case
-    agents == current_metadata.agents && !association_changed
-  {
-    True ->
-      apply_attribute_update(
-        service,
-        next_metadata,
-        dict.from_list([#(title_attribute, next_metadata.title)]),
-        dict.new(),
-      )
-    False ->
-      update_session_roster(
-        service,
-        id,
-        current_metadata,
-        next_metadata,
-        association_changed,
-      )
-  })
+  use _ <- result.try(
+    case agents == current_metadata.agents && !association_changed {
+      True ->
+        apply_attribute_update(
+          service,
+          next_metadata,
+          dict.from_list([#(title_attribute, next_metadata.title)]),
+          dict.new(),
+        )
+      False ->
+        update_session_roster(
+          service,
+          id,
+          current_metadata,
+          next_metadata,
+          association_changed,
+        )
+    },
+  )
   load_group_view(service, id)
 }
 
@@ -339,13 +356,7 @@ fn update_session_roster(
   // Construct every profile before stopping anything. A missing MCP
   // configuration or invalid plugin graph must leave the live team untouched.
   use next_config <- result.try(group_config(service, next_metadata))
-  // The pre-edit profiles only reconstruct the stopped group for resumption;
-  // a vanished workspace in the OLD association must not block the edit that
-  // repairs it, so their storage plugin tolerates a dangling reference.
-  use current_config <- result.try(group_config_repair(
-    service,
-    current_metadata,
-  ))
+  use current_config <- result.try(group_config(service, current_metadata))
   use _ <- result.try(stop_session(service, id))
   // Profiles for agents the edit removes are still needed to resume the
   // pre-edit group; survivors and additions use the post-edit profiles.
@@ -393,7 +404,7 @@ fn update_session_roster(
         list.map(next_metadata.agents, fn(spec) {
           agent_group.RosterEntry(
             id: spec.id,
-            profile_id: profile_id(id, spec.id),
+            profile_id: kind_profile_id(spec.kind),
             model_id: spec.model_id,
             attributes: agent_attributes(spec),
             initial_status: agent.Waiting,
@@ -412,12 +423,7 @@ fn update_session_roster(
       fn() { core.refresh(service.cluster) },
     )
   {
-    Ok(_) -> {
-      removed_profiles
-      |> list.map(fn(profile) { profile.id })
-      |> agent_profile.uninstall
-      Ok(Nil)
-    }
+    Ok(_) -> Ok(Nil)
     Error(error) ->
       Error("could not update agent group: " <> string.inspect(error))
   }
@@ -621,11 +627,7 @@ pub fn stop_session(service: Service, id: String) -> Result(Nil, String) {
       |> result.map_error(fn(error) { "could not stop session: " <> error })
     agent_group.Idle(_) | agent_group.Completed(_) -> Ok(Nil)
   })
-  // Per-session profiles are node-global ETS entries; a later resume
-  // re-installs them, so drop them now instead of growing forever.
-  agent_profile.uninstall(
-    list.map(metadata.agents, fn(spec) { profile_id(metadata.id, spec.id) }),
-  )
+  let _ = metadata
   Ok(Nil)
 }
 
@@ -773,6 +775,7 @@ pub fn add_mcp_server(
   ))
   use _ <- result.try(mcp.put_configuration(service.mcp_runtime, configuration))
   use _ <- result.try(refresh_all_mcp_configuration(service.mcp_runtime))
+  refresh_mcp_profile(service)
   Ok(configuration)
 }
 
@@ -823,6 +826,7 @@ pub fn update_mcp_server(
   ))
   use _ <- result.try(mcp.put_configuration(service.mcp_runtime, configuration))
   use _ <- result.try(refresh_all_mcp_configuration(service.mcp_runtime))
+  refresh_mcp_profile(service)
   Ok(configuration)
 }
 
@@ -865,6 +869,7 @@ pub fn remove_mcp_server(
   ))
   use _ <- result.try(mcp.put_configuration(service.mcp_runtime, configuration))
   use _ <- result.try(refresh_all_mcp_configuration(service.mcp_runtime))
+  refresh_mcp_profile(service)
   Ok(configuration)
 }
 
@@ -962,13 +967,11 @@ pub fn add_cloud_storage_workspace(
   prefix: String,
 ) -> Result(storage_workspaces.Workspace, String) {
   use workspace <- result.try(
-    storage_workspaces.validate_workspace(
-      storage_workspaces.Workspace(
-        id:,
-        label:,
-        prefix: normalize_workspace_prefix(id, prefix),
-      ),
-    )
+    storage_workspaces.validate_workspace(storage_workspaces.Workspace(
+      id:,
+      label:,
+      prefix: normalize_workspace_prefix(id, prefix),
+    ))
     |> result.map_error(workspace_error),
   )
   commit_workspace_change(
@@ -997,13 +1000,11 @@ pub fn update_cloud_storage_workspace(
   prefix: String,
 ) -> Result(storage_workspaces.Workspace, String) {
   use workspace <- result.try(
-    storage_workspaces.validate_workspace(
-      storage_workspaces.Workspace(
-        id:,
-        label:,
-        prefix: normalize_workspace_prefix(id, prefix),
-      ),
-    )
+    storage_workspaces.validate_workspace(storage_workspaces.Workspace(
+      id:,
+      label:,
+      prefix: normalize_workspace_prefix(id, prefix),
+    ))
     |> result.map_error(workspace_error),
   )
   commit_workspace_change(
@@ -1083,14 +1084,23 @@ fn find_workspace(
   service: Service,
   id: String,
 ) -> Result(storage_workspaces.Workspace, String) {
-  case storage_workspaces.resume(service.storage, workspaces_catalog_key) {
+  find_workspace_in(service.storage, id)
+}
+
+fn find_workspace_in(
+  backend: Storage,
+  id: String,
+) -> Result(storage_workspaces.Workspace, String) {
+  case storage_workspaces.resume(backend, workspaces_catalog_key) {
     Ok(session) ->
       storage_workspaces.lookup(storage_workspaces.catalog(session), id)
       |> result.map_error(workspace_error)
     Error(storage_workspaces.StorageFailed(storage.NotFound(_))) ->
       Error(storage_workspaces.UnknownWorkspace(id) |> workspace_error)
     Error(error) ->
-      Error("could not load cloud storage workspaces: " <> workspace_error(error))
+      Error(
+        "could not load cloud storage workspaces: " <> workspace_error(error),
+      )
   }
 }
 
@@ -1149,7 +1159,8 @@ fn resume_or_create_workspaces(
         Error(storage_workspaces.ConcurrentUpdate) ->
           storage_workspaces.resume(service.storage, workspaces_catalog_key)
           |> result.map_error(fn(error) {
-            "could not load cloud storage workspaces: " <> workspace_error(error)
+            "could not load cloud storage workspaces: "
+            <> workspace_error(error)
           })
         Error(error) ->
           Error(
@@ -1158,53 +1169,9 @@ fn resume_or_create_workspaces(
           )
       }
     Error(error) ->
-      Error("could not load cloud storage workspaces: " <> workspace_error(error))
-  }
-}
-
-/// Builds the session's cloud storage plugin. An associated workspace
-/// contributes its configured prefix; an unassociated session gets its own
-/// isolated namespace derived from the session ID.
-fn cloud_storage_plugin(
-  service: Service,
-  metadata: SessionMetadata,
-) -> Result(plugin.Plugin, String) {
-  case metadata.cloud_storage_workspace {
-    Some(workspace_id) -> {
-      use workspace <- result.try(
-        find_workspace(service, workspace_id)
-        |> result.map_error(fn(_) {
-          "session references unknown cloud storage workspace `"
-          <> workspace_id
-          <> "`; edit the session to re-point or clear its cloud storage association"
-        }),
+      Error(
+        "could not load cloud storage workspaces: " <> workspace_error(error),
       )
-      cloud_storage.new(service.storage, workspace.prefix)
-    }
-    None ->
-      cloud_storage.new(service.storage, isolated_storage_prefix(metadata.id))
-  }
-}
-
-/// The repair-path variant: a dangling association falls back to the isolated
-/// namespace instead of failing. Only used to reconstruct a session's
-/// pre-edit profiles, where the plugin's empty durable state makes any valid
-/// scope equivalent.
-fn cloud_storage_plugin_lenient(
-  service: Service,
-  metadata: SessionMetadata,
-) -> Result(plugin.Plugin, String) {
-  case metadata.cloud_storage_workspace {
-    Some(workspace_id) ->
-      case find_workspace(service, workspace_id) {
-        Ok(workspace) -> cloud_storage.new(service.storage, workspace.prefix)
-        Error(_) ->
-          cloud_storage.new(
-            service.storage,
-            isolated_storage_prefix(metadata.id),
-          )
-      }
-    None -> cloud_storage_plugin(service, metadata)
   }
 }
 
@@ -1218,14 +1185,16 @@ fn validate_create(
   service: Service,
   input: CreateInput,
 ) -> Result(Nil, String) {
-  use _ <- result.try(case
-    list.any(service.models, fn(model) { model.id == input.model_id }),
-    input.team_size >= 1 && input.team_size <= 4
-  {
-    False, _ -> Error("unknown model: " <> input.model_id)
-    _, False -> Error("team_size must be between 1 and 4")
-    _, _ -> Ok(Nil)
-  })
+  use _ <- result.try(
+    case
+      list.any(service.models, fn(model) { model.id == input.model_id }),
+      input.team_size >= 1 && input.team_size <= 4
+    {
+      False, _ -> Error("unknown model: " <> input.model_id)
+      _, False -> Error("team_size must be between 1 and 4")
+      _, _ -> Ok(Nil)
+    },
+  )
   case input.cloud_storage_workspace_id {
     None -> Ok(Nil)
     Some(workspace_id) ->
@@ -1392,81 +1361,7 @@ fn group_config(
   service: Service,
   metadata: SessionMetadata,
 ) -> Result(agent_group.Config, String) {
-  group_config_with_storage(service, metadata, cloud_storage_plugin)
-}
-
-/// Builds profiles for the session's CURRENT (pre-edit) metadata when
-/// resuming a stopped group during a roster/workspace edit. The cloud storage
-/// plugin is stateless, so a dangling association may safely fall back to the
-/// session's isolated namespace — otherwise a session whose workspace vanished
-/// could never be re-pointed or cleared, since every repair attempt would
-/// fail while reconstructing its old profiles.
-fn group_config_repair(
-  service: Service,
-  metadata: SessionMetadata,
-) -> Result(agent_group.Config, String) {
-  group_config_with_storage(service, metadata, cloud_storage_plugin_lenient)
-}
-
-fn group_config_with_storage(
-  service: Service,
-  metadata: SessionMetadata,
-  storage_plugin: fn(Service, SessionMetadata) -> Result(plugin.Plugin, String),
-) -> Result(agent_group.Config, String) {
-  use profiles <- result.try(
-    list.try_map(metadata.agents, fn(spec) {
-      let message_targets = case spec.id {
-        "lead" ->
-          metadata.agents
-          |> list.map(fn(item) { item.id })
-          |> list.filter(fn(id) { id != "lead" })
-        _ ->
-          case list.any(metadata.agents, fn(item) { item.id == "lead" }) {
-            True -> ["lead"]
-            False -> []
-          }
-      }
-      let collaboration =
-        coding_plugin.collaboration(
-          metadata.id,
-          spec.id,
-          spec.role,
-          message_targets,
-          capability_instructions(spec.kind),
-        )
-      use group_storage <- result.try(storage_plugin(service, metadata))
-      use plugins <- result.try(case spec.kind {
-        CodingAgent ->
-          Ok([
-            collaboration,
-            group_storage,
-            coding_plugin.workspace(metadata.workspace),
-          ])
-        ResearchAgent -> Ok([collaboration, group_storage])
-        McpSpecialist -> {
-          use configuration <- result.try(mcp.configuration(
-            service.mcp_runtime,
-            all_mcp_configuration_id,
-          ))
-          let specialist = mcp.plugin(service.mcp_runtime, configuration)
-          Ok([collaboration, group_storage, specialist])
-        }
-      })
-      use registry <- result.try(
-        plugin.registry(plugins)
-        |> result.map_error(fn(error) { string.inspect(error) }),
-      )
-      Ok(
-        agent_profile.AgentProfile(
-          id: profile_id(metadata.id, spec.id),
-          registry:,
-          transport: service.model_transport,
-          reasoning_effort: None,
-          observe: fn(_) { Ok(Nil) },
-        ),
-      )
-    }),
-  )
+  use profiles <- result.try(session_profiles(metadata))
   Ok(agent_group.Config(
     storage: service.storage,
     object_key: group_key(metadata.id),
@@ -1476,14 +1371,126 @@ fn group_config_with_storage(
   ))
 }
 
-fn capability_instructions(kind: AgentKind) -> String {
+/// The registered kind profiles for the session's roster.
+fn session_profiles(
+  metadata: SessionMetadata,
+) -> Result(List(agent_profile.AgentProfile), String) {
+  metadata.agents
+  |> list.map(fn(spec) { kind_profile_id(spec.kind) })
+  |> list.unique
+  |> agent_profile.profiles
+  |> result.map_error(fn(error) {
+    "agent profiles are not installed: " <> string.inspect(error)
+  })
+}
+
+const coding_profile_id = "coding-workspace"
+
+const researcher_profile_id = "isolated-researcher"
+
+const mcp_profile_id = "mcp-researcher"
+
+fn kind_profile_id(kind: AgentKind) -> String {
   case kind {
-    CodingAgent ->
-      "You can inspect and modify the shared workspace, run commands with the installed coding tools, and read, write, list, delete, or create transfer URLs for durable objects in the session's cloud storage workspace."
-    ResearchAgent ->
-      "You have no filesystem, workspace, shell, or MCP tools. You can use `team.message_agent` only to report to the lead, and you can use the `cloud_storage.*` tools to read, write, list, delete, or create transfer URLs for durable objects in the session's cloud storage workspace."
-    McpSpecialist ->
-      "You are the MCP research specialist with access to all enabled global MCP servers. You have `team.message_agent` (to report to the lead), `mcp.list` (to inspect tools from currently reachable external servers), `mcp.call` (to invoke a listed tool), and the `cloud_storage.*` tools for durable objects in the session's cloud storage workspace. You have no direct filesystem or shell access."
+    CodingAgent -> coding_profile_id
+    ResearchAgent -> researcher_profile_id
+    McpSpecialist -> mcp_profile_id
+  }
+}
+
+/// The three static agent profiles this server can run. Session-specific
+/// configuration — workspace root, roster, cloud storage association —
+/// reaches the plugins through the durable group and agent attributes, so
+/// profiles are node capabilities rather than session state.
+fn kind_profiles(
+  backend: Storage,
+  mcp_runtime: mcp.Runtime,
+  model_transport: agent.ModelTransport,
+) -> Result(List(agent_profile.AgentProfile), String) {
+  let collaboration = coding_plugin.collaboration()
+  let group_storage =
+    cloud_storage.new_resolved(backend, session_scope_resolver(backend))
+  use mcp_config <- result.try(mcp.configuration(
+    mcp_runtime,
+    all_mcp_configuration_id,
+  ))
+  let specialist = mcp.plugin(mcp_runtime, mcp_config)
+  list.try_map(
+    [
+      #(coding_profile_id, [
+        collaboration,
+        group_storage,
+        coding_plugin.workspace(),
+      ]),
+      #(researcher_profile_id, [collaboration, group_storage]),
+      #(mcp_profile_id, [collaboration, group_storage, specialist]),
+    ],
+    fn(entry) {
+      let #(id, plugins) = entry
+      use registry <- result.try(
+        plugin.registry(plugins)
+        |> result.map_error(fn(error) { string.inspect(error) }),
+      )
+      Ok(
+        agent_profile.AgentProfile(
+          id:,
+          registry:,
+          transport: model_transport,
+          reasoning_effort: None,
+          observe: fn(_) { Ok(Nil) },
+        ),
+      )
+    },
+  )
+}
+
+/// Resolves a session's cloud-storage scope per tool invocation from the
+/// group's durable attributes: an associated workspace's prefix when the
+/// association resolves, the session's isolated namespace when there is no
+/// association, and an actionable error when the association dangles.
+fn session_scope_resolver(
+  backend: Storage,
+) -> fn(plugin.Context) -> Result(scope.Scope, String) {
+  fn(context) {
+    let plugin.Host(group_id:, group_attributes:, ..) = plugin.host(context)
+    case dict.get(group_attributes, cloud_storage_workspace_attribute) {
+      Ok(workspace_id) if workspace_id != "" ->
+        case find_workspace_in(backend, workspace_id) {
+          Ok(workspace) -> scope.new(workspace.prefix)
+          Error(error) ->
+            Error(
+              error
+              <> "; edit the session to re-point or clear its cloud storage association",
+            )
+        }
+      _ -> scope.new(isolated_storage_prefix(group_id))
+    }
+  }
+}
+
+fn install_agent_profiles(
+  backend: Storage,
+  mcp_runtime: mcp.Runtime,
+  model_transport: agent.ModelTransport,
+) -> Result(Nil, String) {
+  use profiles <- result.try(kind_profiles(
+    backend,
+    mcp_runtime,
+    model_transport,
+  ))
+  agent_profile.install(profiles)
+  Ok(Nil)
+}
+
+/// The MCP specialist profile embeds a configuration snapshot; re-install the
+/// kind profiles after any MCP catalog change so newly activated agents see
+/// the updated server set.
+fn refresh_mcp_profile(service: Service) -> Nil {
+  case
+    kind_profiles(service.storage, service.mcp_runtime, service.model_transport)
+  {
+    Ok(profiles) -> agent_profile.install(profiles)
+    Error(_) -> Nil
   }
 }
 
@@ -1534,7 +1541,7 @@ fn initial_states(metadata: SessionMetadata) -> List(agent.State) {
     let base = agent.state(spec.id, spec.model_id)
     agent.State(
       ..base,
-      profile_id: profile_id(metadata.id, spec.id),
+      profile_id: kind_profile_id(spec.kind),
       attributes: agent_attributes(spec),
       status: agent.Waiting,
     )
@@ -1597,10 +1604,6 @@ fn title(prompt: String) -> String {
     True -> string.slice(title, 0, 64) <> "…"
     False -> title
   }
-}
-
-fn profile_id(session_id: String, agent_id: String) -> String {
-  session_id <> ":" <> agent_id
 }
 
 fn group_key(id: String) -> String {

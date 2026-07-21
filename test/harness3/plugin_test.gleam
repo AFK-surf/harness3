@@ -166,3 +166,87 @@ pub fn a_raising_release_hook_does_not_stop_other_plugins_test() {
   plugin.release(runtime)
   let assert Ok(Nil) = process.receive(released, within: 1000)
 }
+
+pub fn dynamic_prompt_sections_see_state_and_host_test() {
+  let host =
+    plugin.Host(
+      group_id: "group-1",
+      agent_id: "lead",
+      agent_attributes: dict.from_list([#("role", "Lead engineer")]),
+      group_attributes: dict.from_list([#("workspace", "/tmp/ws")]),
+      peers: [#("researcher", dict.new())],
+    )
+  let dynamic =
+    plugin.new("dynamic", "{\"topic\":\"storage\"}")
+    |> plugin.with_system_prompt(plugin.SystemPromptSection("Static", "fixed"))
+    |> plugin.with_dynamic_system_prompt(fn(state, context) {
+      let plugin.Host(group_id:, agent_id:, group_attributes:, peers:, ..) =
+        plugin.host(context)
+      let assert Ok(workspace) = dict.get(group_attributes, "workspace")
+      let assert [#(peer, _)] = peers
+      plugin.SystemPromptSection(
+        "Dynamic",
+        group_id
+          <> "/"
+          <> agent_id
+          <> "@"
+          <> workspace
+          <> " with "
+          <> peer
+          <> " state="
+          <> state,
+      )
+    })
+  let assert Ok(registry) = plugin.registry([dynamic])
+  let assert Ok(runtime) =
+    plugin.activate_hosted(registry, plugin.empty_states(), host)
+  assert plugin.system_prompt(runtime)
+    == "## Static\n\nfixed\n\n## Dynamic\n\ngroup-1/lead@/tmp/ws with researcher state={\"topic\":\"storage\"}"
+}
+
+pub fn tools_read_the_host_from_their_context_test() {
+  let hosted =
+    plugin.new("hosted", "{}")
+    |> plugin.with_tool(
+      plugin.tool(
+        llm.Tool("hosted.whoami", None, json.object([])),
+        fn(state, context, _invocation) {
+          let plugin.Host(agent_id:, ..) = plugin.host(context)
+          Ok(plugin.hook_result(
+            state,
+            context,
+            plugin.ToolOutput([llm.Text(agent_id)], False),
+          ))
+        },
+      ),
+    )
+  let assert Ok(registry) = plugin.registry([hosted])
+  let assert Ok(runtime) =
+    plugin.activate_hosted(
+      registry,
+      plugin.empty_states(),
+      plugin.Host(
+        group_id: "g",
+        agent_id: "researcher",
+        agent_attributes: dict.new(),
+        group_attributes: dict.new(),
+        peers: [],
+      ),
+    )
+  let assert Ok(#(
+    _,
+    plugin.ToolOutput(content: [llm.Text(id)], is_error: False),
+  )) =
+    plugin.invoke_tool(
+      runtime,
+      "hosted.whoami",
+      plugin.ToolInvocation("whoami", "{}"),
+    )
+  assert id == "researcher"
+
+  // Plain activation provides an empty host.
+  let assert Ok(bare) = plugin.activate(registry, plugin.empty_states())
+  let assert Ok(#(_, plugin.ToolOutput(content: [llm.Text(empty)], ..))) =
+    plugin.invoke_tool(bare, "hosted.whoami", plugin.ToolInvocation("w", "{}"))
+  assert empty == ""
+}

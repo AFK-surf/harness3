@@ -12,3 +12,15 @@ pub fn new(storage: Storage, prefix: String) -> Result(plugin.Plugin, String) {
   use storage_scope <- result.try(scope.new(prefix))
   Ok(cloud_storage_plugin.new(storage, storage_scope))
 }
+
+/// A plugin whose storage scope is resolved from the invoking agent's context
+/// on every tool invocation. The resolver typically derives a prefix from the
+/// agent's durable group attributes and validates it with `scope.new`; a
+/// resolution error fails that invocation with a tool error while leaving the
+/// agent runnable.
+pub fn new_resolved(
+  storage: Storage,
+  resolve: cloud_storage_plugin.ScopeResolver,
+) -> plugin.Plugin {
+  cloud_storage_plugin.new_resolved(storage, resolve)
+}

@@ -754,7 +754,7 @@ fn prepare_agents(
   group.agents
   |> list.filter(fn(state) { state.status == agent.Ready })
   |> list.try_fold([], fn(prepared, state) {
-    case prepare_agent(config, state, catalog) {
+    case prepare_agent(config, group, state, catalog) {
       Ok(item) -> Ok([item, ..prepared])
       Error(error) -> {
         // Plugin hosts already started for earlier agents must not outlive a
@@ -776,6 +776,7 @@ fn discard_prepared(prepared: List(PreparedAgent)) -> Nil {
 
 fn prepare_agent(
   config: Config,
+  group: AgentGroup,
   state: agent.State,
   catalog: model_catalog.Catalog,
 ) -> Result(PreparedAgent, Error) {
@@ -794,12 +795,25 @@ fn prepare_agent(
       max_output_tokens: model.max_output_tokens,
       reasoning_effort: profile.reasoning_effort,
       context_window_tokens: model.context_window_tokens,
+      group_context: group_context_of(group, state.id),
     )
   use active <- result.try(
     agent.activate(state, agent_config)
     |> result.map_error(fn(error) { AgentActivationFailed(state.id, error) }),
   )
   Ok(PreparedAgent(state.id, active, profile))
+}
+
+/// The durable group-level identity plugins see at activation: group id and
+/// attributes, plus every other agent as an id/attributes peer entry.
+fn group_context_of(group: AgentGroup, agent_id: String) -> agent.GroupContext {
+  agent.GroupContext(
+    group_id: group.id,
+    group_attributes: group.attributes,
+    peers: group.agents
+      |> list.filter(fn(peer) { peer.id != agent_id })
+      |> list.map(fn(peer) { #(peer.id, peer.attributes) }),
+  )
 }
 
 fn launch_agent(group: Group, prepared: PreparedAgent) -> agent.Handle {
@@ -1460,6 +1474,7 @@ fn start_agent_worker(
       state.lease_duration_seconds,
       state.minimum_lifetime_milliseconds,
     ),
+    state.group,
     current,
     catalog,
   ))
@@ -1532,6 +1547,7 @@ fn request_agent_compaction(
           state.lease_duration_seconds,
           state.minimum_lifetime_milliseconds,
         ),
+        state.group,
         replacement,
         catalog,
       ))
@@ -1620,8 +1636,14 @@ fn inject_and_start(
       state.lease_duration_seconds,
       state.minimum_lifetime_milliseconds,
     )
-  use prepared <- result.try(prepare_agents(config, single, catalog))
-  let assert [prepared] = prepared
+  // Prepared against the full group, not `single`: plugins must see the
+  // agent's real peers.
+  use prepared <- result.try(prepare_agent(
+    config,
+    state.group,
+    next_agent,
+    catalog,
+  ))
   use state <- result.try(
     persist_agents(state, replace_agent(state.group.agents, next_agent))
     |> result.map_error(fn(error) {
