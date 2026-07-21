@@ -334,7 +334,7 @@ export function App() {
 
   return (
     <>
-      <div className="grid h-screen grid-cols-[274px_minmax(0,1fr)] max-[1020px]:grid-cols-[224px_minmax(0,1fr)] max-[780px]:block max-[780px]:h-auto max-[780px]:min-h-screen">
+      <div className="grid h-screen grid-cols-[clamp(196px,17vw,232px)_minmax(0,1fr)] max-[780px]:block max-[780px]:h-auto max-[780px]:min-h-screen">
         <Sidebar
           sessions={sessions}
           selectedSessionId={current?.id ?? null}
@@ -344,7 +344,7 @@ export function App() {
           onManageMcp={() => setMcpOpen(true)}
           onSelectSession={(id) => void selectSession(id)}
         />
-        <main className="min-h-0 min-w-0 max-[780px]:min-h-[calc(100vh-66px)]">
+        <main className="min-h-0 min-w-0 max-[780px]:h-[calc(100dvh-66px)]">
           {current ? (
             <SessionWorkspace
               session={current}

@@ -54,7 +54,7 @@ export function SessionWorkspace({
   useLayoutEffect(() => {
     followsLatest.current = true;
     scrollToLatest(threadRef.current);
-  }, [selectedAgent?.id]);
+  }, [session.id, selectedAgent?.id]);
 
   useLayoutEffect(() => {
     if (followsLatest.current) scrollToLatest(threadRef.current);
@@ -95,131 +95,98 @@ export function SessionWorkspace({
   }
 
   return (
-    <section className="flex h-full min-h-0 flex-col max-[780px]:min-h-[calc(100vh-66px)]">
-      <header className="flex min-h-[112px] items-start justify-between gap-5 border-b border-line-soft px-[26px] pt-[21px] pb-[18px] max-[780px]:p-[17px]">
-        <div className="min-w-0">
-          <div className="flex gap-[7px] text-[10px] tracking-[.08em] text-faint uppercase">
-            <span>Session</span><b className="font-normal text-[#3e4642]">/</b>
-            <span>{session.id.replace("session-", "").slice(0, 8)}</span>
-          </div>
-          <h1 className="my-[9px] truncate text-xl tracking-[-.025em]">{session.title}</h1>
-          <div className="flex flex-wrap items-center gap-[13px] text-[10px] text-faint [&>span:not(:first-child)]:max-w-[310px] [&>span:not(:first-child)]:truncate">
-            <span className={`rounded-full border px-[7px] py-1 tracking-[.08em] uppercase ${session.execution.status === "completed" ? "border-[#304354] bg-[#131a20] text-info" : session.execution.status === "idle" ? "border-[#4c3a26] bg-[#1e1811] text-warn" : "border-[#39462f] bg-[#151c13] text-accent"}`}>
-              {session.execution.status}
-            </span>
-            <span>{modelSummary(models, session.agents)}</span>
-            <span title={session.workspace}>{session.workspace}</span>
-          </div>
+    <section className="flex h-full min-h-0 flex-col">
+      <header className="flex h-16 shrink-0 items-center justify-between gap-3 border-b border-line-soft px-5 max-[780px]:h-[60px] max-[780px]:px-3">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <h1 className="min-w-[4rem] truncate text-base font-semibold tracking-[-.02em]" title={session.title}>
+            {session.title}
+          </h1>
+          <span className={`shrink-0 rounded-full border px-2 py-1 text-[9px] tracking-[.08em] uppercase ${session.execution.status === "completed" ? "border-[#304354] bg-[#131a20] text-info" : session.execution.status === "idle" ? "border-[#4c3a26] bg-[#1e1811] text-warn" : "border-[#39462f] bg-[#151c13] text-accent"}`}>
+            {session.execution.status}
+          </span>
+          <span className="shrink-0 text-[10px] text-faint max-[1000px]:hidden" title={`Session ${session.id} · ${session.workspace}`}>
+            {session.id.replace("session-", "").slice(0, 8)} · {modelSummary(models, session.agents)}
+          </span>
         </div>
-        <div className="flex items-center gap-2 max-[780px]:flex-col max-[780px]:items-stretch">
-          <button className={ghostButton} type="button" onClick={onEdit}>
-            Edit team
+        <div className="flex shrink-0 items-center gap-1.5">
+          <span className="flex items-center gap-1.5 text-[9px] tracking-[.08em] text-faint uppercase max-[900px]:hidden" title="Durable group state refreshes automatically">
+            <span className="size-1.5 animate-pulse rounded-full bg-accent" /> live
+          </span>
+          <CompactButton agent={selectedAgent} requesting={compactionRequesting} onCompact={onCompact} />
+          <button className={`${ghostButton} px-2.5 py-1.5 text-[10px]`} type="button" onClick={onEdit} aria-label="Edit team" title="Edit team">
+            <span className="max-[520px]:hidden">Edit</span><span className="hidden text-sm max-[520px]:inline" aria-hidden="true">✎</span>
           </button>
-          <button className={`${dangerGhostButton} max-[520px]:hidden`} type="button" onClick={onStop}>
-            Stop team
+          <button className={`${dangerGhostButton} px-2.5 py-1.5 text-[10px]`} type="button" onClick={onStop} aria-label="Stop team" title="Stop team">
+            <span className="max-[520px]:hidden">Stop</span><span className="hidden max-[520px]:inline" aria-hidden="true">■</span>
           </button>
         </div>
       </header>
 
-      <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_292px] max-[1020px]:grid-cols-[minmax(0,1fr)_240px] max-[780px]:flex max-[780px]:flex-col">
-        <section className="flex min-h-0 min-w-0 flex-col max-[780px]:min-h-[640px]">
-          <div className="flex items-center justify-between border-b border-line-soft px-[26px] py-[13px] max-[780px]:px-4">
-            <div>
-              <span className={sectionLabel}>Agent thread</span>
-              <strong className="mt-1 block text-[13px]">{selectedAgent.id} · round {selectedAgent.round}</strong>
-            </div>
-            <div className="flex items-center gap-3">
-              <CompactButton
-                agent={selectedAgent}
-                requesting={compactionRequesting}
-                onCompact={onCompact}
-              />
-              <div
-                className="flex items-center gap-1.5 text-[10px] tracking-[.09em] text-faint uppercase"
-                title="The durable group state is refreshed automatically"
-              >
-                <span className="size-[5px] animate-pulse rounded-full bg-accent" /> live
-              </div>
-            </div>
-          </div>
-
-          <div
-            className="min-h-0 flex-1 scroll-smooth overflow-y-auto px-[26px] pt-[22px] pb-8 max-[780px]:px-4"
-            ref={threadRef}
-            aria-live="polite"
-            onScroll={(event) => {
-              const element = event.currentTarget;
-              followsLatest.current =
-                element.scrollHeight - element.scrollTop - element.clientHeight < 100;
-            }}
-          >
-            <AgentThread agent={selectedAgent} />
-          </div>
-
-          <form className="mx-[26px] mb-[22px] rounded-xl border border-[#30383d] bg-[#121619] p-[11px] shadow-[0_16px_50px_rgba(0,0,0,.2)] focus-within:border-[#536644] max-[780px]:mx-4" onSubmit={(event) => void submitMessage(event)}>
-            <div className="flex items-center gap-2 px-[3px] pb-1.5 text-[10px] text-faint">
-              <label htmlFor="target-agent">Send to</label>
-              <select className="border-0 bg-transparent py-[3px] pr-[19px] pl-[5px] text-[10px] text-accent"
-                id="target-agent"
-                value={selectedAgent.id}
-                onChange={(event) => onSelectAgent(event.target.value)}
-              >
-                {session.agents.map((agent) => (
-                  <option key={agent.id} value={agent.id}>
-                    {agent.id} · {agent.status}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <textarea className="block min-h-[65px] w-full resize-y border-0 bg-transparent px-1 py-2 leading-normal text-ink outline-0 placeholder:text-[#535c58]"
-              rows={3}
-              value={message}
-              onChange={(event) => setMessage(event.target.value)}
-              onKeyDown={handleComposerKeyDown}
-              placeholder="Describe the task, ask a follow-up, or activate a teammate…"
-              required
-            />
-            <div className="flex items-center justify-between border-t border-line-soft pt-[7px] text-[9px] text-faint">
-              <span><kbd className="rounded border border-[#363d3a] bg-[#121513] px-[5px] py-0.5 text-[10px] text-faint">⌘</kbd><kbd className="rounded border border-[#363d3a] bg-[#121513] px-[5px] py-0.5 text-[10px] text-faint">Enter</kbd> to send</span>
-              <button className={`${primaryButton} px-3 py-2 text-[11px]`} type="submit" disabled={sending}>
-                {sending ? "Sending…" : "Send message"} <span>↗</span>
-              </button>
-            </div>
-          </form>
-        </section>
-
-        <aside className="min-h-0 overflow-y-auto border-l border-line-soft bg-[rgba(14,17,19,.63)] px-[17px] py-5 max-[780px]:order-first max-[780px]:border-l-0 max-[780px]:border-b max-[780px]:border-line">
-          <div className="flex items-end justify-between px-[3px] pb-[13px]">
-            <div>
-              <span className={sectionLabel}>Team</span>
-              <h2 className="mt-[5px] mb-0 text-base">Agents</h2>
-            </div>
-            <span className="text-[10px] text-faint">{session.agents.length} total</span>
-          </div>
-          <div className="flex flex-col gap-[7px] max-[780px]:grid max-[780px]:grid-cols-2 max-[520px]:grid-cols-1">
-            {session.agents.map((agent) => (
-              <AgentCard
+      <div className="flex h-10 shrink-0 border-b border-line-soft bg-[rgba(14,17,19,.55)]">
+        <nav className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto px-3" aria-label="Team agents">
+          <span className={`${sectionLabel} mr-1 shrink-0 max-[520px]:sr-only`}>Team</span>
+          {session.agents.map((agent) => {
+            const tokens = agent.stats.input_tokens + agent.stats.output_tokens;
+            return (
+              <button
+                className={`flex h-7 shrink-0 items-center gap-1.5 rounded-md border px-2 text-[10px] transition ${agent.id === selectedAgent.id ? "border-[#45563b] bg-[#1b2418] text-ink" : "border-transparent text-muted hover:border-line hover:bg-panel-2 hover:text-ink"}`}
                 key={agent.id}
-                agent={agent}
-                active={agent.id === selectedAgent.id}
+                type="button"
+                aria-current={agent.id === selectedAgent.id ? "true" : undefined}
+                title={`${agent.role} · ${agent.status} · round ${agent.round} · ${formatNumber(tokens)} tokens`}
                 onClick={() => onSelectAgent(agent.id)}
-              />
-            ))}
-          </div>
-          <div className="mt-[18px] rounded-[10px] border border-line-soft bg-[#111416] p-[14px] max-[780px]:hidden">
-            <span className={sectionLabel}>Session usage</span>
-            <div className="my-3">
-              <strong className="font-serif text-[26px] font-normal">{formatNumber(usage.input + usage.output)}</strong>
-              <small className="ml-[5px] text-faint">tokens</small>
-            </div>
-            <dl className="grid grid-cols-3 gap-[5px] [&_dd]:mt-[3px] [&_dd]:mb-0 [&_dd]:text-[10px] [&_dd]:text-muted [&_dt]:text-[8px] [&_dt]:text-faint [&_dt]:uppercase">
-              <div className="min-w-0"><dt>Input</dt><dd>{formatNumber(usage.input)}</dd></div>
-              <div className="min-w-0"><dt>Output</dt><dd>{formatNumber(usage.output)}</dd></div>
-              <div className="min-w-0"><dt>Cache read</dt><dd>{formatNumber(usage.cache)}</dd></div>
-            </dl>
-          </div>
-        </aside>
+              >
+                <span className={`size-1.5 rounded-full ${agent.status === "failed" ? "bg-danger" : agent.status === "completed" ? "bg-info" : agent.status === "ready" ? "bg-accent" : "bg-faint"}`} aria-hidden="true" />
+                <span className="max-w-28 truncate capitalize">{agent.id}</span>
+                <span className="text-[8px] text-faint">R{agent.round}</span>
+                {agent.pending_messages > 0 ? <span className="rounded bg-[#322617] px-1 text-[8px] text-warn">{agent.pending_messages}</span> : null}
+              </button>
+            );
+          })}
+        </nav>
+        <dl
+          className="flex shrink-0 items-center gap-2.5 border-l border-line-soft px-3 text-[9px] tabular-nums max-[520px]:gap-1.5 max-[520px]:px-2"
+          title="Session token usage"
+          aria-label="Session token usage"
+        >
+          <div className="flex items-center gap-1"><dt className="text-faint"><span className="max-[520px]:hidden">Input</span><abbr className="hidden no-underline max-[520px]:inline" title="Input">I</abbr></dt><dd className="m-0 text-muted">{formatNumber(usage.input)}</dd></div>
+          <div className="flex items-center gap-1"><dt className="text-faint"><span className="max-[520px]:hidden">Output</span><abbr className="hidden no-underline max-[520px]:inline" title="Output">O</abbr></dt><dd className="m-0 text-muted">{formatNumber(usage.output)}</dd></div>
+          <div className="flex items-center gap-1"><dt className="text-faint"><span className="max-[520px]:hidden">Cached</span><abbr className="hidden no-underline max-[520px]:inline" title="Cached">C</abbr></dt><dd className="m-0 text-muted">{formatNumber(usage.cache)}</dd></div>
+        </dl>
       </div>
+
+      <section className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div
+          className="min-h-0 flex-1 overflow-y-auto px-[26px] pt-5 pb-6 max-[780px]:px-4"
+          ref={threadRef}
+          aria-live="polite"
+          onScroll={(event) => {
+            const element = event.currentTarget;
+            followsLatest.current =
+              element.scrollHeight - element.scrollTop - element.clientHeight < 100;
+          }}
+        >
+          <AgentThread agent={selectedAgent} />
+        </div>
+
+        <form className="mx-[26px] mb-3.5 rounded-xl border border-[#30383d] bg-[#121619] px-3 pt-2 pb-2 shadow-[0_16px_50px_rgba(0,0,0,.2)] focus-within:border-[#536644] max-[780px]:mx-4" onSubmit={(event) => void submitMessage(event)}>
+          <textarea className="block min-h-11 w-full resize-y border-0 bg-transparent px-1 py-1.5 leading-normal text-ink outline-0 placeholder:text-[#535c58]"
+            rows={2}
+            value={message}
+            onChange={(event) => setMessage(event.target.value)}
+            onKeyDown={handleComposerKeyDown}
+            placeholder="Message the selected agent…"
+            required
+          />
+          <div className="flex items-center gap-2 border-t border-line-soft pt-1.5 text-[9px] text-faint">
+            <span className="min-w-0 truncate">To <strong className="font-semibold text-accent">{selectedAgent.id}</strong></span>
+            <span className="ml-auto max-[520px]:hidden">⌘ Enter to send</span>
+            <button className={`${primaryButton} shrink-0 px-3 py-1.5 text-[10px]`} type="submit" disabled={sending}>
+              {sending ? "Sending…" : "Send"} <span aria-hidden="true">↗</span>
+            </button>
+          </div>
+        </form>
+      </section>
     </section>
   );
 }
@@ -259,8 +226,10 @@ function CompactButton({
       title={title}
       disabled={requesting || compaction.pending || !hasMessages}
       onClick={onCompact}
+      aria-label={label}
     >
-      {label}
+      <span className="max-[520px]:hidden">{label}</span>
+      <span className="hidden text-sm max-[520px]:inline" aria-hidden="true">↙</span>
     </button>
   );
 }
@@ -357,37 +326,6 @@ function ContentView({ content }: { content: MessageContent }) {
     case "document":
       return <div className="mt-[10px] first:mt-0">[document]</div>;
   }
-}
-
-function AgentCard({
-  agent,
-  active,
-  onClick,
-}: {
-  agent: Agent;
-  active: boolean;
-  onClick: () => void;
-}) {
-  const tokens = agent.stats.input_tokens + agent.stats.output_tokens;
-  return (
-    <button
-      className={`w-full rounded-[10px] border p-[11px] text-left text-muted transition ${active ? "border-[#45563b] bg-[#171e15]" : "border-line-soft bg-[#121619] hover:border-[#354039]"}`}
-      type="button"
-      onClick={onClick}
-    >
-      <div className="flex items-center gap-2">
-        <span className="grid size-6 place-items-center rounded-[7px] border border-[#34402e] bg-[#171e14] text-[10px] font-extrabold text-accent">{agent.id.slice(0, 1).toUpperCase()}</span>
-        <strong className="text-xs text-ink capitalize">{agent.id}</strong>
-        <span className={`ml-auto rounded-[5px] px-[5px] py-[3px] text-[8px] tracking-[.08em] uppercase ${agent.status === "ready" ? "bg-[#26351e] text-accent" : agent.status === "completed" ? "bg-[#18232b] text-info" : agent.status === "failed" ? "bg-[#271716] text-danger" : "bg-[#1b2023] text-faint"}`}>{agent.status}</span>
-      </div>
-      <p className="my-[9px] line-clamp-2 text-[10px] leading-[1.45] text-faint">{agent.role}</p>
-      <div className="flex gap-[11px] text-[9px] text-[#5c6661]">
-        <span>{agent.kind === "mcp" ? "MCP specialist" : `round ${agent.round}`}</span>
-        <span>{formatNumber(tokens)} tokens</span>
-        {agent.pending_messages > 0 ? <span>{agent.pending_messages} queued</span> : null}
-      </div>
-    </button>
-  );
 }
 
 function contentText(content: MessageContent): string {
