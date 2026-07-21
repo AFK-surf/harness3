@@ -149,11 +149,6 @@ pub type Event {
   ToolFinished(id: String, name: String, is_error: Bool)
 }
 
-pub type Disposition {
-  Continue
-  Complete
-}
-
 pub opaque type Active {
   Active(state: State, config: Config, plugins: PluginHost)
 }
@@ -347,10 +342,6 @@ fn plugin_states(host: PluginHost) -> PluginSnapshot {
   process.call_forever(subject, GetStates)
 }
 
-pub type RoundResult {
-  RoundResult(active: Active, state: State, disposition: Disposition)
-}
-
 type Part {
   TextPart(text: String)
   ReasoningPart(summary: String, encrypted: Option(llm.EncryptedReasoning))
@@ -374,60 +365,6 @@ type AccumulatorMessage {
   Consume(llm.Event, Subject(Result(Nil, Error)))
   Read(Subject(Accumulator))
   StopAccumulator
-}
-
-pub fn run_round(
-  active: Active,
-  router: CallbackRouter,
-  observe: fn(Event) -> Result(Nil, Error),
-) -> Result(RoundResult, Error) {
-  let Active(state:, config:, plugins:) = active
-  use accumulated <- result.try(run_model(
-    active,
-    normal_request_messages(state, plugins),
-    config.max_output_tokens,
-    observe,
-  ))
-  use _ <- result.try(validate_finish(accumulated.finish))
-  use assistant_content <- result.try(parts_to_content(accumulated.parts))
-  let assistant = llm.Message(llm.Assistant, assistant_content)
-  use tool_messages <- result.try(execute_tools(
-    plugins,
-    router,
-    assistant_content,
-    observe,
-  ))
-  let additions = [assistant, ..tool_messages]
-  let messages = list.append(state.messages, additions)
-  let context_messages = case state.context_messages {
-    None -> None
-    Some(context) -> Some(list.append(context, additions))
-  }
-  let disposition = case accumulated.finish, tool_messages {
-    Some(llm.Paused), _ -> Continue
-    _, [] -> Complete
-    _, _ -> Continue
-  }
-  let status = case disposition {
-    Continue -> Ready
-    Complete -> Completed
-  }
-  let PluginSnapshot(generation:, states:) = plugin_states(plugins)
-  let state =
-    State(
-      ..state,
-      round: state.round + 1,
-      messages:,
-      context_messages:,
-      stats: add_stats(state.stats, accumulated.stats),
-      plugin_states: states,
-      plugin_generation: generation,
-      last_catalog_revision: Some(config.catalog_revision),
-      last_context_tokens: context_tokens(accumulated),
-      status:,
-    )
-  let active = Active(state, config, plugins)
-  Ok(RoundResult(active, state, disposition))
 }
 
 fn normal_request_messages(
@@ -897,37 +834,6 @@ fn parts_to_content(
 
 @external(erlang, "gleam_stdlib", "identity")
 fn raw_json(value: String) -> Json
-
-fn execute_tools(
-  host: PluginHost,
-  router: CallbackRouter,
-  content: List(llm.Content),
-  observe: fn(Event) -> Result(Nil, Error),
-) -> Result(List(llm.Message), Error) {
-  content
-  |> list.filter_map(fn(part) {
-    case part {
-      llm.ToolCall(id, name, arguments) ->
-        Ok(#(id, name, json.to_string(arguments)))
-      _ -> Error(Nil)
-    }
-  })
-  |> list.try_fold([], fn(messages, call) {
-    let #(id, name, arguments) = call
-    use _ <- result.try(observe(ToolStarted(id, name)))
-    let PluginHost(subject) = host
-    use output <- result.try(
-      process.call_forever(subject, fn(reply) {
-        InvokeTool(name, plugin.ToolInvocation(id, arguments), router, reply)
-      }),
-    )
-    let plugin.ToolOutput(content, is_error) = output
-    use _ <- result.try(observe(ToolFinished(id, name, is_error)))
-    let message =
-      llm.Message(llm.ToolRole, [llm.ToolResult(id, content, is_error)])
-    Ok(list.append(messages, [message]))
-  })
-}
 
 pub type CommitReceipt {
   CommitReceipt(state: State, group_revision: Int)

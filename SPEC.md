@@ -283,7 +283,8 @@ include the synthesized system prompt.
 
 ### 6.2 Round loop
 
-`run_round`:
+Each round (the loop is internal to the worker; there is no public single-round entry
+point):
 1. Builds the request: plugin system prompt (all sections joined as `## name\n\nbody`)
    prepended as a System message when non-empty; tools = all plugin tools.
 2. Runs the transport; retryable LLM failures repeat the identical request forever with
@@ -314,7 +315,7 @@ include the synthesized system prompt.
 
 - The plugin host is a dedicated actor owning the plugin runtime; the worker process,
   spawned unlinked and then linked to the plugin host, waits on a release gate (60 s
-  max), then loops `run_round` → `commit` until Complete/Failed, stops the plugin host,
+  max), then loops round → `commit` until Completed/Failed, stops the plugin host,
   and fires `on_exit`.
 - Commits go through an injected `Checkpointer` with the expected agent revision. The
   commit *returns the authoritative state*: if the coordinator merged queued inbox
