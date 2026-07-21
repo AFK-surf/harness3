@@ -24,7 +24,12 @@ fn auth_json(access: String, refresh: String, expires: Int) -> String {
   <> ",\"accountId\":\"acct-1\"}}"
 }
 
-fn write_auth(path: String, access: String, refresh: String, expires: Int) -> Nil {
+fn write_auth(
+  path: String,
+  access: String,
+  refresh: String,
+  expires: Int,
+) -> Nil {
   let assert Ok(Nil) =
     simplifile.write(to: path, contents: auth_json(access, refresh, expires))
   Nil
@@ -44,7 +49,10 @@ pub fn load_reads_oauth_entry_test() {
 pub fn load_reports_missing_entry_test() {
   let path = temporary_path("harness3-oauth-missing")
   let assert Ok(Nil) =
-    simplifile.write(to: path, contents: "{\"zai\":{\"type\":\"api_key\",\"key\":\"x\"}}")
+    simplifile.write(
+      to: path,
+      contents: "{\"zai\":{\"type\":\"api_key\",\"key\":\"x\"}}",
+    )
   assert openai_oauth.load(path) == Error(openai_oauth.MissingCredentials)
   let assert Ok(Nil) = simplifile.delete(path)
 }
@@ -65,7 +73,8 @@ pub fn ensure_fresh_refreshes_and_persists_test() {
     assert token == "refresh-1"
     Ok(openai_oauth.Refreshed("access-2", Some("refresh-2"), Some(3600)))
   }
-  let assert Ok(credentials) = openai_oauth.ensure_fresh_with(path, 1000, refresh)
+  let assert Ok(credentials) =
+    openai_oauth.ensure_fresh_with(path, 1000, refresh)
   assert credentials.access == "access-2"
   assert credentials.refresh == "refresh-2"
   assert credentials.expires == 1000 + 3_600_000
@@ -83,7 +92,8 @@ pub fn ensure_fresh_keeps_old_refresh_when_not_rotated_test() {
   let path = temporary_path("harness3-oauth-keep-refresh")
   write_auth(path, "access-1", "refresh-1", 1000)
   let refresh = fn(_) { Ok(openai_oauth.Refreshed("access-2", None, None)) }
-  let assert Ok(credentials) = openai_oauth.ensure_fresh_with(path, 1000, refresh)
+  let assert Ok(credentials) =
+    openai_oauth.ensure_fresh_with(path, 1000, refresh)
   assert credentials.refresh == "refresh-1"
   assert credentials.expires == 1000 + 3_600_000
   let assert Ok(Nil) = simplifile.delete(path)
@@ -98,7 +108,8 @@ pub fn ensure_fresh_accepts_concurrent_refresh_test() {
     write_auth(path, "access-2", "refresh-2", 9_999_999_999_999)
     Error(openai_oauth.RefreshFailed("refresh token already used"))
   }
-  let assert Ok(credentials) = openai_oauth.ensure_fresh_with(path, 1000, refresh)
+  let assert Ok(credentials) =
+    openai_oauth.ensure_fresh_with(path, 1000, refresh)
   assert credentials.access == "access-2"
   assert credentials.refresh == "refresh-2"
   let assert Ok(Nil) = simplifile.delete(path)

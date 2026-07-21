@@ -6,7 +6,8 @@ import harness3/llm
 import harness3/llm/openai_codex
 import harness3/llm/openai_oauth
 
-fn test_credentials() -> fn() -> Result(openai_oauth.Credentials, openai_oauth.Error) {
+fn test_credentials() -> fn() ->
+  Result(openai_oauth.Credentials, openai_oauth.Error) {
   fn() {
     Ok(openai_oauth.Credentials(
       access: "access-token",
@@ -35,9 +36,13 @@ pub fn codex_request_shape_test() {
         llm.Message(llm.User, [llm.Text("hello")]),
       ],
       tools: [
-        llm.Tool("coding.read", Some("Read a file"), json.object([
-          #("type", json.string("object")),
-        ])),
+        llm.Tool(
+          "coding.read",
+          Some("Read a file"),
+          json.object([
+            #("type", json.string("object")),
+          ]),
+        ),
       ],
       max_output_tokens: Some(1024),
       reasoning_effort: None,
@@ -58,7 +63,10 @@ pub fn codex_request_shape_test() {
 
   assert string.contains(body, "\"store\":false")
   assert string.contains(body, "\"stream\":true")
-  assert string.contains(body, "\"instructions\":\"You are a careful coding agent.")
+  assert string.contains(
+    body,
+    "\"instructions\":\"You are a careful coding agent.",
+  )
   assert string.contains(body, "\"verbosity\":\"low\"")
   assert string.contains(body, "reasoning.encrypted_content")
   assert string.contains(body, "\"tool_choice\":\"auto\"")
@@ -103,7 +111,10 @@ pub fn codex_decodes_wire_tool_names_test() {
     <> "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{}\"}\n\n"
     <> "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"status\":\"completed\"}}\n\n"
   let assert Ok(events) = llm.decode_response(test_provider(), 200, sse)
-  assert list.contains(events, llm.ToolCallStart(0, "call_1", "team.message_agent"))
+  assert list.contains(
+    events,
+    llm.ToolCallStart(0, "call_1", "team.message_agent"),
+  )
 }
 
 pub fn codex_request_default_instructions_test() {
@@ -111,7 +122,10 @@ pub fn codex_request_default_instructions_test() {
     llm.request("gpt-5.5", [llm.Message(llm.User, [llm.Text("hello")])])
   let assert Ok(llm.HttpRequest(body:, ..)) =
     llm.build_request(test_provider(), request)
-  assert string.contains(body, "\"instructions\":\"You are a helpful assistant.\"")
+  assert string.contains(
+    body,
+    "\"instructions\":\"You are a helpful assistant.\"",
+  )
 }
 
 pub fn codex_url_suffixes_test() {
@@ -125,7 +139,10 @@ pub fn codex_url_suffixes_test() {
   }
   let request = llm.request("gpt-5.5", [])
   let assert Ok(llm.HttpRequest(url:, ..)) =
-    llm.build_request(openai_codex.new(config("https://chatgpt.com/backend-api/")), request)
+    llm.build_request(
+      openai_codex.new(config("https://chatgpt.com/backend-api/")),
+      request,
+    )
   assert url == "https://chatgpt.com/backend-api/codex/responses"
   let assert Ok(llm.HttpRequest(url:, ..)) =
     llm.build_request(
