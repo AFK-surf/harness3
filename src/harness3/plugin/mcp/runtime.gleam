@@ -6,7 +6,6 @@
 //// one agent can never tear down or block another's servers through shared
 //// state.
 
-import exception
 import gleam/erlang/process.{type Subject}
 import gleam/otp/actor
 import gleam/result
@@ -82,56 +81,41 @@ pub fn catalog(runtime: Runtime) -> catalog.Catalog {
   process.call_forever(subject, GetCatalog)
 }
 
+/// A dead runtime crashes the caller: the runtime is node-level
+/// infrastructure, and losing it is not a condition callers can handle.
 pub fn put_configuration(
   runtime: Runtime,
   configuration: configuration.Configuration,
 ) -> Result(Nil, String) {
   let Runtime(subject) = runtime
-  exception.rescue(fn() {
-    process.call(subject, 5000, fn(reply) {
-      PutConfiguration(configuration, reply)
-    })
+  process.call(subject, 5000, fn(reply) {
+    PutConfiguration(configuration, reply)
   })
-  |> result.map_error(fn(_) { "MCP runtime is unavailable" })
-  |> result.flatten
 }
 
 /// Looks up a configuration. Every call here is served from memory, so it is
-/// safe from any process — including the group coordinator.
+/// safe from any process — including the group coordinator. A dead runtime
+/// crashes the caller.
 pub fn configuration(
   runtime: Runtime,
   configuration_id: String,
 ) -> Result(configuration.Configuration, String) {
   let Runtime(subject) = runtime
-  exception.rescue(fn() {
-    process.call(subject, 5000, fn(reply) {
-      GetConfiguration(configuration_id, reply)
-    })
+  process.call(subject, 5000, fn(reply) {
+    GetConfiguration(configuration_id, reply)
   })
-  |> result.map_error(fn(_) { "MCP runtime is unavailable" })
-  |> result.flatten
 }
 
-/// Looks up a configuration with load-error semantics: a dead runtime is a
-/// retryable `Unavailable`, while "gone or disabled" is an authoritative
-/// `Revoked` — the only answer that may tear down an agent's live
-/// transports.
+/// Looks up a configuration with load-error semantics: "gone or disabled" is
+/// an authoritative `Revoked` — the answer that tears down an agent's live
+/// transports. A dead runtime crashes the caller rather than masquerading as
+/// a load error.
 pub fn load_configuration(
   runtime: Runtime,
   configuration_id: String,
 ) -> Result(configuration.Configuration, connections.LoadError) {
-  let Runtime(subject) = runtime
-  case
-    exception.rescue(fn() {
-      process.call(subject, 5000, fn(reply) {
-        GetConfiguration(configuration_id, reply)
-      })
-    })
-  {
-    Error(_) -> Error(connections.Unavailable("MCP runtime is unavailable"))
-    Ok(Error(reason)) -> Error(connections.Revoked(reason))
-    Ok(Ok(configuration)) -> Ok(configuration)
-  }
+  configuration(runtime, configuration_id)
+  |> result.map_error(connections.Revoked)
 }
 
 /// Resolves everything an agent needs to open its own connections, with the
@@ -142,12 +126,9 @@ pub fn load_configuration(
 pub fn loader_spec(
   runtime: Runtime,
   load: fn() -> Result(configuration.Configuration, connections.LoadError),
-) -> Result(connections.Spec, String) {
+) -> connections.Spec {
   let Runtime(subject) = runtime
-  exception.rescue(fn() {
-    process.call(subject, 5000, fn(reply) { GetLoaderSpec(load, reply) })
-  })
-  |> result.map_error(fn(_) { "MCP runtime is unavailable" })
+  process.call(subject, 5000, fn(reply) { GetLoaderSpec(load, reply) })
 }
 
 pub fn stop(runtime: Runtime) -> Nil {

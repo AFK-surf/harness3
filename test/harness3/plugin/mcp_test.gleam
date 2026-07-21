@@ -121,7 +121,7 @@ pub fn activation_never_touches_mcp_servers_test() {
       fn() { 1234 },
       connector,
     )
-  let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
+  let assert Ok(_current) = runtime.configuration(mcp_runtime, "research")
   let assert Ok(registry) =
     harness_plugin.registry([
       mcp_plugin.new(mcp_runtime, fn() {
@@ -146,7 +146,7 @@ pub fn each_agent_owns_its_own_connections_test() {
       fn() { 1234 },
       connector,
     )
-  let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
+  let assert Ok(_current) = runtime.configuration(mcp_runtime, "research")
 
   // Two agents, each with its own activated plugin runtime.
   let assert Ok(registry) =
@@ -290,7 +290,7 @@ pub fn releasing_the_plugin_closes_its_transports_test() {
       fn() { 1234 },
       connector,
     )
-  let assert Ok(current) = runtime.configuration(mcp_runtime, "research")
+  let assert Ok(_current) = runtime.configuration(mcp_runtime, "research")
   let assert Ok(registry) =
     harness_plugin.registry([
       mcp_plugin.new(mcp_runtime, fn() {
@@ -560,7 +560,7 @@ pub fn discovery_excludes_failed_servers_without_failing_test() {
       fn() { 1234 },
       connector,
     )
-  let assert Ok(current) = runtime.configuration(mcp_runtime, "mixed")
+  let assert Ok(_current) = runtime.configuration(mcp_runtime, "mixed")
   let assert Ok(registry) =
     harness_plugin.registry([
       mcp_plugin.new(mcp_runtime, fn() {
@@ -630,8 +630,7 @@ pub fn composio_streamable_http_smoke_test() {
       let assert Ok(value) =
         catalog.put_configuration(catalog.new(), configuration)
       let assert Ok(mcp_runtime) = runtime.start(value, envoy.get, fn() { 0 })
-      let assert Ok(spec) =
-        runtime.loader_spec(mcp_runtime, fn() { Ok(configuration) })
+      let spec = runtime.loader_spec(mcp_runtime, fn() { Ok(configuration) })
       let #(connections, listed) = connections.list(connections.new(spec))
       let assert Ok(listing) = listed
       assert !list.is_empty(listing.tools)

@@ -196,9 +196,8 @@ pub fn workspace_root(service: Service) -> String {
 /// load from, so the management view is identical on every node.
 pub fn mcp_configurations(
   service: Service,
-) -> Result(List(mcp_configuration.Configuration), String) {
-  read_mcp_catalog(service.storage)
-  |> result.map(mcp_catalog.configurations)
+) -> List(mcp_configuration.Configuration) {
+  read_mcp_catalog(service.storage) |> mcp_catalog.configurations
 }
 
 pub fn stop(service: Service) -> Nil {
@@ -846,15 +845,18 @@ pub fn remove_mcp_server(
   Ok(configuration)
 }
 
-/// The durable MCP catalog, absent-tolerant: the catalog object is created
-/// lazily on the first mutation, so a missing object is an empty catalog.
-fn read_mcp_catalog(backend: Storage) -> Result(mcp_catalog.Catalog, String) {
+/// The durable MCP catalog. `start_mcp` creates the catalog object on first
+/// boot, so after startup it always exists: a read failure — including
+/// NotFound — is an infrastructure fault or out-of-band interference, never a
+/// legitimate "no MCP configured" state, and crashes the calling process
+/// rather than being mapped to an answer. In an agent's plugin host that
+/// crash closes the linked transports and hands recovery to the tool
+/// journal; in a web request it fails that request.
+fn read_mcp_catalog(backend: Storage) -> mcp_catalog.Catalog {
   case mcp_catalog.resume(backend, mcp_catalog_key) {
-    Ok(session) -> Ok(mcp_catalog.catalog(session))
-    Error(mcp_catalog.StorageFailed(storage.NotFound(_))) ->
-      Ok(mcp_catalog.new())
+    Ok(session) -> mcp_catalog.catalog(session)
     Error(error) ->
-      Error("could not load MCP catalog: " <> string.inspect(error))
+      panic as { "MCP catalog unreadable: " <> string.inspect(error) }
   }
 }
 
@@ -888,18 +890,15 @@ fn aggregate_configuration(
 }
 
 /// The MCP specialist plugin's configuration loader: reads the durable
-/// catalog from storage on every activation and discovery, so catalog edits
-/// reach agents on every node with no profile or runtime synchronization. A
-/// storage failure is never an authoritative revocation, so live transports
-/// are left alone.
+/// catalog from storage on every connection discovery, so catalog edits
+/// reach agents on every node with no profile or runtime synchronization.
+/// The aggregate always exists, so the loader never revokes; storage faults
+/// crash the invoking plugin host, whose exit closes the linked transports
+/// and hands recovery to the coordinator's tool journal.
 fn mcp_configuration_loader(
   backend: Storage,
 ) -> fn() -> Result(mcp_configuration.Configuration, mcp_connections.LoadError) {
-  fn() {
-    read_mcp_catalog(backend)
-    |> result.map(aggregate_configuration)
-    |> result.map_error(mcp_connections.Unavailable)
-  }
+  fn() { Ok(aggregate_configuration(read_mcp_catalog(backend))) }
 }
 
 fn aggregate_server_id(configuration_id: String, server_id: String) -> String {
@@ -1244,22 +1243,15 @@ fn validate_update(
         False -> Error("unknown model: " <> normalized.model_id)
       },
     )
-    use _ <- result.try(case normalized.kind {
-      CodingAgent | ResearchAgent -> Ok(Nil)
-      McpSpecialist ->
-        read_mcp_catalog(service.storage)
-        |> result.map(fn(_) { Nil })
-    })
     Ok([normalized, ..validated])
   })
   |> result.map(list.reverse)
 }
 
 fn has_mcp_servers(service: Service) -> Bool {
-  case read_mcp_catalog(service.storage) {
-    Ok(catalog) -> !list.is_empty(aggregate_configuration(catalog).servers)
-    Error(_) -> False
-  }
+  !list.is_empty(
+    aggregate_configuration(read_mcp_catalog(service.storage)).servers,
+  )
 }
 
 /// Validates and normalizes an absolute workspace path.

@@ -250,10 +250,15 @@ event-consumer failures are permanent.
 
 - MCP configuration is application-owned and durable through a CAS catalog analogous
   to the model catalog. Configurations contain one or more servers and are referenced
-  by stable ID. The broker plugin itself is stateless (its durable state is empty):
-  it is constructed with a configuration *loader*, called at every activation and on
-  every connection discovery, so configuration edits reach running agents without the
-  plugin holding a snapshot. Credentials may be
+  by stable ID. The broker plugin itself is stateless (its durable state is empty,
+  and it registers no activation hook): it is constructed with a configuration
+  *loader*, called on every connection discovery — which runs in the agent's own
+  plugin host, never the coordinator — so configuration edits reach running agents
+  without the plugin holding a snapshot. Loaders return `Revoked` only for
+  authoritative "gone or disabled" answers (the one thing that tears down live
+  transports); infrastructure faults crash the loader instead of being mapped to
+  errors, taking the plugin host and its linked transports with it and handing
+  recovery to the coordinator's tool journal. Credentials may be
   literal or environment-variable bindings. Stdio executables and working directories
   must be absolute; HTTP endpoints must be absolute HTTP(S) URLs.
 - The runtime supports MCP 2025-11-25 over newline-delimited stdio and Streamable HTTP.
@@ -301,12 +306,14 @@ event-consumer failures are permanent.
   generic plugins through the durable group/agent attributes and the
   activation host. Profiles are installed exactly once, at boot, and never
   uninstalled or rewritten: the MCP researcher plugin holds no configuration
-  at all — a loader reads the durable MCP catalog from storage at every agent
-  activation (validating it is loadable before the agent runs) and on every
+  at all — a loader reads the durable MCP catalog from storage on every
   connection discovery, so catalog edits reach agents on every node with no
-  profile or runtime synchronization. A loader failure surfaces as
-  `Unavailable` and leaves live transports alone; only an authoritative
-  `Revoked` answer tears them down.
+  profile or runtime synchronization. The catalog object always exists after
+  first boot (`start_mcp` persists an empty catalog when none is found), so a
+  read failure — including NotFound — is an infrastructure fault, never "no
+  MCP configured", and crashes the reading process: an agent's plugin host
+  (closing its linked transports; the tool journal recovers the call as
+  outcome-unknown), or the web request that asked.
 
 ## 5. Model catalog
 

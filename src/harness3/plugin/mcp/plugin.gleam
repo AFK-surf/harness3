@@ -19,12 +19,14 @@ type BrokerCall {
   BrokerCall(tool: String, arguments: json.Json)
 }
 
-/// Supplies the plugin's MCP configuration. Called at every activation (to
-/// validate that the configuration is loadable before the agent runs) and on
-/// every connection discovery, so configuration edits reach running agents
-/// without the plugin holding any snapshot. Typically reads a durable
-/// catalog. `Unavailable` means the catalog could not be reached and leaves
-/// live transports alone; `Revoked` is authoritative and tears them down.
+/// Supplies the plugin's MCP configuration, called on every connection
+/// discovery so configuration edits reach running agents without the plugin
+/// holding any snapshot. Typically reads a durable catalog. `Unavailable`
+/// means the catalog could not be reached and leaves live transports alone;
+/// `Revoked` is authoritative and tears them down. Infrastructure faults
+/// should crash the loader rather than be mapped to errors: it runs in the
+/// agent's own plugin host, whose crash closes the linked transports and
+/// hands recovery to the coordinator's tool journal.
 pub type ConfigurationLoader =
   fn() -> Result(configuration.Configuration, connections.LoadError)
 
@@ -37,26 +39,6 @@ pub fn new(
     "MCP specialist",
     "You have brokered access to external MCP resources. Use `mcp.list` to inspect the tools currently available from reachable MCP servers, then use `mcp.call` with one of the returned identifiers. Unreachable servers are excluded. You have no filesystem or shell access. External tools may read or change remote systems, so use them deliberately and report concrete sources and results to the lead agent.",
   ))
-  |> plugin.on_activate(
-    plugin.activation_hook(fn(_state, context) {
-      // Activation runs inside the group coordinator, which also services its
-      // own lease renewal, so it must never touch MCP servers. The
-      // configuration is loaded fresh here — validating that the catalog is
-      // reachable before the agent runs; connections are opened lazily by the
-      // tools below, which run in this agent's own plugin host.
-      use _ <- result.try(
-        load()
-        |> result.map_error(fn(error) {
-          let reason = case error {
-            connections.Unavailable(reason) -> reason
-            connections.Revoked(reason) -> reason
-          }
-          plugin.HookFailed(plugin_name, "activation", reason)
-        }),
-      )
-      Ok(plugin.hook_result("{}", context, Nil))
-    }),
-  )
   |> plugin.on_release(
     plugin.release_hook(fn(_state, context) {
       // Transports survive the plugin host's normal exit (a normal exit signal
@@ -216,14 +198,11 @@ fn with_connections(
       let #(connections, output) = use_connections(connections)
       #(plugin.set_resource(context, to_dynamic(connections)), output)
     }
-    None ->
-      case runtime.loader_spec(mcp_runtime, load) {
-        Error(error) -> #(context, plugin.ToolOutput([llm.Text(error)], True))
-        Ok(spec) -> {
-          let #(connections, output) = use_connections(connections.new(spec))
-          #(plugin.set_resource(context, to_dynamic(connections)), output)
-        }
-      }
+    None -> {
+      let spec = runtime.loader_spec(mcp_runtime, load)
+      let #(connections, output) = use_connections(connections.new(spec))
+      #(plugin.set_resource(context, to_dynamic(connections)), output)
+    }
   }
 }
 
