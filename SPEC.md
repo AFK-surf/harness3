@@ -18,7 +18,7 @@ through storage objects (CAS writes, leases) plus token-authenticated HTTP RPC.
 | `llm/anthropic_messages`, `llm/openai_chat_completions`, `llm/openai_responses` | Provider adapters: build HTTP requests, decode buffered/streamed responses into neutral events |
 | `model_catalog` | Durable, versioned catalog of models (id → name/endpoint/type/credentials), CAS-committed |
 | `plugin` | Plugin registry/runtime: system-prompt sections, tools, callbacks, activation hooks, JSON state per plugin |
-| `plugin/cloud_storage/*` | Agent-group-scoped durable text-object CRUD, pagination, and direct transfer URLs |
+| `plugin/cloud_storage/*` | Prefix-scoped durable text-object CRUD, pagination, and direct transfer URLs |
 | `plugin/mcp/*` | Reusable MCP configuration/catalog, client, stdio and Streamable HTTP transports, per-agent connections, and harness plugin adapter |
 | `agent` | Single agent: round loop (LLM call → tool execution → commit), streaming accumulator, plugin host actor, durable state (de)serialization |
 | `agent_profile` | Node-local ETS registry of installed profiles (id → plugin registry, transport, observer, limits) |
@@ -197,17 +197,31 @@ event-consumer failures are permanent.
 
 ### 4.1 Cloud storage plugin
 
-- `cloud_storage.new(storage, group_id)` gives an agent read, write, list, delete,
-  and direct upload/download URL tools over a namespace isolated to that agent group.
-  Logical keys are safe relative paths; group IDs are hashed before becoming backend
-  prefixes, preventing traversal or access to another group's objects.
+- `cloud_storage.new(storage, prefix)` gives an agent read, write, list, delete,
+  and direct upload/download URL tools over a namespace rooted at an
+  independently configurable storage prefix. The prefix must be a non-empty
+  safe relative path (a trailing slash is implied); logical keys are safe
+  relative paths resolved under it, so agents cannot traverse outside their
+  prefix or into another namespace. Plugins built with the same prefix share
+  objects; different prefixes stay isolated.
 - Objects handled directly by the tools are UTF-8 text. Listing is lexicographic and
   keyset-paginated with opaque cursors. Transfer URLs are backend-provided and expire
   after five minutes where supported.
-- `harness3-server` installs a separately constructed cloud-storage plugin in every
-  agent profile, using the session ID as the common group scope. Coding, non-MCP
-  research, and MCP specialist agents therefore share durable objects within a session
-  while sessions remain isolated.
+- `harness3-server` manages durable *cloud storage workspaces* (id, label,
+  prefix) in a CAS-committed catalog at
+  `harness3-server/cloud-storage-workspaces`, created lazily on the first
+  mutation, and exposes add/edit/delete over its web API and UI. A blank
+  prefix defaults to `plugins/cloud_storage/workspaces/<id>/objects/`;
+  prefixes overlapping the harness control-plane namespaces (`cluster/`,
+  `harness3-server/`) are rejected. Each session records an optional
+  workspace association in its group attributes (an empty-string upsert
+  clears it); associated sessions resolve the workspace's current prefix
+  whenever their profiles are built, while unassociated sessions get an
+  isolated namespace at `plugins/cloud_storage/sessions/<session id>/objects/`.
+  A workspace cannot be deleted while a session
+  references it, its stored objects are never deleted with it, and changing
+  a session's association stops and re-wakes the team like a roster change
+  because running agents hold their scope in an activated plugin.
 
 ### 4.2 MCP plugin
 
@@ -241,7 +255,7 @@ event-consumer failures are permanent.
   configuration, namespacing server IDs with an injective source-configuration
   prefix. The agent editor therefore exposes one MCP researcher resource profile,
   not one profile per configuration. A configured team assigns that researcher
-  `mcp.list`, `mcp.call`, `team.message_agent`, and group
+  `mcp.list`, `mcp.call`, `team.message_agent`, and the session's
   `cloud_storage.*` tools, but no filesystem or shell capability. Coding agents
   receive `coding.read`, `coding.write`, `coding.exec`, `team.message_agent`, and
   `cloud_storage.*`, but no MCP tools. The lead may message all subagents; every

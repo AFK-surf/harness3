@@ -23,6 +23,7 @@ import harness3/plugin/mcp
 import harness3/plugin/mcp/catalog as mcp_catalog
 import harness3/plugin/mcp/configuration as mcp_configuration
 import harness3/storage.{type Storage}
+import harness3_server/cloud_storage_workspaces as storage_workspaces
 import harness3_server/coding_plugin
 import harness3_server/config.{type ModelConfig}
 import harness3_server/storage_config
@@ -32,6 +33,8 @@ import simplifile
 const catalog_key = "harness3-server/catalog"
 
 const mcp_catalog_key = "harness3-server/mcp-catalog"
+
+const workspaces_catalog_key = "harness3-server/cloud-storage-workspaces"
 
 const all_mcp_configuration_id = "__harness3_server_all_mcp_servers__"
 
@@ -44,6 +47,8 @@ const title_attribute = "title"
 const prompt_attribute = "prompt"
 
 const workspace_attribute = "workspace"
+
+const cloud_storage_workspace_attribute = "cloud_storage_workspace"
 
 const created_at_attribute = "created_at"
 
@@ -80,6 +85,9 @@ pub type SessionMetadata {
     title: String,
     prompt: String,
     workspace: String,
+    /// The associated cloud storage workspace ID. `None` gives the session
+    /// its own isolated namespace derived from the session ID.
+    cloud_storage_workspace: Option(String),
     created_at: Int,
     agents: List(AgentSpec),
   )
@@ -90,11 +98,27 @@ pub type Session {
 }
 
 pub type CreateInput {
-  CreateInput(model_id: String, workspace: String, team_size: Int)
+  CreateInput(
+    model_id: String,
+    workspace: String,
+    team_size: Int,
+    cloud_storage_workspace_id: Option(String),
+  )
+}
+
+/// How a session update treats the cloud storage workspace association:
+/// leave it alone, replace it, or clear it back to the isolated default.
+pub type WorkspaceAssociation {
+  KeepAssociation
+  SetAssociation(Option(String))
 }
 
 pub type UpdateInput {
-  UpdateInput(name: String, agents: List(AgentSpec))
+  UpdateInput(
+    name: String,
+    agents: List(AgentSpec),
+    cloud_storage_workspace: WorkspaceAssociation,
+  )
 }
 
 pub opaque type Service {
@@ -184,6 +208,7 @@ pub fn create_session(
       title: "New coding session",
       prompt: "",
       workspace:,
+      cloud_storage_workspace: input.cloud_storage_workspace_id,
       created_at: system_time(Second),
       agents:,
     )
@@ -237,11 +262,14 @@ pub fn get_session(service: Service, id: String) -> Result(Session, String) {
   load_group_view(service, id)
 }
 
-/// Replaces a session's durable name and agent roster. All updates go through
-/// the group's single writer: a live coordinator applies attribute upserts via
-/// the host-routed update RPC, while roster changes stop the group and ride
-/// the next wake's claim CAS. Surviving agent histories and plugin state are
-/// retained; newly added agents start dormant.
+/// Replaces a session's durable name and agent roster, and optionally its
+/// cloud storage workspace association. All updates go through the group's
+/// single writer: a live coordinator applies attribute upserts via the
+/// host-routed update RPC, while roster changes stop the group and ride the
+/// next wake's claim CAS. A workspace change takes the stop-and-wake path too,
+/// because running agents hold their storage scope in an activated plugin.
+/// Surviving agent histories and plugin state are retained; newly added
+/// agents start dormant.
 pub fn update_session(
   service: Service,
   id: String,
@@ -250,9 +278,23 @@ pub fn update_session(
   use agents <- result.try(validate_update(service, input))
   use session <- result.try(load_group_view(service, id))
   let Session(metadata: current_metadata, ..) = session
+  use association <- result.try(resolve_association(
+    service,
+    current_metadata,
+    input.cloud_storage_workspace,
+  ))
   let next_metadata =
-    SessionMetadata(..current_metadata, title: string.trim(input.name), agents:)
-  use _ <- result.try(case agents == current_metadata.agents {
+    SessionMetadata(
+      ..current_metadata,
+      title: string.trim(input.name),
+      cloud_storage_workspace: association,
+      agents:,
+    )
+  let association_changed =
+    association != current_metadata.cloud_storage_workspace
+  use _ <- result.try(case
+    agents == current_metadata.agents && !association_changed
+  {
     True ->
       apply_attribute_update(
         service,
@@ -260,9 +302,31 @@ pub fn update_session(
         dict.from_list([#(title_attribute, next_metadata.title)]),
         dict.new(),
       )
-    False -> update_session_roster(service, id, current_metadata, next_metadata)
+    False ->
+      update_session_roster(
+        service,
+        id,
+        current_metadata,
+        next_metadata,
+        association_changed,
+      )
   })
   load_group_view(service, id)
+}
+
+fn resolve_association(
+  service: Service,
+  current_metadata: SessionMetadata,
+  update: WorkspaceAssociation,
+) -> Result(Option(String), String) {
+  case update {
+    KeepAssociation -> Ok(current_metadata.cloud_storage_workspace)
+    SetAssociation(None) -> Ok(None)
+    SetAssociation(Some(workspace_id)) -> {
+      use _ <- result.try(find_workspace(service, workspace_id))
+      Ok(Some(workspace_id))
+    }
+  }
 }
 
 fn update_session_roster(
@@ -270,6 +334,7 @@ fn update_session_roster(
   id: String,
   current_metadata: SessionMetadata,
   next_metadata: SessionMetadata,
+  association_changed: Bool,
 ) -> Result(Nil, String) {
   // Construct every profile before stopping anything. A missing MCP
   // configuration or invalid plugin graph must leave the live team untouched.
@@ -297,12 +362,26 @@ fn update_session_roster(
   // A declarative roster command: the wake applies it to the state it reads
   // under its claim CAS, so surviving agents' histories and any concurrently
   // delivered messages are preserved by the owner, not by a caller snapshot.
-  // Upsert only what this edit actually changes (the title). Carrying the
-  // whole attribute view would write back snapshot values — a first message
-  // that set the prompt between our read and this wake must not be reverted.
+  // Upsert only what this edit actually changes (the title, and the cloud
+  // storage workspace when it moved). Carrying the whole attribute view would
+  // write back snapshot values — a first message that set the prompt between
+  // our read and this wake must not be reverted. Clearing the association is
+  // an empty-string upsert: group updates merge attributes and cannot delete
+  // keys, and the session view treats an empty value as unassociated.
+  let attribute_upserts = case association_changed {
+    True ->
+      dict.from_list([
+        #(title_attribute, next_metadata.title),
+        #(
+          cloud_storage_workspace_attribute,
+          option.unwrap(next_metadata.cloud_storage_workspace, ""),
+        ),
+      ])
+    False -> dict.from_list([#(title_attribute, next_metadata.title)])
+  }
   let update =
     agent_group.GroupUpdate(
-      attributes: dict.from_list([#(title_attribute, next_metadata.title)]),
+      attributes: attribute_upserts,
       agent_attributes: dict.new(),
       roster: Some(
         list.map(next_metadata.agents, fn(spec) {
@@ -856,17 +935,256 @@ fn persist_mcp_catalog(
   })
 }
 
+/// Lists the configured cloud storage workspaces. A server that has never
+/// written one has no catalog object yet and simply has no workspaces.
+pub fn cloud_storage_workspaces(
+  service: Service,
+) -> List(storage_workspaces.Workspace) {
+  case storage_workspaces.resume(service.storage, workspaces_catalog_key) {
+    Ok(session) ->
+      storage_workspaces.workspaces(storage_workspaces.catalog(session))
+    Error(_) -> []
+  }
+}
+
+/// Adds a cloud storage workspace. An empty prefix falls back to the default
+/// namespace derived from the workspace ID.
+pub fn add_cloud_storage_workspace(
+  service: Service,
+  id: String,
+  label: String,
+  prefix: String,
+) -> Result(storage_workspaces.Workspace, String) {
+  use workspace <- result.try(
+    storage_workspaces.validate_workspace(
+      storage_workspaces.Workspace(
+        id:,
+        label:,
+        prefix: normalize_workspace_prefix(id, prefix),
+      ),
+    )
+    |> result.map_error(workspace_error),
+  )
+  commit_workspace_change(
+    service,
+    fn(catalog) {
+      use _ <- result.try(case storage_workspaces.lookup(catalog, id) {
+        Ok(_) -> Error("cloud storage workspace already exists: " <> id)
+        Error(storage_workspaces.UnknownWorkspace(_)) -> Ok(Nil)
+        Error(error) -> Error(workspace_error(error))
+      })
+      storage_workspaces.put_workspace(catalog, workspace)
+      |> result.map(fn(next) { #(next, workspace) })
+      |> result.map_error(workspace_error)
+    },
+    3,
+  )
+}
+
+/// Replaces a workspace's label and prefix. The ID is a stable identity and
+/// cannot be renamed; sessions referencing the workspace resolve the new
+/// prefix the next time their profiles are built.
+pub fn update_cloud_storage_workspace(
+  service: Service,
+  id: String,
+  label: String,
+  prefix: String,
+) -> Result(storage_workspaces.Workspace, String) {
+  use workspace <- result.try(
+    storage_workspaces.validate_workspace(
+      storage_workspaces.Workspace(
+        id:,
+        label:,
+        prefix: normalize_workspace_prefix(id, prefix),
+      ),
+    )
+    |> result.map_error(workspace_error),
+  )
+  commit_workspace_change(
+    service,
+    fn(catalog) {
+      use _ <- result.try(
+        storage_workspaces.lookup(catalog, id)
+        |> result.map_error(workspace_error),
+      )
+      storage_workspaces.put_workspace(catalog, workspace)
+      |> result.map(fn(next) { #(next, workspace) })
+      |> result.map_error(workspace_error)
+    },
+    3,
+  )
+}
+
+/// Removes a workspace configuration. Objects already stored under its prefix
+/// are left untouched, but a session that still references the workspace
+/// blocks removal so it cannot lose its storage by accident.
+pub fn remove_cloud_storage_workspace(
+  service: Service,
+  id: String,
+) -> Result(Nil, String) {
+  use sessions <- result.try(list_sessions(service))
+  let referencing =
+    list.filter_map(sessions, fn(session) {
+      let Session(metadata:, ..) = session
+      case metadata.cloud_storage_workspace == Some(id) {
+        True -> Ok(metadata.id)
+        False -> Error(Nil)
+      }
+    })
+  use _ <- result.try(case referencing {
+    [] -> Ok(Nil)
+    _ ->
+      Error(
+        "cloud storage workspace `"
+        <> id
+        <> "` is still used by session(s): "
+        <> string.join(referencing, ", "),
+      )
+  })
+  commit_workspace_change(
+    service,
+    fn(catalog) {
+      storage_workspaces.remove_workspace(catalog, id)
+      |> result.map(fn(next) { #(next, Nil) })
+      |> result.map_error(workspace_error)
+    },
+    3,
+  )
+}
+
+fn normalize_workspace_prefix(id: String, prefix: String) -> String {
+  case string.trim(prefix) {
+    "" -> storage_workspaces.default_prefix(id)
+    prefix -> prefix
+  }
+}
+
+/// Resolves a workspace ID to its durable record, failing with the same
+/// "unknown" message whether the catalog is missing the ID or does not exist
+/// yet at all.
+fn find_workspace(
+  service: Service,
+  id: String,
+) -> Result(storage_workspaces.Workspace, String) {
+  case storage_workspaces.resume(service.storage, workspaces_catalog_key) {
+    Ok(session) ->
+      storage_workspaces.lookup(storage_workspaces.catalog(session), id)
+      |> result.map_error(workspace_error)
+    Error(storage_workspaces.StorageFailed(storage.NotFound(_))) ->
+      Error(storage_workspaces.UnknownWorkspace(id) |> workspace_error)
+    Error(error) ->
+      Error("could not load cloud storage workspaces: " <> workspace_error(error))
+  }
+}
+
+fn workspace_error(error: storage_workspaces.Error) -> String {
+  case error {
+    storage_workspaces.InvalidWorkspace(reason) -> reason
+    storage_workspaces.DuplicateWorkspace(id) ->
+      "duplicate cloud storage workspace ID: " <> id
+    storage_workspaces.UnknownWorkspace(id) ->
+      "unknown cloud storage workspace: " <> id
+    storage_workspaces.StorageFailed(error) ->
+      "cloud storage workspace storage failure: " <> string.inspect(error)
+    storage_workspaces.InvalidStoredCatalog(reason) ->
+      "stored cloud storage workspace catalog is invalid: " <> reason
+    storage_workspaces.ConcurrentUpdate ->
+      "cloud storage workspaces changed concurrently"
+  }
+}
+
+fn commit_workspace_change(
+  service: Service,
+  change: fn(storage_workspaces.Catalog) ->
+    Result(#(storage_workspaces.Catalog, value), String),
+  attempts: Int,
+) -> Result(value, String) {
+  use session <- result.try(resume_or_create_workspaces(service))
+  use #(next, value) <- result.try(change(storage_workspaces.catalog(session)))
+  case storage_workspaces.commit(session, next) {
+    Ok(_) -> Ok(value)
+    Error(storage_workspaces.ConcurrentUpdate) if attempts > 1 ->
+      commit_workspace_change(service, change, attempts - 1)
+    Error(error) ->
+      Error(
+        "could not persist cloud storage workspaces: " <> workspace_error(error),
+      )
+  }
+}
+
+/// The catalog is created lazily on the first mutation: a read-only server
+/// never writes an empty object, and concurrent first writers create
+/// identical empty catalogs, which the ambiguous-write confirmation absorbs.
+fn resume_or_create_workspaces(
+  service: Service,
+) -> Result(storage_workspaces.Session, String) {
+  case storage_workspaces.resume(service.storage, workspaces_catalog_key) {
+    Ok(session) -> Ok(session)
+    Error(storage_workspaces.StorageFailed(storage.NotFound(_))) ->
+      case
+        storage_workspaces.create(
+          service.storage,
+          workspaces_catalog_key,
+          storage_workspaces.new(),
+        )
+      {
+        Ok(session) -> Ok(session)
+        Error(storage_workspaces.ConcurrentUpdate) ->
+          storage_workspaces.resume(service.storage, workspaces_catalog_key)
+          |> result.map_error(fn(error) {
+            "could not load cloud storage workspaces: " <> workspace_error(error)
+          })
+        Error(error) ->
+          Error(
+            "could not initialize cloud storage workspaces: "
+            <> workspace_error(error),
+          )
+      }
+    Error(error) ->
+      Error("could not load cloud storage workspaces: " <> workspace_error(error))
+  }
+}
+
+/// Builds the session's cloud storage plugin. An associated workspace
+/// contributes its configured prefix; an unassociated session gets its own
+/// isolated namespace derived from the session ID.
+fn cloud_storage_plugin(
+  service: Service,
+  metadata: SessionMetadata,
+) -> Result(plugin.Plugin, String) {
+  case metadata.cloud_storage_workspace {
+    Some(workspace_id) -> {
+      use workspace <- result.try(find_workspace(service, workspace_id))
+      cloud_storage.new(service.storage, workspace.prefix)
+    }
+    None ->
+      cloud_storage.new(service.storage, isolated_storage_prefix(metadata.id))
+  }
+}
+
+/// The isolated cloud storage namespace of a session with no associated
+/// workspace. Session IDs are already URL-safe, so they embed readably.
+fn isolated_storage_prefix(session_id: String) -> String {
+  "plugins/cloud_storage/sessions/" <> session_id <> "/objects/"
+}
+
 fn validate_create(
   service: Service,
   input: CreateInput,
 ) -> Result(Nil, String) {
-  case
+  use _ <- result.try(case
     list.any(service.models, fn(model) { model.id == input.model_id }),
     input.team_size >= 1 && input.team_size <= 4
   {
     False, _ -> Error("unknown model: " <> input.model_id)
     _, False -> Error("team_size must be between 1 and 4")
     _, _ -> Ok(Nil)
+  })
+  case input.cloud_storage_workspace_id {
+    None -> Ok(Nil)
+    Some(workspace_id) ->
+      find_workspace(service, workspace_id)
+      |> result.map(fn(_) { Nil })
   }
 }
 
@@ -976,6 +1294,14 @@ fn session_view(
     title: dict.get(group.attributes, title_attribute) |> result.unwrap(""),
     prompt: dict.get(group.attributes, prompt_attribute) |> result.unwrap(""),
     workspace:,
+    cloud_storage_workspace: case
+      dict.get(group.attributes, cloud_storage_workspace_attribute)
+    {
+      // Unassociated groups carry no attribute; clearing an association
+      // writes an empty upsert. Both render as unassociated.
+      Error(_) | Ok("") -> None
+      Ok(workspace_id) -> Some(workspace_id)
+    },
     created_at: dict.get(group.attributes, created_at_attribute)
       |> result.try(int.parse)
       |> result.unwrap(0),
@@ -1041,7 +1367,7 @@ fn group_config(
           message_targets,
           capability_instructions(spec.kind),
         )
-      let group_storage = cloud_storage.new(service.storage, metadata.id)
+      use group_storage <- result.try(cloud_storage_plugin(service, metadata))
       use plugins <- result.try(case spec.kind {
         CodingAgent ->
           Ok([
@@ -1086,21 +1412,29 @@ fn group_config(
 fn capability_instructions(kind: AgentKind) -> String {
   case kind {
     CodingAgent ->
-      "You can inspect and modify the shared workspace, run commands with the installed coding tools, and read, write, list, delete, or create transfer URLs for durable cloud-storage objects shared by this agent group."
+      "You can inspect and modify the shared workspace, run commands with the installed coding tools, and read, write, list, delete, or create transfer URLs for durable objects in the session's cloud storage workspace."
     ResearchAgent ->
-      "You have no filesystem, workspace, shell, or MCP tools. You can use `team.message_agent` only to report to the lead, and you can use the `cloud_storage.*` tools to read, write, list, delete, or create transfer URLs for durable objects shared by this agent group."
+      "You have no filesystem, workspace, shell, or MCP tools. You can use `team.message_agent` only to report to the lead, and you can use the `cloud_storage.*` tools to read, write, list, delete, or create transfer URLs for durable objects in the session's cloud storage workspace."
     McpSpecialist ->
-      "You are the MCP research specialist with access to all enabled global MCP servers. You have `team.message_agent` (to report to the lead), `mcp.list` (to inspect tools from currently reachable external servers), `mcp.call` (to invoke a listed tool), and the `cloud_storage.*` tools for durable objects shared by this agent group. You have no direct filesystem or shell access."
+      "You are the MCP research specialist with access to all enabled global MCP servers. You have `team.message_agent` (to report to the lead), `mcp.list` (to inspect tools from currently reachable external servers), `mcp.call` (to invoke a listed tool), and the `cloud_storage.*` tools for durable objects in the session's cloud storage workspace. You have no direct filesystem or shell access."
   }
 }
 
 fn group_attributes(metadata: SessionMetadata) -> dict.Dict(String, String) {
-  dict.from_list([
+  let base = [
     #(title_attribute, metadata.title),
     #(prompt_attribute, metadata.prompt),
     #(workspace_attribute, metadata.workspace),
     #(created_at_attribute, int.to_string(metadata.created_at)),
-  ])
+  ]
+  case metadata.cloud_storage_workspace {
+    None -> dict.from_list(base)
+    Some(workspace_id) ->
+      dict.from_list([
+        #(cloud_storage_workspace_attribute, workspace_id),
+        ..base
+      ])
+  }
 }
 
 fn agent_attributes(spec: AgentSpec) -> dict.Dict(String, String) {

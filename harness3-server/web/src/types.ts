@@ -156,6 +156,7 @@ export interface Session {
   title: string;
   prompt: string;
   workspace: string;
+  cloud_storage_workspace: string | null;
   created_at: number;
   revision: number;
   execution: Execution;
@@ -166,10 +167,32 @@ export interface SessionsResponse {
   sessions: Session[];
 }
 
+export interface CloudStorageWorkspace {
+  id: string;
+  label: string;
+  prefix: string;
+}
+
+export interface CloudStorageWorkspacesResponse {
+  workspaces: CloudStorageWorkspace[];
+}
+
+export interface CloudStorageWorkspaceInput {
+  id: string;
+  label: string;
+  prefix: string;
+}
+
+export interface UpdateCloudStorageWorkspaceInput {
+  label: string;
+  prefix: string;
+}
+
 export interface CreateSessionInput {
   model_id: string;
   workspace: string;
   team_size: number;
+  cloud_storage_workspace_id: string | null;
 }
 
 export interface UpdateAgentInput {
@@ -182,6 +205,7 @@ export interface UpdateAgentInput {
 export interface UpdateSessionInput {
   name: string;
   agents: UpdateAgentInput[];
+  cloud_storage_workspace_id: string | null;
 }
 
 export type AddMcpTransport =

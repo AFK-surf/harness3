@@ -115,14 +115,34 @@ Without any enabled MCP servers, the researcher remains least-privilege and rece
 `team.message_agent` plus the group cloud-storage tools; it never falls back to
 local filesystem or shell tools. Every agent receives `cloud_storage.read`,
 `cloud_storage.write`, `cloud_storage.list`, `cloud_storage.delete`, and
-`cloud_storage.get_url`. These tools share durable objects within one session
-while keeping different sessions isolated. The lead, implementer, and reviewer
+`cloud_storage.get_url`. The lead, implementer, and reviewer
 retain the coding tools and do not receive MCP
 access. Plugin state references the stable aggregate configuration ID, while
 the group's agent attributes only record the MCP resource profile and the
 global catalog owns the actual server settings. The lead can message every
 subagent; subagents can message only the lead, so there is no direct
 subagent-to-subagent communication path.
+
+## Cloud storage workspaces
+
+An agent team's `cloud_storage.*` tools operate on a storage prefix that is
+configured independently of the agent group. Use the **Cloud storage** button
+in the web UI sidebar to add, edit, or remove durable *cloud storage
+workspaces* — a stable ID, a label, and a storage prefix (a safe relative
+path; leaving it empty defaults to
+`plugins/cloud_storage/workspaces/<id>/objects/`). Prefixes overlapping the
+harness-internal `cluster/` and `harness3-server/` namespaces are rejected.
+
+Each session is associated with at most one workspace, chosen when the
+session is created or later from the agent-group editor. Sessions associated
+with the same workspace share all of its objects; an unassociated session
+gets its own isolated namespace
+(`plugins/cloud_storage/sessions/<session id>/objects/`). Changing a
+session's association stops
+and restarts the team like a roster edit, and editing a workspace's prefix is
+picked up by its sessions the next time they wake. Removing a workspace never
+deletes stored objects, and a workspace that a session still references
+cannot be removed until the session is re-pointed.
 
 Models must provide Pi's `contextWindow` field. Each agent automatically
 compacts its model-facing context after a normal request reaches 80% of that

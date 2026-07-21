@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { errorMessage } from "../api";
 import type {
+  CloudStorageWorkspace,
   CreateSessionInput,
   McpConfiguration,
   Model,
@@ -23,6 +24,7 @@ interface NewSessionDialogProps {
   open: boolean;
   models: Model[];
   configurations: McpConfiguration[];
+  cloudWorkspaces: CloudStorageWorkspace[];
   workspaceRoot: string;
   onClose: () => void;
   onCreate: (input: CreateSessionInput) => Promise<void>;
@@ -33,6 +35,7 @@ export function NewSessionDialog({
   open,
   models,
   configurations,
+  cloudWorkspaces,
   workspaceRoot,
   onClose,
   onCreate,
@@ -47,6 +50,7 @@ export function NewSessionDialog({
   const [modelId, setModelId] = useState("");
   const [teamSize, setTeamSize] = useState(3);
   const [workspace, setWorkspace] = useState("");
+  const [cloudWorkspaceId, setCloudWorkspaceId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const workspaceInput = useRef<HTMLInputElement>(null);
 
@@ -56,9 +60,12 @@ export function NewSessionDialog({
       ? current
       : models[0]?.id ?? "");
     setWorkspace((current) => current || workspaceRoot);
+    setCloudWorkspaceId((current) => cloudWorkspaces.some(
+      (cloudWorkspace) => cloudWorkspace.id === current,
+    ) ? current : "");
     const frame = window.requestAnimationFrame(() => workspaceInput.current?.focus());
     return () => window.cancelAnimationFrame(frame);
-  }, [models, open, workspaceRoot]);
+  }, [models, open, workspaceRoot, cloudWorkspaces]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -69,9 +76,11 @@ export function NewSessionDialog({
         model_id: modelId,
         workspace,
         team_size: teamSize,
+        cloud_storage_workspace_id: cloudWorkspaceId || null,
       });
       setTeamSize(3);
       setWorkspace(workspaceRoot);
+      setCloudWorkspaceId("");
     } catch (error) {
       onError(errorMessage(error));
     } finally {
@@ -137,6 +146,24 @@ export function NewSessionDialog({
             autoComplete="off"
             required
           />
+        </label>
+
+        <label className={field}>
+          <span>Cloud storage <small>shared object namespace</small></span>
+          <select className={control}
+            value={cloudWorkspaceId}
+            onChange={(event) => setCloudWorkspaceId(event.target.value)}
+          >
+            <option value="">Isolated to this session (default)</option>
+            {cloudWorkspaces.map((cloudWorkspace) => (
+              <option key={cloudWorkspace.id} value={cloudWorkspace.id}>
+                {cloudWorkspace.label} · {cloudWorkspace.id}
+              </option>
+            ))}
+          </select>
+          <small className="mt-1.5 block text-[9px] leading-[1.45]">
+            Sessions associated with the same workspace share its durable objects.
+          </small>
         </label>
 
         <div className="mt-0.5 mb-[21px] flex flex-wrap gap-1.5 text-[9px] capitalize text-[#aeb8b0] [&>span]:rounded-[7px] [&>span]:border [&>span]:border-[#2e372a] [&>span]:bg-[#151b13] [&>span]:px-2 [&>span]:py-1.5">

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, errorMessage } from "./api";
+import { CloudStorageDialog } from "./components/CloudStorageDialog";
 import { EditGroupDialog } from "./components/EditGroupDialog";
 import { EmptyState } from "./components/EmptyState";
 import { McpDialog } from "./components/McpDialog";
@@ -8,6 +9,9 @@ import { SessionWorkspace } from "./components/SessionWorkspace";
 import { Sidebar, type ConnectionState } from "./components/Sidebar";
 import type {
   AddMcpServerInput,
+  CloudStorageWorkspace,
+  CloudStorageWorkspaceInput,
+  CloudStorageWorkspacesResponse,
   CompactionResponse,
   CreateSessionInput,
   HealthResponse,
@@ -17,6 +21,7 @@ import type {
   ModelsResponse,
   Session,
   SessionsResponse,
+  UpdateCloudStorageWorkspaceInput,
   UpdateSessionInput,
   UpdateMcpServerInput,
 } from "./types";
@@ -30,6 +35,7 @@ interface ToastState {
 export function App() {
   const [models, setModels] = useState<Model[]>([]);
   const [mcpConfigurations, setMcpConfigurations] = useState<McpConfiguration[]>([]);
+  const [cloudWorkspaces, setCloudWorkspaces] = useState<CloudStorageWorkspace[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [current, setCurrent] = useState<Session | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
@@ -37,6 +43,7 @@ export function App() {
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [mcpOpen, setMcpOpen] = useState(false);
+  const [cloudStorageOpen, setCloudStorageOpen] = useState(false);
   const [editGroupOpen, setEditGroupOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const [compactionRequesting, setCompactionRequesting] = useState(false);
@@ -95,14 +102,23 @@ export function App() {
     return response.configurations;
   }, []);
 
+  const loadCloudWorkspaces = useCallback(async () => {
+    const response = await api<CloudStorageWorkspacesResponse>(
+      "/api/cloud-storage/workspaces",
+    );
+    setCloudWorkspaces(response.workspaces);
+    return response.workspaces;
+  }, []);
+
   useEffect(() => {
     let active = true;
     void (async () => {
-      const [healthResult, modelResult, mcpResult, sessionResult] =
+      const [healthResult, modelResult, mcpResult, cloudResult, sessionResult] =
         await Promise.allSettled([
           api<HealthResponse>("/api/health"),
           api<ModelsResponse>("/api/models"),
           api<McpConfigurationsResponse>("/api/mcp/configurations"),
+          api<CloudStorageWorkspacesResponse>("/api/cloud-storage/workspaces"),
           api<SessionsResponse>("/api/sessions"),
         ] as const);
       if (!active) return;
@@ -123,6 +139,11 @@ export function App() {
         setMcpConfigurations(mcpResult.value.configurations);
       } else {
         showToast(errorMessage(mcpResult.reason), true);
+      }
+      if (cloudResult.status === "fulfilled") {
+        setCloudWorkspaces(cloudResult.value.workspaces);
+      } else {
+        showToast(errorMessage(cloudResult.reason), true);
       }
       if (sessionResult.status === "fulfilled") {
         const loadedSessions = sessionResult.value.sessions;
@@ -332,6 +353,36 @@ export function App() {
     showToast("MCP server updated. Active specialists pick it up on next activation.");
   }
 
+  async function addCloudWorkspace(input: CloudStorageWorkspaceInput) {
+    await api<CloudStorageWorkspace>("/api/cloud-storage/workspaces", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    await loadCloudWorkspaces();
+    showToast("Cloud storage workspace added. Associate it from the session editor.");
+  }
+
+  async function updateCloudWorkspace(
+    workspaceId: string,
+    input: UpdateCloudStorageWorkspaceInput,
+  ) {
+    await api<CloudStorageWorkspace>(
+      `/api/cloud-storage/workspaces/${encodeURIComponent(workspaceId)}`,
+      { method: "PUT", body: JSON.stringify(input) },
+    );
+    await loadCloudWorkspaces();
+    showToast("Cloud storage workspace updated. Associated sessions pick up a changed prefix on their next wake.");
+  }
+
+  async function removeCloudWorkspace(workspaceId: string) {
+    await api<{ ok: boolean }>(
+      `/api/cloud-storage/workspaces/${encodeURIComponent(workspaceId)}`,
+      { method: "DELETE" },
+    );
+    await loadCloudWorkspaces();
+    showToast("Cloud storage workspace removed. Stored objects were kept.");
+  }
+
   return (
     <>
       <div className="grid h-screen grid-cols-[274px_minmax(0,1fr)] max-[1020px]:grid-cols-[224px_minmax(0,1fr)] max-[780px]:block max-[780px]:h-auto max-[780px]:min-h-screen">
@@ -342,6 +393,7 @@ export function App() {
           workspaceRoot={workspaceRoot}
           onNewSession={openNewSession}
           onManageMcp={() => setMcpOpen(true)}
+          onManageCloudStorage={() => setCloudStorageOpen(true)}
           onSelectSession={(id) => void selectSession(id)}
         />
         <main className="min-h-0 min-w-0 max-[780px]:min-h-[calc(100vh-66px)]">
@@ -370,6 +422,7 @@ export function App() {
         open={newSessionOpen}
         models={models}
         configurations={mcpConfigurations}
+        cloudWorkspaces={cloudWorkspaces}
         workspaceRoot={workspaceRoot}
         onClose={() => setNewSessionOpen(false)}
         onCreate={createSession}
@@ -384,11 +437,21 @@ export function App() {
         onRemove={removeMcpServer}
         onError={(message) => showToast(message, true)}
       />
+      <CloudStorageDialog
+        open={cloudStorageOpen}
+        workspaces={cloudWorkspaces}
+        onClose={() => setCloudStorageOpen(false)}
+        onAdd={addCloudWorkspace}
+        onUpdate={updateCloudWorkspace}
+        onRemove={removeCloudWorkspace}
+        onError={(message) => showToast(message, true)}
+      />
       {current ? (
         <EditGroupDialog
           open={editGroupOpen}
           session={current}
           models={models}
+          cloudWorkspaces={cloudWorkspaces}
           onClose={() => setEditGroupOpen(false)}
           onSave={updateSession}
           onError={(message) => showToast(message, true)}

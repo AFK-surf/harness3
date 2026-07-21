@@ -10,6 +10,7 @@ interface SidebarProps {
   workspaceRoot: string;
   onNewSession: () => void;
   onManageMcp: () => void;
+  onManageCloudStorage: () => void;
   onSelectSession: (id: string) => void;
 }
 
@@ -20,6 +21,7 @@ export function Sidebar({
   workspaceRoot,
   onNewSession,
   onManageMcp,
+  onManageCloudStorage,
   onSelectSession,
 }: SidebarProps) {
   const connectionLabel = connection === "online"
@@ -49,6 +51,10 @@ export function Sidebar({
       <button className="mt-[7px] flex w-full items-center gap-[9px] rounded-[9px] border border-transparent bg-transparent px-3 py-[9px] text-left text-muted hover:border-line hover:bg-panel-2 hover:text-ink max-[780px]:mt-0 max-[780px]:ml-[5px] max-[780px]:w-auto" type="button" onClick={onManageMcp}>
         <span className="text-[17px] text-warn" aria-hidden="true">⌁</span>
         <span className="max-[780px]:hidden">MCP servers</span>
+      </button>
+      <button className="mt-[2px] flex w-full items-center gap-[9px] rounded-[9px] border border-transparent bg-transparent px-3 py-[9px] text-left text-muted hover:border-line hover:bg-panel-2 hover:text-ink max-[780px]:mt-0 max-[780px]:ml-[5px] max-[780px]:w-auto" type="button" onClick={onManageCloudStorage}>
+        <span className="text-[15px] text-info" aria-hidden="true">☁</span>
+        <span className="max-[780px]:hidden">Cloud storage</span>
       </button>
 
       <div className={`${sectionLabel} px-[9px] pt-6 pb-[9px] max-[780px]:hidden`}>Recent sessions</div>
