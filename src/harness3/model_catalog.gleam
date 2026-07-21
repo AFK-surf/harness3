@@ -9,18 +9,26 @@ import gleam/string
 import harness3/llm.{type Provider}
 import harness3/llm/anthropic_messages
 import harness3/llm/openai_chat_completions
+import harness3/llm/openai_codex
+import harness3/llm/openai_oauth
 import harness3/llm/openai_responses
 import harness3/storage.{type Storage, type VersionToken}
 
 pub type ModelType {
   OpenAIChatCompletions
   OpenAIResponses
+  /// The ChatGPT Codex backend: Responses API over OAuth, with Pi-compatible
+  /// headers and mandatory streaming.
+  OpenAICodexResponses
   AnthropicMessages
 }
 
 pub opaque type Credentials {
   ApiKey(value: String)
   EnvironmentVariable(name: String)
+  /// Path to a Pi `auth.json` holding ChatGPT OAuth credentials. The access
+  /// token rotates, so it is resolved (and refreshed) on every request.
+  OpenAIOAuth(path: String)
 }
 
 /// Stores an API key directly in the catalog. Prefer `environment_variable`
@@ -33,6 +41,12 @@ pub fn api_key(value: String) -> Credentials {
 /// is resolved on the node each time a provider is constructed.
 pub fn environment_variable(name: String) -> Credentials {
   EnvironmentVariable(name)
+}
+
+/// Stores only the path of a Pi `auth.json` file. The OAuth access token is
+/// read — and refreshed when expired — on every request.
+pub fn openai_oauth_file(path: String) -> Credentials {
+  OpenAIOAuth(path)
 }
 
 pub type Model {
@@ -195,23 +209,44 @@ fn storage_error(error: storage.Error) -> Error {
 }
 
 pub fn provider(model: Model) -> Provider {
-  let api_key = resolve_credentials(model.credentials)
-  case model.model_type {
-    OpenAIChatCompletions ->
+  case model.model_type, model.credentials {
+    OpenAIChatCompletions, _ ->
       openai_chat_completions.new(openai_chat_completions.Config(
-        api_key,
+        resolve_credentials(model.credentials),
         model.endpoint,
         openai_chat_completions.MaxCompletionTokens,
         openai_chat_completions.OmitReasoning,
       ))
-    OpenAIResponses ->
-      openai_responses.new(openai_responses.Config(api_key, model.endpoint))
-    AnthropicMessages ->
+    OpenAIResponses, _ ->
+      openai_responses.new(openai_responses.Config(
+        resolve_credentials(model.credentials),
+        model.endpoint,
+      ))
+    AnthropicMessages, _ ->
       anthropic_messages.new(anthropic_messages.Config(
-        api_key,
+        resolve_credentials(model.credentials),
         model.endpoint,
         "2023-06-01",
       ))
+    OpenAICodexResponses, OpenAIOAuth(path) ->
+      openai_codex.new(openai_codex.Config(
+        credentials: openai_oauth.fresh_source(path),
+        base_url: model.endpoint,
+        originator: openai_codex.default_originator,
+        session_id: None,
+      ))
+    OpenAICodexResponses, _ ->
+      // Validation rejects this pairing; a hand-edited catalog gets a provider
+      // that fails with a clear reason instead of a mis-authenticated request.
+      llm.from_functions(
+        build: fn(_) {
+          Error(llm.InvalidRequest(
+            "openai_codex_responses models require openai_oauth credentials",
+          ))
+        },
+        response: fn(_, _) { Error(llm.InvalidResponse("no provider")) },
+        stream_event: fn(_) { Error(llm.InvalidResponse("no provider")) },
+      )
   }
 }
 
@@ -242,12 +277,31 @@ fn validate_model(model: Model) -> Result(Nil, Error) {
     _, _, _, "", _ -> Error(InvalidCatalog("model credentials cannot be empty"))
     _, _, _, _, tokens if tokens <= 0 ->
       Error(InvalidCatalog("model context window must be positive"))
-    _, _, _, _, _ ->
-      case model.max_output_tokens {
+    _, _, _, _, _ -> {
+      use _ <- result.try(case model.max_output_tokens {
         option.Some(tokens) if tokens <= 0 ->
           Error(InvalidCatalog("model max output tokens must be positive"))
         _ -> Ok(Nil)
-      }
+      })
+      validate_credentials_pairing(model)
+    }
+  }
+}
+
+/// The Codex backend authenticates with OAuth bearer tokens plus the account
+/// header; an API key cannot drive it.
+fn validate_credentials_pairing(model: Model) -> Result(Nil, Error) {
+  case model.model_type, model.credentials {
+    OpenAICodexResponses, OpenAIOAuth(_) -> Ok(Nil)
+    OpenAICodexResponses, _ ->
+      Error(InvalidCatalog(
+        "openai_codex_responses models require openai_oauth credentials",
+      ))
+    _, OpenAIOAuth(_) ->
+      Error(InvalidCatalog(
+        "openai_oauth credentials require an openai_codex_responses model",
+      ))
+    _, _ -> Ok(Nil)
   }
 }
 
@@ -300,6 +354,7 @@ fn encode_model(model: Model) -> json.Json {
   let #(credential_type, value) = case model.credentials {
     ApiKey(value) -> #("api_key", value)
     EnvironmentVariable(name) -> #("environment_variable", name)
+    OpenAIOAuth(path) -> #("openai_oauth", path)
   }
   json.object([
     #("id", json.string(model.id)),
@@ -322,6 +377,7 @@ fn model_type_name(model_type: ModelType) -> String {
   case model_type {
     OpenAIChatCompletions -> "openai_chat_completions"
     OpenAIResponses -> "openai_responses"
+    OpenAICodexResponses -> "openai_codex_responses"
     AnthropicMessages -> "anthropic_messages"
   }
 }
@@ -332,6 +388,7 @@ fn model_type_decoder() -> decode.Decoder(ModelType) {
     case value {
       "openai_chat_completions" -> decode.success(OpenAIChatCompletions)
       "openai_responses" -> decode.success(OpenAIResponses)
+      "openai_codex_responses" -> decode.success(OpenAICodexResponses)
       "anthropic_messages" -> decode.success(AnthropicMessages)
       _ -> decode.failure(OpenAIResponses, "unsupported model type")
     }
@@ -344,6 +401,7 @@ fn credentials_decoder() -> decode.Decoder(Credentials) {
   case kind {
     "api_key" -> decode.success(ApiKey(value))
     "environment_variable" -> decode.success(EnvironmentVariable(value))
+    "openai_oauth" -> decode.success(OpenAIOAuth(value))
     _ -> decode.failure(ApiKey(""), "unsupported credential type")
   }
 }
@@ -351,6 +409,7 @@ fn credentials_decoder() -> decode.Decoder(Credentials) {
 fn credential_value(credentials: Credentials) -> String {
   case credentials {
     ApiKey(value) | EnvironmentVariable(value) -> value
+    OpenAIOAuth(path) -> path
   }
 }
 
@@ -358,6 +417,9 @@ fn resolve_credentials(credentials: Credentials) -> String {
   case credentials {
     ApiKey(value) -> value
     EnvironmentVariable(name) -> envoy.get(name) |> result.unwrap("")
+    // Codex providers never resolve through this path; OAuth tokens are
+    // loaded fresh from the auth file on every request.
+    OpenAIOAuth(_) -> ""
   }
 }
 

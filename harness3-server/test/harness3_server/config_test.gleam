@@ -3,7 +3,7 @@ import gleam/bit_array
 import gleam/crypto
 import gleam/json
 import gleam/list
-import gleam/option.{None}
+import gleam/option.{None, Some}
 import gleam/string
 import harness3/agent
 import harness3/agent_group
@@ -27,6 +27,14 @@ fn temporary_root(label: String) -> String {
 
 fn models_json() -> String {
   "{\"providers\":{\"test\":{\"name\":\"Test Provider\",\"baseUrl\":\"https://example.test/api/v3\",\"api\":\"openai-completions\",\"apiKey\":\"test-secret\",\"models\":[{\"id\":\"model-1\",\"name\":\"Model One\",\"contextWindow\":32768,\"maxTokens\":4096},{\"id\":\"model-2\",\"name\":\"Model Two\",\"contextWindow\":65536,\"maxTokens\":8192}]}}}"
+}
+
+fn auth_json() -> String {
+  "{\"openai-codex\":{\"type\":\"oauth\",\"access\":\"test-access\",\"refresh\":\"test-refresh\",\"expires\":9999999999999,\"accountId\":\"acct-1\"}}"
+}
+
+fn models_store_json() -> String {
+  "{\"openai-codex\":{\"models\":[{\"id\":\"gpt-9-x\",\"name\":\"GPT 9 X\",\"contextWindow\":100000,\"maxTokens\":16000}],\"checkedAt\":1}}"
 }
 
 fn mcp_server_script() -> String {
@@ -114,14 +122,21 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let data_path = root <> "/data"
   let workspace = root <> "/workspace"
   let mcp_path = root <> "/mcp.json"
+  let auth_path = root <> "/auth.json"
+  let store_path = root <> "/models-store.json"
   let assert Ok(Nil) = simplifile.create_directory_all(workspace)
   let assert Ok(Nil) =
     simplifile.write(to: models_path, contents: models_json())
   let assert Ok(Nil) =
     simplifile.write(to: mcp_path, contents: mcp_config_json())
+  let assert Ok(Nil) = simplifile.write(to: auth_path, contents: auth_json())
+  let assert Ok(Nil) =
+    simplifile.write(to: store_path, contents: models_store_json())
 
+  envoy.set("HARNESS3_PI_AUTH_PATH", auth_path)
+  envoy.set("HARNESS3_PI_MODELS_STORE_PATH", store_path)
   let assert Ok(models) = config.load_models(models_path)
-  let assert [model, second_model] = models
+  let assert [model, second_model, oauth_model] = models
   assert model.id == "test/model-1"
   assert model.remote_id == "model-1"
   assert model.display_name == "Model One · Test Provider"
@@ -129,6 +144,24 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   assert model.context_window_tokens == 32_768
   assert second_model.id == "test/model-2"
   assert second_model.context_window_tokens == 65_536
+  assert oauth_model.id == "openai-codex/gpt-9-x"
+  assert oauth_model.provider_id == "openai-codex"
+  assert oauth_model.remote_id == "gpt-9-x"
+  assert oauth_model.display_name == "GPT 9 X · OpenAI Codex"
+  assert oauth_model.endpoint == "https://chatgpt.com/backend-api"
+  assert oauth_model.credentials == config.OpenAIOAuthFile(auth_path)
+  assert oauth_model.model_type == model_catalog.OpenAICodexResponses
+  assert oauth_model.context_window_tokens == 100_000
+  assert oauth_model.max_output_tokens == Some(16_000)
+  let oauth_catalog_model = config.catalog_model(oauth_model)
+  assert oauth_catalog_model.credentials
+    == model_catalog.openai_oauth_file(auth_path)
+
+  // Without OAuth credentials only the custom providers load.
+  envoy.set("HARNESS3_PI_AUTH_PATH", root <> "/missing-auth.json")
+  let assert Ok(custom_only) = config.load_models(models_path)
+  assert list.length(custom_only) == 2
+  envoy.set("HARNESS3_PI_AUTH_PATH", auth_path)
 
   envoy.set("HARNESS3_MODELS_PATH", models_path)
   envoy.set("HARNESS3_DATA_DIR", data_path)
@@ -140,7 +173,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   envoy.set("HARNESS3_MCP_CONFIG_PATH", mcp_path)
   let assert Ok(first) = service.start()
   let assert Ok(second) = service.start()
-  assert list.length(service.models(first)) == 2
+  assert list.length(service.models(first)) == 3
   assert service.workspace_root(second) == workspace
   let assert [mcp_configuration] = service.mcp_configurations(second)
   assert mcp_configuration.id == "research"
@@ -527,6 +560,8 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
 
   envoy.unset("HARNESS3_MCP_CONFIG_PATH")
   envoy.unset("HARNESS3_MODELS_PATH")
+  envoy.unset("HARNESS3_PI_AUTH_PATH")
+  envoy.unset("HARNESS3_PI_MODELS_STORE_PATH")
   envoy.unset("HARNESS3_DATA_DIR")
   envoy.unset("HARNESS3_WORKSPACE_ROOT")
   envoy.unset("HARNESS3_STORAGE")

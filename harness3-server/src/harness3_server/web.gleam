@@ -330,6 +330,7 @@ fn model_type_name(model_type: model_catalog.ModelType) -> String {
   case model_type {
     model_catalog.OpenAIChatCompletions -> "openai_chat_completions"
     model_catalog.OpenAIResponses -> "openai_responses"
+    model_catalog.OpenAICodexResponses -> "openai_codex_responses"
     model_catalog.AnthropicMessages -> "anthropic_messages"
   }
 }

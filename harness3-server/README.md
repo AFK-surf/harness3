@@ -33,6 +33,21 @@ Model secrets loaded from Pi are held in process environment variables. The
 durable harness catalog stores only generated environment-variable references,
 not the secret values.
 
+## OpenAI OAuth models
+
+When Pi is logged in with ChatGPT (`~/.pi/agent/auth.json` contains an
+`openai-codex` OAuth entry), the server's model list also includes OpenAI's
+models (for example `openai-codex/gpt-5.5`). The model list comes from Pi's
+models store (`~/.pi/agent/models-store.json`) when present, falling back to a
+snapshot of Pi's built-in registry. These models call the ChatGPT Codex
+backend with the OAuth access token; the token is re-read on every request and
+refreshed against `https://auth.openai.com/oauth/token` when expired, with the
+rotated credentials written back to the auth file so Pi keeps working. Only
+the auth-file path is stored in the durable catalog — never token values. Log
+in (or re-login) with Pi to add or repair these credentials; a missing or
+invalid entry simply omits the OpenAI models without affecting other
+providers.
+
 ## MCP configurations
 
 Use the **MCP servers** button in the web UI sidebar to add, edit, or remove
@@ -134,6 +149,8 @@ gleam run
 | Variable | Default |
 |---|---|
 | `HARNESS3_MODELS_PATH` | `~/.pi/agent/models.json` |
+| `HARNESS3_PI_AUTH_PATH` | `~/.pi/agent/auth.json` |
+| `HARNESS3_PI_MODELS_STORE_PATH` | `~/.pi/agent/models-store.json` |
 | `HARNESS3_MCP_CONFIG_PATH` | unset (reuse the persisted catalog) |
 | `HARNESS3_BIND` | `127.0.0.1` |
 | `HARNESS3_PORT` | `8080` |

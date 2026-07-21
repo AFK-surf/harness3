@@ -99,7 +99,9 @@ fn build(config: Config, request: Request) -> Result(HttpRequest, Error) {
   ))
 }
 
-fn encode_message_items(message: Message) -> Result(List(Json), Error) {
+/// Encodes one message into the Responses input items it produces. Public
+/// for the Codex provider, whose request body uses the same item shapes.
+pub fn encode_message_items(message: Message) -> Result(List(Json), Error) {
   let llm.Message(role:, content:) = message
   encode_ordered_items(role, content, [], [])
 }
@@ -305,7 +307,9 @@ fn text_only(content: List(Content)) -> Result(String, Error) {
   |> result.map(string.concat)
 }
 
-fn encode_tool(tool: Tool) -> Result(Json, Error) {
+/// Encodes a tool for the Responses `tools` array. Public for the Codex
+/// provider, which uses the same function tool shape.
+pub fn encode_tool(tool: Tool) -> Result(Json, Error) {
   let llm.Tool(name:, description:, input_schema:) = tool
   let fields = [
     #("type", json.string("function")),
@@ -470,7 +474,9 @@ fn response_decoder() -> decode.Decoder(ResponseData) {
   ))
 }
 
-fn decode_response(status: Int, body: String) -> Result(List(Event), Error) {
+/// Decodes a buffered (non-SSE) Responses API body, or the error envelope of
+/// a non-2xx response. Public for the Codex provider's error path.
+pub fn decode_response(status: Int, body: String) -> Result(List(Event), Error) {
   case status >= 200 && status < 300 {
     False -> Error(decode_api_error(status, body))
     True -> {
@@ -553,7 +559,9 @@ fn output_item_events(item: ItemData, index: Int) -> List(Event) {
   }
 }
 
-fn decode_stream_event(data: String) -> Result(List(Event), Error) {
+/// Decodes one SSE `data:` payload of a Responses stream. Public for the
+/// Codex provider, whose stream speaks the same event protocol.
+pub fn decode_stream_event(data: String) -> Result(List(Event), Error) {
   use kind <- result.try(
     parse(data, {
       use kind <- decode.field("type", decode.string)
