@@ -8,6 +8,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import type { Agent, Message, MessageContent, Model, Session } from "../types";
+import { Markdown } from "./Markdown";
 import {
   dangerGhostButton,
   ghostButton,
@@ -266,6 +267,8 @@ function AgentThread({ agent }: { agent: Agent }) {
 }
 
 function MessageView({ message, agentId }: { message: Message; agentId: string }) {
+  const [showRaw, setShowRaw] = useState(false);
+  const hasText = message.content.some((content) => content.type === "text");
   const label = message.role === "assistant"
     ? agentId
     : message.role === "tool"
@@ -278,23 +281,40 @@ function MessageView({ message, agentId }: { message: Message; agentId: string }
       : "U";
 
   return (
-    <article className="mx-auto mb-[22px] max-w-[860px]">
+    <article className="group mx-auto mb-[22px] max-w-[860px]">
       <div className="mb-[7px] flex items-center gap-[9px] text-[10px] tracking-[.075em] text-faint uppercase">
         <span className={`grid size-6 place-items-center rounded-[7px] border text-[10px] font-extrabold ${message.role === "tool" ? "border-[#4c3c2a] bg-[#201910] text-warn" : message.role === "assistant" ? "border-[#34402e] bg-[#171e14] text-accent" : "border-[#3c4146] bg-[#1c2023] text-[#c8ceca]"}`}>{avatar}</span><span>{label}</span>
+        {hasText ? (
+          <button
+            className={`ml-auto rounded-md border px-[7px] py-[3px] text-[9px] font-semibold tracking-[.075em] transition ${showRaw ? "border-[#4a5c3d] bg-[#171e14] text-accent" : "border-transparent text-faint opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:border-line hover:bg-panel-2 hover:text-muted"}`}
+            type="button"
+            onClick={() => setShowRaw((raw) => !raw)}
+            aria-pressed={showRaw}
+            title={showRaw ? "Render markdown" : "Show raw text"}
+          >
+            {showRaw ? "Raw" : "MD"}
+          </button>
+        ) : null}
       </div>
       <div className="pl-[33px] text-[13px] leading-[1.62] text-[#d8ddd8]">
         {message.content.map((content, index) => (
-          <ContentView key={`${content.type}-${index}`} content={content} />
+          <ContentView key={`${content.type}-${index}`} content={content} raw={showRaw} />
         ))}
       </div>
     </article>
   );
 }
 
-function ContentView({ content }: { content: MessageContent }) {
+function ContentView({ content, raw }: { content: MessageContent; raw: boolean }) {
   switch (content.type) {
     case "text":
-      return <div className="mt-[10px] first:mt-0"><pre className="m-0 whitespace-pre-wrap break-words font-[inherit]">{content.text}</pre></div>;
+      return (
+        <div className="mt-[10px] first:mt-0">
+          {raw
+            ? <pre className="m-0 whitespace-pre-wrap break-words font-[inherit]">{content.text}</pre>
+            : <Markdown text={content.text} />}
+        </div>
+      );
     case "reasoning":
       return (
         <details className="mt-[10px] border-l-2 border-[#3c4934] bg-[#121713] px-[11px] py-[9px] text-muted first:mt-0">
