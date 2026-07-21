@@ -26,6 +26,23 @@ pub type Status {
   Failed(reason: String)
 }
 
+pub type ToolJournalEntry {
+  ToolPending(id: String, name: String, arguments: String)
+  ToolRunning(id: String, name: String, arguments: String)
+  ToolCompleted(
+    id: String,
+    name: String,
+    arguments: String,
+    content: List(llm.Content),
+    is_error: Bool,
+    recovered: Bool,
+  )
+}
+
+pub type ToolJournal {
+  ToolJournal(entries: List(ToolJournalEntry))
+}
+
 pub type State {
   State(
     id: String,
@@ -51,6 +68,7 @@ pub type State {
     compaction_requested: Int,
     compaction_completed: Int,
     last_compaction_error: Option(String),
+    tool_journal: Option(ToolJournal),
     status: Status,
   )
 }
@@ -74,6 +92,7 @@ pub fn state(id: String, model_id: String) -> State {
     compaction_requested: 0,
     compaction_completed: 0,
     last_compaction_error: None,
+    tool_journal: None,
     status: Ready,
   )
 }
@@ -914,12 +933,31 @@ pub type CommitReceipt {
   CommitReceipt(state: State, group_revision: Int)
 }
 
-pub opaque type Checkpointer {
-  Checkpointer(commit: fn(Int, State) -> Result(CommitReceipt, Error))
+pub type CommitMode {
+  RoundCommit
+  ToolProgressCommit
 }
 
+pub opaque type Checkpointer {
+  Checkpointer(
+    commit: fn(Int, State, CommitMode) -> Result(CommitReceipt, Error),
+  )
+}
+
+/// Constructs a checkpointer for embedders that do not maintain a separate
+/// concurrent inbox. Tool-progress and final commits are both forwarded to the
+/// same callback.
 pub fn checkpointer(
   commit: fn(Int, State) -> Result(CommitReceipt, Error),
+) -> Checkpointer {
+  Checkpointer(fn(expected, state, _) { commit(expected, state) })
+}
+
+/// Constructs a checkpointer that distinguishes write-ahead tool progress from
+/// a final round commit. Agent groups use this to keep concurrent deliveries in
+/// the durable inbox until every ToolCall has a matching ToolResult.
+pub fn checkpointer_with_mode(
+  commit: fn(Int, State, CommitMode) -> Result(CommitReceipt, Error),
 ) -> Checkpointer {
   Checkpointer(commit)
 }
@@ -970,50 +1008,57 @@ fn run_loop(
   observe: fn(Event) -> Result(Nil, Error),
 ) -> Nil {
   let Active(state:, config:, plugins:) = active
-  case compaction_target(state, config) {
-    Some(target) ->
-      case compact(active, target, observe) {
-        Error(error) -> {
-          let failed =
-            State(
-              ..state,
-              compaction_requested: int.max(state.compaction_requested, target),
-              last_compaction_error: Some(string.inspect(error)),
-            )
-          let Checkpointer(commit:) = checkpointer
-          case commit(state.revision, failed) {
-            // The commit atomically folded any messages that arrived during
-            // the failed compaction into the conversation; exiting here would
-            // strand them with no worker. Continue with normal rounds —
-            // deliberately not `run_loop`, which would retry the failing
-            // compaction immediately and block round execution.
-            Ok(CommitReceipt(state: committed, ..))
-              if committed.status == Ready
-            ->
-              run_normal_loop(
-                Active(committed, config, plugins),
-                checkpointer,
-                router,
-                observe,
-              )
-            _ -> Nil
+  case state.tool_journal {
+    Some(_) -> recover_tool_round(active, checkpointer, router, observe)
+    None ->
+      case compaction_target(state, config) {
+        Some(target) ->
+          case compact(active, target, observe) {
+            Error(error) -> {
+              let failed =
+                State(
+                  ..state,
+                  compaction_requested: int.max(
+                    state.compaction_requested,
+                    target,
+                  ),
+                  last_compaction_error: Some(string.inspect(error)),
+                )
+              let Checkpointer(commit:) = checkpointer
+              case commit(state.revision, failed, RoundCommit) {
+                // The commit atomically folded any messages that arrived during
+                // the failed compaction into the conversation; exiting here would
+                // strand them with no worker. Continue with normal rounds —
+                // deliberately not `run_loop`, which would retry the failing
+                // compaction immediately and block round execution.
+                Ok(CommitReceipt(state: committed, ..))
+                  if committed.status == Ready
+                ->
+                  run_normal_loop(
+                    Active(committed, config, plugins),
+                    checkpointer,
+                    router,
+                    observe,
+                  )
+                _ -> Nil
+              }
+            }
+            Ok(#(_, compacted)) -> {
+              let Checkpointer(commit:) = checkpointer
+              case commit(state.revision, compacted, RoundCommit) {
+                Error(_) -> Nil
+                Ok(CommitReceipt(state: committed, ..)) ->
+                  run_loop(
+                    Active(committed, config, plugins),
+                    checkpointer,
+                    router,
+                    observe,
+                  )
+              }
+            }
           }
-        }
-        Ok(#(_, compacted)) -> {
-          let Checkpointer(commit:) = checkpointer
-          case commit(state.revision, compacted) {
-            Error(_) -> Nil
-            Ok(CommitReceipt(state: committed, ..)) ->
-              run_loop(
-                Active(committed, config, plugins),
-                checkpointer,
-                router,
-                observe,
-              )
-          }
-        }
+        None -> run_normal_loop(active, checkpointer, router, observe)
       }
-    None -> run_normal_loop(active, checkpointer, router, observe)
   }
 }
 
@@ -1027,37 +1072,491 @@ fn run_normal_loop(
   case state.status {
     Waiting | Completed | Failed(_) -> Nil
     Ready ->
-      case run_round(active, router, observe) {
+      case checkpoint_model_round(active, observe) {
         Error(error) -> {
           let failed = State(..state, status: Failed(string.inspect(error)))
           let Checkpointer(commit:) = checkpointer
-          case commit(state.revision, failed) {
+          case commit(state.revision, failed, RoundCommit) {
             Ok(CommitReceipt(state: committed, ..))
               if committed.status == Ready
-            -> {
+            ->
               run_loop(
                 Active(committed, config, plugins),
                 checkpointer,
                 router,
                 observe,
               )
-            }
             _ -> Nil
           }
         }
-        Ok(RoundResult(state: next_state, ..)) -> {
+        Ok(next_state) -> {
+          let mode = case next_state.tool_journal {
+            Some(_) -> ToolProgressCommit
+            None -> RoundCommit
+          }
           let Checkpointer(commit:) = checkpointer
-          case commit(state.revision, next_state) {
+          case commit(state.revision, next_state, mode) {
             Error(_) -> Nil
-            Ok(CommitReceipt(state: committed, ..)) ->
-              run_loop(
-                Active(committed, config, plugins),
-                checkpointer,
-                router,
-                observe,
-              )
+            Ok(CommitReceipt(state: committed, ..)) -> {
+              let active = Active(committed, config, plugins)
+              case committed.tool_journal {
+                Some(_) ->
+                  continue_tool_round(active, checkpointer, router, observe)
+                None -> run_loop(active, checkpointer, router, observe)
+              }
+            }
           }
         }
+      }
+  }
+}
+
+/// Runs only the model portion of a round. When the response contains tools,
+/// the assistant ToolCalls and a Pending journal are returned for a durable
+/// checkpoint before any plugin is invoked.
+fn checkpoint_model_round(
+  active: Active,
+  observe: fn(Event) -> Result(Nil, Error),
+) -> Result(State, Error) {
+  let Active(state:, config:, plugins:) = active
+  use accumulated <- result.try(run_model(
+    active,
+    normal_request_messages(state, plugins),
+    config.max_output_tokens,
+    observe,
+  ))
+  use _ <- result.try(validate_finish(accumulated.finish))
+  use assistant_content <- result.try(parts_to_content(accumulated.parts))
+  let assistant = llm.Message(llm.Assistant, assistant_content)
+  let additions = [assistant]
+  let messages = list.append(state.messages, additions)
+  let context_messages = case state.context_messages {
+    None -> None
+    Some(context) -> Some(list.append(context, additions))
+  }
+  let entries = tool_journal_entries(assistant_content)
+  let tool_journal = case entries {
+    [] -> None
+    entries -> Some(ToolJournal(entries))
+  }
+  let status = case accumulated.finish, entries {
+    Some(llm.Paused), [] -> Ready
+    _, [] -> Completed
+    _, _ -> Ready
+  }
+  // Activation hooks may have changed plugin state even when the model did
+  // not call a tool. Persist the serialized runtime at the model checkpoint;
+  // later tool-completion checkpoints will advance it further.
+  let PluginSnapshot(generation:, states:) = plugin_states(plugins)
+  Ok(
+    State(
+      ..state,
+      round: state.round + 1,
+      messages:,
+      context_messages:,
+      stats: add_stats(state.stats, accumulated.stats),
+      plugin_states: states,
+      plugin_generation: generation,
+      last_catalog_revision: Some(config.catalog_revision),
+      last_context_tokens: context_tokens(accumulated),
+      tool_journal:,
+      status:,
+    ),
+  )
+}
+
+fn tool_journal_entries(content: List(llm.Content)) -> List(ToolJournalEntry) {
+  content
+  |> list.filter_map(fn(part) {
+    case part {
+      llm.ToolCall(id, name, arguments) ->
+        Ok(ToolPending(id, name, json.to_string(arguments)))
+      _ -> Error(Nil)
+    }
+  })
+}
+
+/// A Running entry can only be observed at this entry point after a worker
+/// disappeared between its pre-effect and post-effect checkpoints. Its outcome
+/// is unknowable. Resolve it conservatively and cancel every later Pending
+/// call from the same assistant block.
+fn recover_tool_round(
+  active: Active,
+  checkpointer: Checkpointer,
+  router: CallbackRouter,
+  observe: fn(Event) -> Result(Nil, Error),
+) -> Nil {
+  let Active(state:, config:, plugins:) = active
+  let assert Some(ToolJournal(entries)) = state.tool_journal
+  case recover_running_entries(entries) {
+    None -> continue_tool_round(active, checkpointer, router, observe)
+    Some(entries) -> {
+      let recovered = State(..state, tool_journal: Some(ToolJournal(entries)))
+      let Checkpointer(commit:) = checkpointer
+      case commit(state.revision, recovered, ToolProgressCommit) {
+        Error(_) -> Nil
+        Ok(CommitReceipt(state: committed, ..)) ->
+          continue_tool_round(
+            Active(committed, config, plugins),
+            checkpointer,
+            router,
+            observe,
+          )
+      }
+    }
+  }
+}
+
+/// Resolves a crash-interrupted journal without executing tools. A Running
+/// call becomes an explicit unknown/possibly-partial result and all later
+/// Pending calls are recorded as not executed. Journals with no Running call
+/// are unchanged.
+pub fn recover_tool_journal(state: State) -> State {
+  case state.tool_journal {
+    None -> state
+    Some(ToolJournal(entries)) ->
+      case recover_running_entries(entries) {
+        None -> state
+        Some(entries) ->
+          State(..state, tool_journal: Some(ToolJournal(entries)))
+      }
+  }
+}
+
+fn recover_running_entries(
+  entries: List(ToolJournalEntry),
+) -> Option(List(ToolJournalEntry)) {
+  let has_running =
+    list.any(entries, fn(entry) {
+      case entry {
+        ToolRunning(..) -> True
+        _ -> False
+      }
+    })
+  case has_running {
+    False -> None
+    True -> Some(recover_entries(entries, False))
+  }
+}
+
+fn recover_entries(
+  entries: List(ToolJournalEntry),
+  running_seen: Bool,
+) -> List(ToolJournalEntry) {
+  case entries {
+    [] -> []
+    [entry, ..rest] ->
+      case entry {
+        ToolRunning(id, name, arguments) -> [
+          recovery_unknown(id, name, arguments),
+          ..recover_entries(rest, True)
+        ]
+        ToolPending(id, name, arguments) if running_seen -> [
+          recovery_cancelled(id, name, arguments),
+          ..recover_entries(rest, True)
+        ]
+        _ -> [entry, ..recover_entries(rest, running_seen)]
+      }
+  }
+}
+
+fn recovery_unknown(
+  id: String,
+  name: String,
+  arguments: String,
+) -> ToolJournalEntry {
+  ToolCompleted(
+    id,
+    name,
+    arguments,
+    [
+      llm.Text(
+        "Tool execution was interrupted after it started. Its outcome is unknown and may be partial. Do not assume it failed or retry it without first verifying external state.",
+      ),
+    ],
+    True,
+    True,
+  )
+}
+
+fn recovery_cancelled(
+  id: String,
+  name: String,
+  arguments: String,
+) -> ToolJournalEntry {
+  ToolCompleted(
+    id,
+    name,
+    arguments,
+    [
+      llm.Text(
+        "Tool execution was cancelled because an earlier tool in the same response was interrupted with an unknown, possibly partial outcome. This tool was not run.",
+      ),
+    ],
+    True,
+    True,
+  )
+}
+
+fn continue_tool_round(
+  active: Active,
+  checkpointer: Checkpointer,
+  router: CallbackRouter,
+  observe: fn(Event) -> Result(Nil, Error),
+) -> Nil {
+  let Active(state:, config:, plugins:) = active
+  let assert Some(ToolJournal(entries)) = state.tool_journal
+  case first_pending(entries) {
+    Error(_) -> finalize_tool_round(active, checkpointer, router, observe, None)
+    Ok(#(id, name, arguments)) -> {
+      let running_entries = mark_first_pending_running(entries)
+      let running =
+        State(..state, tool_journal: Some(ToolJournal(running_entries)))
+      let Checkpointer(commit:) = checkpointer
+      case commit(state.revision, running, ToolProgressCommit) {
+        Error(_) -> Nil
+        Ok(CommitReceipt(state: committed, ..)) -> {
+          let invocation =
+            invoke_journal_tool(plugins, router, id, name, arguments, observe)
+          let #(output, invocation_error) = case invocation {
+            JournalInvocationSucceeded(output) -> #(output, None)
+            JournalInvocationFailed(error, output) -> #(output, Some(error))
+          }
+          let PluginSnapshot(generation:, states:) = plugin_states(plugins)
+          let assert Some(ToolJournal(committed_entries)) =
+            committed.tool_journal
+          let completed_entries =
+            complete_running(committed_entries, id, output)
+          let plugin.ToolOutput(is_error:, ..) = output
+          let completed =
+            State(
+              ..committed,
+              tool_journal: Some(ToolJournal(completed_entries)),
+              plugin_states: states,
+              plugin_generation: generation,
+            )
+          case commit(committed.revision, completed, ToolProgressCommit) {
+            Error(_) -> Nil
+            Ok(CommitReceipt(state: committed, ..)) ->
+              case invocation_error {
+                Some(error) ->
+                  abort_tool_round(
+                    Active(committed, config, plugins),
+                    checkpointer,
+                    router,
+                    observe,
+                    error,
+                  )
+                None ->
+                  case observe(ToolFinished(id, name, is_error)) {
+                    Error(error) ->
+                      abort_tool_round(
+                        Active(committed, config, plugins),
+                        checkpointer,
+                        router,
+                        observe,
+                        error,
+                      )
+                    Ok(Nil) ->
+                      continue_tool_round(
+                        Active(committed, config, plugins),
+                        checkpointer,
+                        router,
+                        observe,
+                      )
+                  }
+              }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn first_pending(
+  entries: List(ToolJournalEntry),
+) -> Result(#(String, String, String), Nil) {
+  entries
+  |> list.find_map(fn(entry) {
+    case entry {
+      ToolPending(id, name, arguments) -> Ok(#(id, name, arguments))
+      _ -> Error(Nil)
+    }
+  })
+}
+
+fn mark_first_pending_running(
+  entries: List(ToolJournalEntry),
+) -> List(ToolJournalEntry) {
+  case entries {
+    [] -> []
+    [ToolPending(id, name, arguments), ..rest] -> [
+      ToolRunning(id, name, arguments),
+      ..rest
+    ]
+    [entry, ..rest] -> [entry, ..mark_first_pending_running(rest)]
+  }
+}
+
+type JournalInvocation {
+  JournalInvocationSucceeded(output: plugin.ToolOutput)
+  JournalInvocationFailed(error: Error, output: plugin.ToolOutput)
+}
+
+fn invoke_journal_tool(
+  host: PluginHost,
+  router: CallbackRouter,
+  id: String,
+  name: String,
+  arguments: String,
+  observe: fn(Event) -> Result(Nil, Error),
+) -> JournalInvocation {
+  case observe(ToolStarted(id, name)) {
+    Error(error) ->
+      JournalInvocationFailed(
+        error,
+        plugin.ToolOutput(
+          [
+            llm.Text(
+              "The tool was not executed because the agent event observer failed before invocation.",
+            ),
+          ],
+          True,
+        ),
+      )
+    Ok(Nil) -> {
+      let PluginHost(subject) = host
+      case
+        process.call_forever(subject, fn(reply) {
+          InvokeTool(name, plugin.ToolInvocation(id, arguments), router, reply)
+        })
+      {
+        Ok(output) -> JournalInvocationSucceeded(output)
+        Error(error) ->
+          JournalInvocationFailed(error, journal_error_output(error))
+      }
+    }
+  }
+}
+
+fn journal_error_output(error: Error) -> plugin.ToolOutput {
+  plugin.ToolOutput([llm.Text(string.inspect(error))], True)
+}
+
+fn complete_running(
+  entries: List(ToolJournalEntry),
+  target_id: String,
+  output: plugin.ToolOutput,
+) -> List(ToolJournalEntry) {
+  let plugin.ToolOutput(content:, is_error:) = output
+  list.map(entries, fn(entry) {
+    case entry {
+      ToolRunning(id, name, arguments) if id == target_id ->
+        ToolCompleted(id, name, arguments, content, is_error, False)
+      _ -> entry
+    }
+  })
+}
+
+fn abort_tool_round(
+  active: Active,
+  checkpointer: Checkpointer,
+  router: CallbackRouter,
+  observe: fn(Event) -> Result(Nil, Error),
+  error: Error,
+) -> Nil {
+  let Active(state:, config:, plugins:) = active
+  let assert Some(ToolJournal(entries)) = state.tool_journal
+  let cancelled_entries = cancel_pending_after_internal_failure(entries)
+  case cancelled_entries == entries {
+    True ->
+      finalize_tool_round(active, checkpointer, router, observe, Some(error))
+    False -> {
+      let cancelled =
+        State(..state, tool_journal: Some(ToolJournal(cancelled_entries)))
+      let Checkpointer(commit:) = checkpointer
+      case commit(state.revision, cancelled, ToolProgressCommit) {
+        Error(_) -> Nil
+        Ok(CommitReceipt(state: committed, ..)) ->
+          finalize_tool_round(
+            Active(committed, config, plugins),
+            checkpointer,
+            router,
+            observe,
+            Some(error),
+          )
+      }
+    }
+  }
+}
+
+fn cancel_pending_after_internal_failure(
+  entries: List(ToolJournalEntry),
+) -> List(ToolJournalEntry) {
+  list.map(entries, fn(entry) {
+    case entry {
+      ToolPending(id, name, arguments) ->
+        ToolCompleted(
+          id,
+          name,
+          arguments,
+          [
+            llm.Text(
+              "This tool was not executed because tool processing stopped after an internal agent failure.",
+            ),
+          ],
+          True,
+          True,
+        )
+      _ -> entry
+    }
+  })
+}
+
+fn finalize_tool_round(
+  active: Active,
+  checkpointer: Checkpointer,
+  router: CallbackRouter,
+  observe: fn(Event) -> Result(Nil, Error),
+  failure: Option(Error),
+) -> Nil {
+  let Active(state:, config:, plugins:) = active
+  let assert Some(ToolJournal(entries)) = state.tool_journal
+  let results =
+    list.map(entries, fn(entry) {
+      let assert ToolCompleted(id:, content:, is_error:, ..) = entry
+      llm.Message(llm.ToolRole, [llm.ToolResult(id, content, is_error)])
+    })
+  let finalized =
+    State(
+      ..state,
+      messages: list.append(state.messages, results),
+      context_messages: case state.context_messages {
+        None -> None
+        Some(context) -> Some(list.append(context, results))
+      },
+      tool_journal: None,
+      status: case failure {
+        None -> Ready
+        Some(error) -> Failed(string.inspect(error))
+      },
+    )
+  let Checkpointer(commit:) = checkpointer
+  case commit(state.revision, finalized, RoundCommit) {
+    Error(_) -> Nil
+    Ok(CommitReceipt(state: committed, ..)) ->
+      case failure, committed.status {
+        // Preserve the existing inbox handoff contract: a concurrent delivery
+        // may have promoted the failed commit back to Ready. Let that message
+        // run; with no pending delivery the observer failure remains terminal.
+        Some(_), Ready | None, _ ->
+          run_loop(
+            Active(committed, config, plugins),
+            checkpointer,
+            router,
+            observe,
+          )
+        Some(_), _ -> Nil
       }
   }
 }
@@ -1167,6 +1666,7 @@ pub fn encode_state(state: State) -> Json {
       "last_compaction_error",
       json.nullable(state.last_compaction_error, json.string),
     ),
+    #("tool_journal", json.nullable(state.tool_journal, encode_tool_journal)),
     #("status", encode_status(state.status)),
   ])
 }
@@ -1231,6 +1731,11 @@ pub fn state_decoder() -> decode.Decoder(State) {
     None,
     decode.optional(decode.string),
   )
+  use tool_journal <- decode.optional_field(
+    "tool_journal",
+    None,
+    decode.optional(tool_journal_decoder()),
+  )
   use status <- decode.field("status", status_decoder())
   decode.success(State(
     id,
@@ -1250,8 +1755,84 @@ pub fn state_decoder() -> decode.Decoder(State) {
     compaction_requested,
     compaction_completed,
     last_compaction_error,
+    tool_journal,
     status,
   ))
+}
+
+fn encode_tool_journal(journal: ToolJournal) -> Json {
+  let ToolJournal(entries:) = journal
+  json.object([#("entries", json.array(entries, encode_tool_journal_entry))])
+}
+
+fn encode_tool_journal_entry(entry: ToolJournalEntry) -> Json {
+  case entry {
+    ToolPending(id, name, arguments) ->
+      encode_tool_journal_base("pending", id, name, arguments, [])
+    ToolRunning(id, name, arguments) ->
+      encode_tool_journal_base("running", id, name, arguments, [])
+    ToolCompleted(id, name, arguments, content, is_error, recovered) ->
+      encode_tool_journal_base("completed", id, name, arguments, [
+        #("content", json.array(content, encode_content)),
+        #("is_error", json.bool(is_error)),
+        #("recovered", json.bool(recovered)),
+      ])
+  }
+}
+
+fn encode_tool_journal_base(
+  kind: String,
+  id: String,
+  name: String,
+  arguments: String,
+  extra: List(#(String, Json)),
+) -> Json {
+  json.object(list.append(
+    [
+      #("status", json.string(kind)),
+      #("id", json.string(id)),
+      #("name", json.string(name)),
+      #("arguments", json.string(arguments)),
+    ],
+    extra,
+  ))
+}
+
+fn tool_journal_decoder() -> decode.Decoder(ToolJournal) {
+  use entries <- decode.field(
+    "entries",
+    decode.list(of: tool_journal_entry_decoder()),
+  )
+  decode.success(ToolJournal(entries))
+}
+
+fn tool_journal_entry_decoder() -> decode.Decoder(ToolJournalEntry) {
+  use kind <- decode.field("status", decode.string)
+  use id <- decode.field("id", decode.string)
+  use name <- decode.field("name", decode.string)
+  use arguments <- decode.field("arguments", decode.string)
+  case kind {
+    "pending" -> decode.success(ToolPending(id, name, arguments))
+    "running" -> decode.success(ToolRunning(id, name, arguments))
+    "completed" -> {
+      use content <- decode.field("content", decode.list(of: content_decoder()))
+      use is_error <- decode.field("is_error", decode.bool)
+      use recovered <- decode.optional_field("recovered", False, decode.bool)
+      decode.success(ToolCompleted(
+        id,
+        name,
+        arguments,
+        content,
+        is_error,
+        recovered,
+      ))
+    }
+    _ ->
+      decode.failure(
+        ToolPending(id, name, arguments),
+        "unknown tool journal entry status",
+      )
+  }
 }
 
 fn encode_stats(stats: llm.Stats) -> Json {

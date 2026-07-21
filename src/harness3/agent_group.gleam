@@ -170,6 +170,7 @@ type Message {
     id: String,
     expected_revision: Int,
     state: agent.State,
+    mode: agent.CommitMode,
     reply: Subject(Result(CommitReceipt, Error)),
   )
   Snapshot(reply: Subject(Result(AgentGroup, Error)))
@@ -803,8 +804,8 @@ fn launch_agent(group: Group, prepared: PreparedAgent) -> agent.Handle {
 fn make_agent(group: Group, prepared: PreparedAgent) -> agent.Handle {
   let PreparedAgent(id:, active:, profile:) = prepared
   let checkpoint =
-    agent.checkpointer(fn(expected, state) {
-      commit_agent(group, id, expected, state)
+    agent.checkpointer_with_mode(fn(expected, state, mode) {
+      commit_agent_with_mode(group, id, expected, state, mode)
       |> result.map(fn(receipt) {
         let CommitReceipt(state:, group_revision:) = receipt
         agent.CommitReceipt(state, group_revision)
@@ -856,9 +857,19 @@ pub fn commit_agent(
   expected_revision: Int,
   state: agent.State,
 ) -> Result(CommitReceipt, Error) {
+  commit_agent_with_mode(group, id, expected_revision, state, agent.RoundCommit)
+}
+
+fn commit_agent_with_mode(
+  group: Group,
+  id: String,
+  expected_revision: Int,
+  state: agent.State,
+  mode: agent.CommitMode,
+) -> Result(CommitReceipt, Error) {
   let Group(subject) = group
   process.call_forever(subject, fn(reply) {
-    CommitAgent(id, expected_revision, state, reply)
+    CommitAgent(id, expected_revision, state, mode, reply)
   })
 }
 
@@ -946,8 +957,8 @@ fn handle_message(
   message: Message,
 ) -> actor.Next(CoordinatorState, Message) {
   case message {
-    CommitAgent(id, expected, agent_state, reply) -> {
-      let outcome = do_commit_agent(state, id, expected, agent_state)
+    CommitAgent(id, expected, agent_state, mode, reply) -> {
+      let outcome = do_commit_agent(state, id, expected, agent_state, mode)
       case outcome {
         Ok(#(state, receipt)) -> {
           process.send(reply, Ok(receipt))
@@ -1008,35 +1019,50 @@ fn handle_message(
         False ->
           case find_agent(state.group.agents, id) {
             Ok(current) ->
-              case current.pending_messages {
-                [] ->
-                  // A compaction request accepted while this worker was
-                  // already exiting is durable but was never executed;
-                  // nothing else would ever pick it up (wakes only start
-                  // Ready agents). Restart a worker for it — unless the last
-                  // attempt failed, in which case restarting would retry a
-                  // failing compaction forever.
-                  case
-                    current.compaction_requested > current.compaction_completed
-                    && current.last_compaction_error == None
-                  {
-                    False -> settle_idle(state)
-                    True ->
-                      case start_agent_worker(state, current, coordinator) {
+              case current.tool_journal {
+                // A worker that exits after a tool-progress checkpoint must be
+                // replaced even with an empty inbox, so the journal can be
+                // closed with an honest interrupted/unknown ToolResult block.
+                Some(_) ->
+                  case start_agent_worker(state, current, coordinator) {
+                    Ok(next) -> actor.continue(next)
+                    Error(_) -> {
+                      abandon(state)
+                      actor.stop()
+                    }
+                  }
+                None ->
+                  case current.pending_messages {
+                    [] ->
+                      // A compaction request accepted while this worker was
+                      // already exiting is durable but was never executed;
+                      // nothing else would ever pick it up (wakes only start
+                      // Ready agents). Restart a worker for it — unless the last
+                      // attempt failed, in which case restarting would retry a
+                      // failing compaction forever.
+                      case
+                        current.compaction_requested
+                        > current.compaction_completed
+                        && current.last_compaction_error == None
+                      {
+                        False -> settle_idle(state)
+                        True ->
+                          case start_agent_worker(state, current, coordinator) {
+                            Ok(next) -> actor.continue(next)
+                            Error(_) -> {
+                              abandon(state)
+                              actor.stop()
+                            }
+                          }
+                      }
+                    [_, ..] ->
+                      case inject_and_start(state, current, [], coordinator) {
                         Ok(next) -> actor.continue(next)
                         Error(_) -> {
                           abandon(state)
                           actor.stop()
                         }
                       }
-                  }
-                [_, ..] ->
-                  case inject_and_start(state, current, [], coordinator) {
-                    Ok(next) -> actor.continue(next)
-                    Error(_) -> {
-                      abandon(state)
-                      actor.stop()
-                    }
                   }
               }
             _ -> settle_idle(state)
@@ -1509,24 +1535,34 @@ fn inject_and_start(
   incoming: List(llm.Message),
   coordinator: Subject(Message),
 ) -> Result(CoordinatorState, Error) {
-  // No worker owns this state, so move both the durable inbox and the new
-  // message into `messages` in one CAS write. A message is never persisted in
-  // both collections, nor absent from both collections, across this handoff.
-  let next_agent =
-    agent.State(
-      ..current,
-      revision: current.revision + 1,
-      messages: list.append(
-        current.messages,
-        list.append(current.pending_messages, incoming),
-      ),
-      context_messages: append_context(
-        current.context_messages,
-        list.append(current.pending_messages, incoming),
-      ),
-      pending_messages: [],
-      status: agent.Ready,
-    )
+  // No worker owns this state. Ordinarily move the durable inbox and new
+  // delivery into the conversation before starting it. An unresolved tool
+  // journal is the exception: its assistant ToolCall must remain adjacent to
+  // the eventual complete ToolResult block, so keep every delivery queued.
+  let next_agent = case current.tool_journal {
+    Some(_) ->
+      agent.State(
+        ..current,
+        revision: current.revision + 1,
+        pending_messages: list.append(current.pending_messages, incoming),
+        status: agent.Ready,
+      )
+    None ->
+      agent.State(
+        ..current,
+        revision: current.revision + 1,
+        messages: list.append(
+          current.messages,
+          list.append(current.pending_messages, incoming),
+        ),
+        context_messages: append_context(
+          current.context_messages,
+          list.append(current.pending_messages, incoming),
+        ),
+        pending_messages: [],
+        status: agent.Ready,
+      )
+  }
   use catalog_session <- result.try(
     model_catalog.resume(state.storage, state.group.model_catalog_key)
     |> result.map_error(ModelCatalogFailed),
@@ -1627,6 +1663,7 @@ fn do_commit_agent(
   id: String,
   expected: Int,
   new_agent: agent.State,
+  mode: agent.CommitMode,
 ) -> Result(#(CoordinatorState, CommitReceipt), Error) {
   use _ <- result.try(case state.owned {
     True -> Ok(Nil)
@@ -1641,6 +1678,14 @@ fn do_commit_agent(
     True -> Ok(Nil)
     False -> Error(InvalidGroup("commit agent id does not match state id"))
   })
+  use _ <- result.try(case mode, new_agent.tool_journal {
+    agent.ToolProgressCommit, Some(_) -> Ok(Nil)
+    agent.ToolProgressCommit, None ->
+      Error(InvalidGroup("tool progress commit has no tool journal"))
+    agent.RoundCommit, None -> Ok(Nil)
+    agent.RoundCommit, Some(_) ->
+      Error(InvalidGroup("round commit left a tool journal unresolved"))
+  })
   let agent_revision = current.revision + 1
   let new_agent = case new_agent.plugin_generation < current.plugin_generation {
     True ->
@@ -1651,21 +1696,30 @@ fn do_commit_agent(
       )
     False -> new_agent
   }
-  let has_pending = !list.is_empty(current.pending_messages)
-  // This group CAS is the active-worker handoff: the new model output and all
-  // messages that arrived during its LLM call are committed together, while
-  // the inbox is cleared. The returned authoritative state makes the worker
-  // continue immediately when anything was injected.
+  // Tool progress is write-ahead state: messages arriving while a tool call
+  // is unresolved must stay in the inbox, otherwise a user message could be
+  // persisted between an assistant ToolCall and its matching ToolResult block.
+  let #(messages, context_messages, pending_messages, has_pending) = case mode {
+    agent.ToolProgressCommit -> #(
+      new_agent.messages,
+      new_agent.context_messages,
+      current.pending_messages,
+      False,
+    )
+    agent.RoundCommit -> #(
+      list.append(new_agent.messages, current.pending_messages),
+      append_context(new_agent.context_messages, current.pending_messages),
+      [],
+      !list.is_empty(current.pending_messages),
+    )
+  }
   let new_agent =
     agent.State(
       ..new_agent,
       revision: agent_revision,
-      messages: list.append(new_agent.messages, current.pending_messages),
-      context_messages: append_context(
-        new_agent.context_messages,
-        current.pending_messages,
-      ),
-      pending_messages: [],
+      messages:,
+      context_messages:,
+      pending_messages:,
       compaction_requested: int.max(
         new_agent.compaction_requested,
         current.compaction_requested,
@@ -2215,17 +2269,24 @@ fn indexed_epoch(config: Config, group: AgentGroup) -> Int {
 }
 
 fn inject_pending(state: agent.State) -> agent.State {
-  case state.pending_messages {
-    [] -> state
-    pending ->
-      agent.State(
-        ..state,
-        revision: state.revision + 1,
-        messages: list.append(state.messages, pending),
-        context_messages: append_context(state.context_messages, pending),
-        pending_messages: [],
-        status: agent.Ready,
-      )
+  // An unresolved tool journal owns the gap after its assistant ToolCall.
+  // Keep deliveries in the inbox until recovery has materialized a complete
+  // ToolResult block, or they would split an invalid provider conversation.
+  case state.tool_journal {
+    Some(_) -> agent.State(..state, status: agent.Ready)
+    None ->
+      case state.pending_messages {
+        [] -> state
+        pending ->
+          agent.State(
+            ..state,
+            revision: state.revision + 1,
+            messages: list.append(state.messages, pending),
+            context_messages: append_context(state.context_messages, pending),
+            pending_messages: [],
+            status: agent.Ready,
+          )
+      }
   }
 }
 

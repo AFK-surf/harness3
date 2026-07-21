@@ -388,6 +388,7 @@ pub fn encrypted_reasoning_state_round_trip_test() {
       compaction_requested: 2,
       compaction_completed: 1,
       last_compaction_error: Some("retry"),
+      tool_journal: None,
       attributes: dict.from_list([#("role", "lead engineer")]),
       status: agent.Ready,
     )
@@ -515,7 +516,7 @@ pub fn full_agent_loop_with_mocked_llm_test() {
   let assert [completed] = snapshot.agents
   assert completed.status == agent.Completed
   assert completed.round == 2
-  assert completed.revision == 2
+  assert completed.revision == 5
   assert dict.get(completed.plugin_states, "stateful") == Ok("{\"calls\":1}")
   assert contains_tool_result(completed.messages)
   let assert Ok(llm.Message(llm.Assistant, [llm.Text("final answer")])) =
@@ -525,7 +526,7 @@ pub fn full_agent_loop_with_mocked_llm_test() {
   let assert Ok(resumed_snapshot) = agent_group.load(config)
   let assert [resumed_agent] = resumed_snapshot.agents
   assert resumed_agent.round == 2
-  assert resumed_agent.revision == 2
+  assert resumed_agent.revision == 5
   assert dict.get(resumed_agent.plugin_states, "stateful")
     == Ok("{\"calls\":1}")
 
@@ -1531,7 +1532,7 @@ pub fn plugin_callback_between_agents_test() {
   let assert Ok(receiver) =
     list.find(snapshot.agents, fn(state) { state.id == "receiver" })
   assert caller.round == 2
-  assert caller.revision == 2
+  assert caller.revision == 5
   assert dict.get(caller.plugin_states, "caller_plugin")
     == Ok("{\"remote_calls\":1}")
   assert caller.plugin_generation == 1
@@ -1839,7 +1840,7 @@ pub fn ambiguous_successful_cas_is_idempotent_and_fences_next_commit_test() {
   let assert [completed] = snapshot.agents
   assert completed.status == agent.Completed
   assert completed.round == 2
-  assert completed.revision == 2
+  assert completed.revision == 5
   remove_directory(root)
 }
 
@@ -2947,5 +2948,97 @@ pub fn truncated_turn_fails_instead_of_completing_test() {
   let assert [failed] = snapshot.agents
   let assert agent.Failed(reason) = failed.status
   assert string.contains(reason, "truncated")
+  remove_directory(root)
+}
+
+pub fn interrupted_tool_journal_recovers_before_pending_messages_test() {
+  let root = temporary_root("tool-journal-recovery-test")
+  let backend = local.new(local.config(root))
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let requests = process.new_subject()
+  let transport =
+    agent.model_transport(fn(_, request, consume) {
+      let release = process.new_subject()
+      process.send(requests, #(request.messages, release))
+      let assert Ok(Nil) = process.receive(release, within: 5000)
+      let assert Ok(Nil) = consume(llm.MessageStart("recovered", "test-model"))
+      let assert Ok(Nil) = consume(llm.TextDelta(0, "recovery understood"))
+      let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+      let assert Ok(Nil) = consume(llm.MessageStop)
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
+  let config =
+    agent_group.Config(
+      backend,
+      "groups/tool-journal-recovery",
+      [profile],
+      10,
+      60_000,
+    )
+  let calls = [
+    llm.ToolCall("done", "test.done", json.object([])),
+    llm.ToolCall("running", "test.running", json.object([])),
+    llm.ToolCall("later", "test.later", json.object([])),
+  ]
+  let interrupted =
+    agent.State(
+      ..agent.state("agent", "model"),
+      messages: [
+        llm.Message(llm.User, [llm.Text("perform the operations")]),
+        llm.Message(llm.Assistant, calls),
+      ],
+      pending_messages: [
+        llm.Message(llm.User, [llm.Text("message received during tool")]),
+      ],
+      tool_journal: Some(
+        agent.ToolJournal([
+          agent.ToolCompleted(
+            "done",
+            "test.done",
+            "{}",
+            [llm.Text("completed before crash")],
+            False,
+            False,
+          ),
+          agent.ToolRunning("running", "test.running", "{}"),
+          agent.ToolPending("later", "test.later", "{}"),
+        ]),
+      ),
+    )
+  let assert Ok(loaded) =
+    agent_group.create(
+      config,
+      agent_group.new("tool-journal-recovery", "catalog", [interrupted]),
+    )
+  let assert Ok(group) = agent_group.wake(loaded)
+  let assert Ok(#(messages, release)) = process.receive(requests, within: 5000)
+  let assert [
+    llm.Message(llm.User, [llm.Text("perform the operations")]),
+    llm.Message(llm.Assistant, recovered_calls),
+    llm.Message(
+      llm.ToolRole,
+      [llm.ToolResult("done", [llm.Text("completed before crash")], False)],
+    ),
+    llm.Message(
+      llm.ToolRole,
+      [llm.ToolResult("running", [llm.Text(unknown)], True)],
+    ),
+    llm.Message(
+      llm.ToolRole,
+      [llm.ToolResult("later", [llm.Text(cancelled)], True)],
+    ),
+    llm.Message(llm.User, [llm.Text("message received during tool")]),
+  ] = messages
+  assert recovered_calls == calls
+  assert string.contains(unknown, "outcome is unknown and may be partial")
+  assert string.contains(cancelled, "This tool was not run")
+  process.send(release, Nil)
+  process.sleep(100)
+  let assert Ok(Nil) = agent_group.stop(group)
   remove_directory(root)
 }

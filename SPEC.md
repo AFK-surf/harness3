@@ -270,8 +270,8 @@ group state (verified by test `wake_loads_the_model_catalog_on_demand_test`).
 ### 6.1 Durable state
 
 `agent.State` = id, profile_id, revision, model_id, round, `messages`,
-`pending_messages` (durable inbox), token stats, per-plugin JSON states,
-`plugin_generation` (monotonic counter for plugin-state freshness),
+`pending_messages` (durable inbox), optional `tool_journal`, token stats,
+per-plugin JSON states, `plugin_generation` (monotonic counter for plugin-state freshness),
 `attributes` (extended attributes: opaque application-owned string key/values,
 persisted verbatim and never interpreted by the harness),
 `last_catalog_revision`, status ∈ {Ready, Waiting, Completed, Failed(reason)}.
@@ -294,13 +294,21 @@ include the synthesized system prompt.
    (`InvalidModelOutput` otherwise). The finish reason is validated: `Stop`, `ToolUse`,
    `Paused`, or none pass; `Length`, `ContentFilter`, `Cancelled`, `Failed`, and
    `Other` fail the round with `InvalidModelOutput`.
-4. Tool calls execute sequentially through the plugin-host actor; each produces one
-   ToolRole message. During a tool, cross-agent callbacks are dispatched through the
-   group coordinator.
-5. Disposition: `Paused` finish → `Continue` regardless of tool calls; otherwise tool
-   messages present → `Continue` (status Ready); none → `Complete`
-   (status Completed). Round counter increments; plugin states/generation are
-   re-snapshotted from the plugin host.
+4. Before any tool executes, the complete Assistant message is durably committed with
+   an ordered journal whose calls are `Pending`. Each call is committed `Running` before
+   invoking its plugin, then `Completed(output)` together with the latest plugin state.
+   Calls execute sequentially; cross-agent callbacks still route through the coordinator.
+5. Once every call is Completed, all matching ToolResult messages are appended as one
+   ordered block and the journal is cleared. Only this final commit folds the durable
+   inbox into the conversation. The next model request is never built while a journal
+   remains unresolved.
+6. After a crash, a durable Running call becomes an error ToolResult saying its outcome
+   is unknown and may be partial; later Pending calls become explicit not-executed
+   results. Earlier Completed outputs are retained. This closes every ToolCall/ToolResult
+   pair before pending user messages are appended, and never blindly replays a possibly
+   side-effecting invocation. If the event observer fails at ToolStarted or ToolFinished,
+   the journal is likewise closed (later calls are recorded as not executed) before the
+   agent becomes Failed; observer errors are never silently swallowed.
 
 ### 6.3 Process structure and lifecycle
 
@@ -466,24 +474,26 @@ test `ambiguous_successful_cas_is_idempotent…`).
 
 ### 7.4 Agent commit protocol
 
-`CommitAgent(id, expected_revision, new_state)`: rejected when unowned
+`CommitAgent(id, expected_revision, new_state, mode)`: rejected when unowned
 (`LostGroupOwnership`) or when `expected_revision` mismatches (`StaleAgentCommit`).
-On success the agent revision increments, and — atomically in the same group CAS —
-any messages queued in `pending_messages` while the worker was busy are appended to
-`messages`, the inbox is cleared, and status is forced Ready so the returned state makes
-the worker continue. If the committed state's `plugin_generation` is older than the
-currently persisted one (a cross-agent callback advanced it mid-round), the persisted
-plugin states win.
+On success the agent revision increments. `ToolProgressCommit` requires an unresolved
+journal and preserves the coordinator's current `pending_messages` without inserting
+anything between ToolCall and ToolResult. `RoundCommit` requires the journal to be clear
+and atomically appends the inbox to `messages`, clears it, and forces Ready when messages
+were pending. If the committed state's `plugin_generation` is older than the currently
+persisted one (a cross-agent callback advanced it mid-round), the persisted plugin states
+win.
 
 ### 7.5 Message delivery (`send_message`)
 
 Empty/whitespace messages are rejected. If the target agent has a live worker, the
 message is appended to the durable `pending_messages` inbox *without* bumping the agent
-revision (the running worker's next commit consumes it). Otherwise the inbox plus the
+revision (the worker's next final round commit consumes it). Otherwise the inbox plus the
 new message are folded into `messages` in one CAS (revision+1, status Ready) and a fresh
-worker is started. A message is never persisted in both collections nor absent from
-both. When a worker exits leaving a non-empty inbox, the coordinator immediately
-restarts it with the inbox injected.
+worker is started. With an unresolved tool journal, even a dormant worker keeps all new
+deliveries in the inbox and restarts recovery first. A message is never inserted between
+an Assistant ToolCall and its complete ToolResult block. When a worker exits leaving an
+inbox or journal, the coordinator immediately restarts it.
 
 ### 7.6 Cross-agent callbacks
 
