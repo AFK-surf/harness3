@@ -339,7 +339,13 @@ fn update_session_roster(
   // Construct every profile before stopping anything. A missing MCP
   // configuration or invalid plugin graph must leave the live team untouched.
   use next_config <- result.try(group_config(service, next_metadata))
-  use current_config <- result.try(group_config(service, current_metadata))
+  // The pre-edit profiles only reconstruct the stopped group for resumption;
+  // a vanished workspace in the OLD association must not block the edit that
+  // repairs it, so their storage plugin tolerates a dangling reference.
+  use current_config <- result.try(group_config_repair(
+    service,
+    current_metadata,
+  ))
   use _ <- result.try(stop_session(service, id))
   // Profiles for agents the edit removes are still needed to resume the
   // pre-edit group; survivors and additions use the post-edit profiles.
@@ -1017,8 +1023,28 @@ pub fn update_cloud_storage_workspace(
 
 /// Removes a workspace configuration. Objects already stored under its prefix
 /// are left untouched, but a session that still references the workspace
-/// blocks removal so it cannot lose its storage by accident.
+/// blocks removal so it cannot lose its storage by accident. The reference
+/// check runs inside the commit retry loop, so a retry always re-checks
+/// against freshly listed sessions; only an association landing in the same
+/// instant as the final write can slip through, and such a dangling reference
+/// stays repairable by editing the session.
 pub fn remove_cloud_storage_workspace(
+  service: Service,
+  id: String,
+) -> Result(Nil, String) {
+  commit_workspace_change(
+    service,
+    fn(catalog) {
+      use _ <- result.try(ensure_workspace_unreferenced(service, id))
+      storage_workspaces.remove_workspace(catalog, id)
+      |> result.map(fn(next) { #(next, Nil) })
+      |> result.map_error(workspace_error)
+    },
+    3,
+  )
+}
+
+fn ensure_workspace_unreferenced(
   service: Service,
   id: String,
 ) -> Result(Nil, String) {
@@ -1031,7 +1057,7 @@ pub fn remove_cloud_storage_workspace(
         False -> Error(Nil)
       }
     })
-  use _ <- result.try(case referencing {
+  case referencing {
     [] -> Ok(Nil)
     _ ->
       Error(
@@ -1040,16 +1066,7 @@ pub fn remove_cloud_storage_workspace(
         <> "` is still used by session(s): "
         <> string.join(referencing, ", "),
       )
-  })
-  commit_workspace_change(
-    service,
-    fn(catalog) {
-      storage_workspaces.remove_workspace(catalog, id)
-      |> result.map(fn(next) { #(next, Nil) })
-      |> result.map_error(workspace_error)
-    },
-    3,
-  )
+  }
 }
 
 fn normalize_workspace_prefix(id: String, prefix: String) -> String {
@@ -1154,11 +1171,40 @@ fn cloud_storage_plugin(
 ) -> Result(plugin.Plugin, String) {
   case metadata.cloud_storage_workspace {
     Some(workspace_id) -> {
-      use workspace <- result.try(find_workspace(service, workspace_id))
+      use workspace <- result.try(
+        find_workspace(service, workspace_id)
+        |> result.map_error(fn(_) {
+          "session references unknown cloud storage workspace `"
+          <> workspace_id
+          <> "`; edit the session to re-point or clear its cloud storage association"
+        }),
+      )
       cloud_storage.new(service.storage, workspace.prefix)
     }
     None ->
       cloud_storage.new(service.storage, isolated_storage_prefix(metadata.id))
+  }
+}
+
+/// The repair-path variant: a dangling association falls back to the isolated
+/// namespace instead of failing. Only used to reconstruct a session's
+/// pre-edit profiles, where the plugin's empty durable state makes any valid
+/// scope equivalent.
+fn cloud_storage_plugin_lenient(
+  service: Service,
+  metadata: SessionMetadata,
+) -> Result(plugin.Plugin, String) {
+  case metadata.cloud_storage_workspace {
+    Some(workspace_id) ->
+      case find_workspace(service, workspace_id) {
+        Ok(workspace) -> cloud_storage.new(service.storage, workspace.prefix)
+        Error(_) ->
+          cloud_storage.new(
+            service.storage,
+            isolated_storage_prefix(metadata.id),
+          )
+      }
+    None -> cloud_storage_plugin(service, metadata)
   }
 }
 
@@ -1346,6 +1392,27 @@ fn group_config(
   service: Service,
   metadata: SessionMetadata,
 ) -> Result(agent_group.Config, String) {
+  group_config_with_storage(service, metadata, cloud_storage_plugin)
+}
+
+/// Builds profiles for the session's CURRENT (pre-edit) metadata when
+/// resuming a stopped group during a roster/workspace edit. The cloud storage
+/// plugin is stateless, so a dangling association may safely fall back to the
+/// session's isolated namespace — otherwise a session whose workspace vanished
+/// could never be re-pointed or cleared, since every repair attempt would
+/// fail while reconstructing its old profiles.
+fn group_config_repair(
+  service: Service,
+  metadata: SessionMetadata,
+) -> Result(agent_group.Config, String) {
+  group_config_with_storage(service, metadata, cloud_storage_plugin_lenient)
+}
+
+fn group_config_with_storage(
+  service: Service,
+  metadata: SessionMetadata,
+  storage_plugin: fn(Service, SessionMetadata) -> Result(plugin.Plugin, String),
+) -> Result(agent_group.Config, String) {
   use profiles <- result.try(
     list.try_map(metadata.agents, fn(spec) {
       let message_targets = case spec.id {
@@ -1367,7 +1434,7 @@ fn group_config(
           message_targets,
           capability_instructions(spec.kind),
         )
-      use group_storage <- result.try(cloud_storage_plugin(service, metadata))
+      use group_storage <- result.try(storage_plugin(service, metadata))
       use plugins <- result.try(case spec.kind {
         CodingAgent ->
           Ok([

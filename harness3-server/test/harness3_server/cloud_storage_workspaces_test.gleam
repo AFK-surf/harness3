@@ -386,3 +386,102 @@ pub fn sessions_share_storage_through_their_associated_workspace_test() {
   unset_service_environment()
   let assert Ok(Nil) = simplifile.delete(root)
 }
+
+/// A workspace removal racing a session's association leaves the session
+/// referencing a workspace the catalog no longer contains. Wake paths must
+/// fail with a repair hint, and the edit path must stay able to re-point or
+/// clear the dead association instead of wedging on the pre-edit profiles.
+pub fn a_session_whose_workspace_vanished_stays_repairable_test() {
+  let root = temporary_root("harness3-workspaces-repair-test")
+  let data_path = root <> "/data"
+  let workspace = root <> "/workspace"
+  let running = start_service(root)
+
+  let assert Ok(_) =
+    service.add_cloud_storage_workspace(running, "shared", "Shared", "")
+  let assert Ok(_) =
+    service.add_cloud_storage_workspace(running, "custom", "Custom", "t/custom")
+  let assert Ok(repoint_target) =
+    service.create_session(
+      running,
+      service.CreateInput("test/model-1", workspace, 1, Some("shared")),
+    )
+  let assert Ok(clear_target) =
+    service.create_session(
+      running,
+      service.CreateInput("test/model-1", workspace, 1, Some("shared")),
+    )
+
+  // The race outcome, produced directly: the catalog commits a removal while
+  // both sessions still carry the association attribute.
+  let backend = local.new(local.config(data_path))
+  let assert Ok(catalog_session) =
+    storage_workspaces.resume(backend, "harness3-server/cloud-storage-workspaces")
+  let assert Ok(narrowed) =
+    storage_workspaces.remove_workspace(
+      storage_workspaces.catalog(catalog_session),
+      "shared",
+    )
+  let assert Ok(_) = storage_workspaces.commit(catalog_session, narrowed)
+
+  // Wake and attribute paths refuse to run the misconfigured session and say
+  // how to fix it.
+  let assert Error(wake_error) =
+    service.request_compaction(running, repoint_target.metadata.id, "lead")
+  assert string.contains(wake_error, "unknown cloud storage workspace")
+  assert string.contains(wake_error, "re-point or clear")
+  let assert Error(rename_error) =
+    service.update_session(
+      running,
+      repoint_target.metadata.id,
+      service.UpdateInput(
+        "Plain rename",
+        repoint_target.metadata.agents,
+        service.KeepAssociation,
+      ),
+    )
+  assert string.contains(rename_error, "unknown cloud storage workspace")
+
+  // Re-pointing repairs the first session.
+  let assert Ok(service.Session(metadata: repointed, ..)) =
+    service.update_session(
+      running,
+      repoint_target.metadata.id,
+      service.UpdateInput(
+        "Repaired session",
+        repoint_target.metadata.agents,
+        service.SetAssociation(Some("custom")),
+      ),
+    )
+  assert repointed.cloud_storage_workspace == Some("custom")
+  let _ = storage_write(lead_runtime(repointed.id), "fixed.txt", "re-pointed")
+  let assert Ok(_) = storage.get(backend, "t/custom/fixed.txt")
+
+  // Clearing repairs the second.
+  let assert Ok(service.Session(metadata: cleared, ..)) =
+    service.update_session(
+      running,
+      clear_target.metadata.id,
+      service.UpdateInput(
+        "Cleared session",
+        clear_target.metadata.agents,
+        service.SetAssociation(None),
+      ),
+    )
+  assert cleared.cloud_storage_workspace == None
+  let _ = storage_write(lead_runtime(cleared.id), "fixed.txt", "cleared")
+  let assert Ok(_) =
+    storage.get(
+      backend,
+      "plugins/cloud_storage/sessions/"
+        <> cleared.id
+        <> "/objects/fixed.txt",
+    )
+
+  let assert Ok(Nil) = service.stop_session(running, repointed.id)
+  let assert Ok(Nil) = service.stop_session(running, cleared.id)
+  service.stop(running)
+
+  unset_service_environment()
+  let assert Ok(Nil) = simplifile.delete(root)
+}

@@ -219,9 +219,16 @@ event-consumer failures are permanent.
   whenever their profiles are built, while unassociated sessions get an
   isolated namespace at `plugins/cloud_storage/sessions/<session id>/objects/`.
   A workspace cannot be deleted while a session
-  references it, its stored objects are never deleted with it, and changing
+  references it (the reference check re-runs inside the removal's commit
+  retry loop), its stored objects are never deleted with it, and changing
   a session's association stops and re-wakes the team like a roster change
-  because running agents hold their scope in an activated plugin.
+  because running agents hold their scope in an activated plugin. If a
+  reference nonetheless dangles — an association landing in the same instant
+  as a removal's final write — wake and message paths fail with a repair
+  hint, and the edit path can still re-point or clear the dead association:
+  reconstructing a session's pre-edit profiles tolerates the missing
+  workspace (falling back to the isolated namespace) because the plugin is
+  stateless.
 
 ### 4.2 MCP plugin
 
