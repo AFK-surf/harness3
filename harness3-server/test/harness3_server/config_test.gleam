@@ -205,7 +205,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let assert Ok(service.Session(metadata, group)) =
     service.create_session(
       second,
-      service.CreateInput("test/model-1", workspace, 3),
+      service.CreateInput("test/model-1", workspace, 3, None),
     )
   assert metadata.title == "New coding session"
   assert metadata.prompt == ""
@@ -233,7 +233,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     service.update_session(
       second,
       metadata.id,
-      service.UpdateInput("Named while active", metadata.agents),
+      service.UpdateInput("Named while active", metadata.agents, service.KeepAssociation),
     )
   assert renamed.title == "Named while active"
   let assert agent_group.Claimed(..) = renamed_group.execution
@@ -331,16 +331,18 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
     service.update_session(
       second,
       metadata.id,
-      service.UpdateInput("Edited coding team", [
-        service.AgentSpec(..lead_spec, model_id: "missing/model"),
-      ]),
+      service.UpdateInput(
+        "Edited coding team",
+        [service.AgentSpec(..lead_spec, model_id: "missing/model")],
+        service.KeepAssociation,
+      ),
     )
   assert string.contains(unknown_model, "unknown model")
   let assert Ok(service.Session(metadata: edited, group: edited_group)) =
     service.update_session(
       second,
       metadata.id,
-      service.UpdateInput("Edited coding team", desired_agents),
+      service.UpdateInput("Edited coding team", desired_agents, service.KeepAssociation),
     )
   assert edited.title == "Edited coding team"
   let assert [edited_lead, _, edited_verifier] = edited.agents
@@ -393,7 +395,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let assert Ok(service.Session(metadata: without_mcp_metadata, ..)) =
     service.create_session(
       without_mcp,
-      service.CreateInput("test/model-1", workspace, 2),
+      service.CreateInput("test/model-1", workspace, 2, None),
     )
   let assert [_, service.AgentSpec(kind: service.ResearchAgent, ..)] =
     without_mcp_metadata.agents
@@ -521,7 +523,7 @@ pub fn pi_models_load_and_catalog_restart_is_idempotent_test() {
   let assert Ok(service.Session(metadata: offline_metadata, ..)) =
     service.create_session(
       with_offline_mcp,
-      service.CreateInput("test/model-1", workspace, 2),
+      service.CreateInput("test/model-1", workspace, 2, None),
     )
   let assert [_, service.AgentSpec(kind: service.McpSpecialist, ..)] =
     offline_metadata.agents

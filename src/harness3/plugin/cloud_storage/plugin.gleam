@@ -45,28 +45,28 @@ type ListedObject {
   ListedObject(key: String, size: Int, modified_at_seconds: Int)
 }
 
-pub fn new(storage: Storage, group_id: String) -> plugin.Plugin {
-  let group_scope = scope.new(group_id)
+pub fn new(storage: Storage, scope: Scope) -> plugin.Plugin {
   plugin.new(plugin_name, "{}")
   |> plugin.with_system_prompt(plugin.SystemPromptSection(
     "Cloud storage",
-    "You have durable UTF-8 text-object storage shared by every agent in this agent group. Keys are safe relative paths. Use `cloud_storage.list` repeatedly with its opaque cursor until next_cursor is null. Writes replace existing content, deletes are idempotent, and `cloud_storage.get_url` provides direct upload or download access.",
+    "You have durable UTF-8 text-object storage in a cloud storage workspace shared with every agent configured for the same workspace. Keys are safe relative paths. Use `cloud_storage.list` repeatedly with its opaque cursor until next_cursor is null. Writes replace existing content, deletes are idempotent, and `cloud_storage.get_url` provides direct upload or download access.",
   ))
-  |> plugin.with_tool(read_tool(storage, group_scope))
-  |> plugin.with_tool(write_tool(storage, group_scope))
-  |> plugin.with_tool(list_tool(storage, group_scope))
-  |> plugin.with_tool(delete_tool(storage, group_scope))
-  |> plugin.with_tool(url_tool(storage, group_scope))
+  |> plugin.with_tool(read_tool(storage, scope))
+  |> plugin.with_tool(write_tool(storage, scope))
+  |> plugin.with_tool(list_tool(storage, scope))
+  |> plugin.with_tool(delete_tool(storage, scope))
+  |> plugin.with_tool(url_tool(storage, scope))
 }
 
-fn read_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
+fn read_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
   plugin.tool(
     llm.Tool(
       "cloud_storage.read",
-      Some("Read a UTF-8 text object from agent-group cloud storage."),
-      object_schema([property("key", "string", "Group-relative object key")], [
-        "key",
-      ]),
+      Some("Read a UTF-8 text object from the cloud storage workspace."),
+      object_schema(
+        [property("key", "string", "Workspace-relative object key")],
+        ["key"],
+      ),
     ),
     fn(state, context, invocation) {
       let plugin.ToolInvocation(arguments:, ..) = invocation
@@ -76,7 +76,7 @@ fn read_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
             "Invalid cloud_storage.read arguments: " <> string.inspect(error),
           )
         Ok(KeyArguments(key)) ->
-          case scope.object_key(group_scope, key) {
+          case scope.object_key(storage_scope, key) {
             Error(error) -> error_output("Invalid cloud storage key: " <> error)
             Ok(backend_key) ->
               case storage.get(storage, backend_key) {
@@ -97,16 +97,16 @@ fn read_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
   )
 }
 
-fn write_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
+fn write_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
   plugin.tool(
     llm.Tool(
       "cloud_storage.write",
       Some(
-        "Create or replace a UTF-8 text object in agent-group cloud storage.",
+        "Create or replace a UTF-8 text object in the cloud storage workspace.",
       ),
       object_schema(
         [
-          property("key", "string", "Group-relative object key"),
+          property("key", "string", "Workspace-relative object key"),
           property("content", "string", "Complete new object contents"),
         ],
         ["key", "content"],
@@ -120,7 +120,7 @@ fn write_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
             "Invalid cloud_storage.write arguments: " <> string.inspect(error),
           )
         Ok(WriteArguments(key, content)) ->
-          case scope.object_key(group_scope, key) {
+          case scope.object_key(storage_scope, key) {
             Error(error) -> error_output("Invalid cloud storage key: " <> error)
             Ok(backend_key) ->
               case
@@ -141,12 +141,12 @@ fn write_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
   )
 }
 
-fn list_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
+fn list_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
   plugin.tool(
     llm.Tool(
       "cloud_storage.list",
       Some(
-        "List agent-group cloud storage in lexicographic key order. Follow next_cursor until it is null; cursors are opaque.",
+        "List the cloud storage workspace in lexicographic key order. Follow next_cursor until it is null; cursors are opaque.",
       ),
       object_schema(
         [
@@ -177,21 +177,24 @@ fn list_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
           error_output(
             "Invalid cloud_storage.list arguments: " <> string.inspect(error),
           )
-        Ok(arguments) -> list_objects(storage, group_scope, arguments)
+        Ok(arguments) -> list_objects(storage, storage_scope, arguments)
       }
       Ok(plugin.hook_result(state, context, output))
     },
   )
 }
 
-fn delete_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
+fn delete_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
   plugin.tool(
     llm.Tool(
       "cloud_storage.delete",
-      Some("Idempotently delete a text object from agent-group cloud storage."),
-      object_schema([property("key", "string", "Group-relative object key")], [
-        "key",
-      ]),
+      Some(
+        "Idempotently delete a text object from the cloud storage workspace.",
+      ),
+      object_schema(
+        [property("key", "string", "Workspace-relative object key")],
+        ["key"],
+      ),
     ),
     fn(state, context, invocation) {
       let plugin.ToolInvocation(arguments:, ..) = invocation
@@ -201,7 +204,7 @@ fn delete_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
             "Invalid cloud_storage.delete arguments: " <> string.inspect(error),
           )
         Ok(KeyArguments(key)) ->
-          case scope.object_key(group_scope, key) {
+          case scope.object_key(storage_scope, key) {
             Error(error) -> error_output("Invalid cloud storage key: " <> error)
             Ok(backend_key) ->
               case storage.delete(storage, backend_key) {
@@ -228,16 +231,16 @@ fn delete_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
   )
 }
 
-fn url_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
+fn url_tool(storage: Storage, storage_scope: Scope) -> plugin.Tool {
   plugin.tool(
     llm.Tool(
       "cloud_storage.get_url",
       Some(
-        "Get a direct upload or download URL for an agent-group cloud storage object. Cloud URLs expire after five minutes.",
+        "Get a direct upload or download URL for a cloud storage workspace object. Cloud URLs expire after five minutes.",
       ),
       object_schema(
         [
-          property("key", "string", "Group-relative object key"),
+          property("key", "string", "Workspace-relative object key"),
           enum_property("operation", "Operation the URL authorizes", [
             "upload",
             "download",
@@ -255,7 +258,7 @@ fn url_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
           )
         Ok(UrlArguments(key, operation)) ->
           case
-            scope.object_key(group_scope, key),
+            scope.object_key(storage_scope, key),
             transfer_operation(operation)
           {
             Error(error), _ ->
@@ -300,7 +303,7 @@ fn url_tool(storage: Storage, group_scope: Scope) -> plugin.Tool {
 
 fn list_objects(
   storage: Storage,
-  group_scope: Scope,
+  storage_scope: Scope,
   arguments: ListArguments,
 ) -> plugin.ToolOutput {
   case validate_page_size(arguments.limit) {
@@ -312,7 +315,7 @@ fn list_objects(
           case validate_position(position) {
             Error(error) -> error_output(error)
             Ok(Nil) ->
-              case scope.list_prefix(group_scope, position.prefix) {
+              case scope.list_prefix(storage_scope, position.prefix) {
                 Error(error) ->
                   error_output("Invalid cloud storage prefix: " <> error)
                 Ok(backend_prefix) ->
@@ -321,7 +324,7 @@ fn list_objects(
                       error_output(storage_error("list", position.prefix, error))
                     Ok(metadata) ->
                       page_output(
-                        group_scope,
+                        storage_scope,
                         position,
                         arguments.limit,
                         metadata,
@@ -379,7 +382,7 @@ fn validate_position(position: PagePosition) -> Result(Nil, String) {
 }
 
 fn page_output(
-  group_scope: Scope,
+  storage_scope: Scope,
   position: PagePosition,
   limit: Int,
   metadata: List(Metadata),
@@ -388,7 +391,7 @@ fn page_output(
     metadata
     |> list.filter_map(fn(item) {
       let storage.Metadata(key:, size:, modified_at_seconds:, ..) = item
-      case scope.logical_key(group_scope, key) {
+      case scope.logical_key(storage_scope, key) {
         Error(_) -> Error(Nil)
         Ok(logical_key) ->
           case string.starts_with(logical_key, position.prefix) {

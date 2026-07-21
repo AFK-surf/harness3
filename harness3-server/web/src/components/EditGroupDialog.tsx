@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { errorMessage } from "../api";
 import type {
+  CloudStorageWorkspace,
   Model,
   Session,
   UpdateAgentInput,
@@ -28,6 +29,7 @@ interface EditGroupDialogProps {
   open: boolean;
   session: Session;
   models: Model[];
+  cloudWorkspaces: CloudStorageWorkspace[];
   onClose: () => void;
   onSave: (input: UpdateSessionInput) => Promise<void>;
   onError: (message: string) => void;
@@ -44,17 +46,20 @@ export function EditGroupDialog({
   open,
   session,
   models,
+  cloudWorkspaces,
   onClose,
   onSave,
   onError,
 }: EditGroupDialogProps) {
   const [name, setName] = useState(session.title);
   const [agents, setAgents] = useState<DraftAgent[]>([]);
+  const [cloudWorkspaceId, setCloudWorkspaceId] = useState("");
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     setName(session.title);
+    setCloudWorkspaceId(session.cloud_storage_workspace ?? "");
     setAgents(session.agents.map((agent) => ({
       key: nextKey(),
       existing: true,
@@ -96,6 +101,7 @@ export function EditGroupDialog({
       await onSave({
         name,
         agents: agents.map(({ key: _key, existing: _existing, ...agent }) => agent),
+        cloud_storage_workspace_id: cloudWorkspaceId || null,
       });
     } catch (error) {
       onError(errorMessage(error));
@@ -132,6 +138,31 @@ export function EditGroupDialog({
           />
         </label>
 
+        <label className={field}>
+          <span>Cloud storage <small>shared object namespace</small></span>
+          <select className={control}
+            value={cloudWorkspaceId}
+            onChange={(event) => setCloudWorkspaceId(event.target.value)}
+          >
+            <option value="">Isolated to this session (default)</option>
+            {cloudWorkspaces.map((cloudWorkspace) => (
+              <option key={cloudWorkspace.id} value={cloudWorkspace.id}>
+                {cloudWorkspace.label} · {cloudWorkspace.id}
+              </option>
+            ))}
+            {cloudWorkspaceId && !cloudWorkspaces.some(
+              (cloudWorkspace) => cloudWorkspace.id === cloudWorkspaceId,
+            ) ? (
+              <option value={cloudWorkspaceId}>
+                {cloudWorkspaceId} · missing workspace
+              </option>
+            ) : null}
+          </select>
+          <small className="mt-1.5 block text-[9px] leading-[1.45]">
+            Moving to another workspace stops running agents and points the team at the new prefix; objects under the old prefix are kept.
+          </small>
+        </label>
+
         <div className="mt-2 mb-3 flex items-start justify-between gap-4">
           <div>
             <span className={sectionLabel}>Agents</span>
@@ -162,9 +193,10 @@ export function EditGroupDialog({
         </div>
 
         <p className="mt-[13px] mb-0 border-l-2 border-[#5a452a] bg-[#19150f] px-[11px] py-[10px] text-[10px] leading-normal text-[#b5a387]">
-          Roster changes stop running agents before they are applied. Surviving
-          agents keep their history; removed agents are deleted. New agents stay
-          dormant until messaged. Renaming alone does not stop the team.
+          Roster or cloud storage workspace changes stop running agents before
+          they are applied. Surviving agents keep their history; removed agents
+          are deleted. New agents stay dormant until messaged. Renaming alone
+          does not stop the team.
         </p>
         <div className={`${dialogActions} mt-[18px]`}>
           <button className={ghostButton} type="button" onClick={onClose}>Cancel</button>

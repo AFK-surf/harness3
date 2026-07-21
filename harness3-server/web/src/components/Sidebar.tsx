@@ -10,6 +10,7 @@ interface SidebarProps {
   workspaceRoot: string;
   onNewSession: () => void;
   onManageMcp: () => void;
+  onManageCloudStorage: () => void;
   onSelectSession: (id: string) => void;
 }
 
@@ -20,6 +21,7 @@ export function Sidebar({
   workspaceRoot,
   onNewSession,
   onManageMcp,
+  onManageCloudStorage,
   onSelectSession,
 }: SidebarProps) {
   const connectionLabel = connection === "online"
@@ -51,7 +53,7 @@ export function Sidebar({
           <option key={session.id} value={session.id}>{session.title}</option>
         ))}
       </select>
-      <div className="grid grid-cols-[1fr_auto] gap-1.5 border-b border-line-soft pb-3 max-[780px]:flex max-[780px]:border-0 max-[780px]:p-0">
+      <div className="grid grid-cols-[1fr_auto_auto] gap-1.5 border-b border-line-soft pb-3 max-[780px]:flex max-[780px]:border-0 max-[780px]:p-0">
         <button
           className="flex h-8 items-center justify-center gap-1.5 rounded-lg border border-[#35432d] bg-[#1a2117] px-2.5 text-[11px] font-semibold text-ink transition hover:border-[#526a42] hover:bg-[#20291b]"
           type="button"
@@ -71,6 +73,16 @@ export function Sidebar({
         >
           <span className="text-base leading-none text-warn" aria-hidden="true">⌁</span>
           <span className="max-[1020px]:hidden">MCP</span>
+        </button>
+        <button
+          className="flex h-8 items-center justify-center gap-1.5 rounded-lg border border-line bg-transparent px-2.5 max-[780px]:px-2 text-[11px] text-muted hover:border-[#3a4248] hover:bg-panel-2 hover:text-ink"
+          type="button"
+          onClick={onManageCloudStorage}
+          aria-label="Manage cloud storage"
+          title="Manage cloud storage"
+        >
+          <span className="text-base leading-none text-info" aria-hidden="true">☁</span>
+          <span className="max-[1020px]:hidden">Cloud</span>
         </button>
       </div>
 

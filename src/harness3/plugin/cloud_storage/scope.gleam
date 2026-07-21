@@ -1,20 +1,23 @@
-import gleam/bit_array
 import gleam/list
 import gleam/string
 
-const namespace = "plugins/cloud_storage/groups/"
-
-/// A backend-key namespace belonging to one agent group.
+/// A backend-key namespace rooted at one configurable storage prefix.
 pub opaque type Scope {
   Scope(prefix: String)
 }
 
-pub fn new(group_id: String) -> Scope {
-  let encoded_group_id =
-    group_id
-    |> bit_array.from_string
-    |> bit_array.base64_url_encode(False)
-  Scope(namespace <> "g-" <> encoded_group_id <> "/objects/")
+/// Scopes object keys under an explicit storage prefix. The prefix must be a
+/// non-empty safe relative path; a trailing slash is implied. An empty prefix
+/// is rejected so a scope can never cover unrelated objects in the backend.
+pub fn new(prefix: String) -> Result(Scope, String) {
+  case prefix {
+    "" -> Error("prefix must be a safe relative path")
+    _ ->
+      case validate_prefix(prefix) {
+        Ok(Nil) -> Ok(Scope(ensure_trailing_slash(prefix)))
+        Error(error) -> Error(error)
+      }
+  }
 }
 
 pub fn object_key(scope: Scope, key: String) -> Result(String, String) {
@@ -53,6 +56,13 @@ pub fn validate_prefix(value: String) -> Result(Nil, String) {
 fn prefix(scope: Scope) -> String {
   let Scope(prefix:) = scope
   prefix
+}
+
+fn ensure_trailing_slash(value: String) -> String {
+  case string.ends_with(value, "/") {
+    True -> value
+    False -> value <> "/"
+  }
 }
 
 fn validate_path(value: String, allow_empty: Bool) -> Result(Nil, String) {

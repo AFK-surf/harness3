@@ -37,9 +37,9 @@ fn temporary_root() -> String {
   <> { crypto.strong_random_bytes(9) |> bit_array.base64_url_encode(False) }
 }
 
-fn activate(backend: storage.Storage, group_id: String) -> plugin.Runtime {
-  let assert Ok(registry) =
-    plugin.registry([cloud_storage.new(backend, group_id)])
+fn activate(backend: storage.Storage, prefix: String) -> plugin.Runtime {
+  let assert Ok(storage_plugin) = cloud_storage.new(backend, prefix)
+  let assert Ok(registry) = plugin.registry([storage_plugin])
   let assert Ok(runtime) = plugin.activate(registry, plugin.empty_states())
   runtime
 }
@@ -116,7 +116,7 @@ fn write(
 pub fn cloud_storage_exposes_scoped_text_crud_tools_test() {
   let root = temporary_root()
   let backend = local.new(local.config(root))
-  let runtime = activate(backend, "group/../with arbitrary id")
+  let runtime = activate(backend, "workspaces/alpha/objects")
   let tool_names =
     plugin.tools(runtime)
     |> list.map(fn(tool) {
@@ -162,7 +162,7 @@ pub fn cloud_storage_exposes_scoped_text_crud_tools_test() {
     expires_in_seconds: None,
   )) = json.parse(output_text(direct_url), url_result_decoder())
   assert string.starts_with(url, "file:///")
-  assert string.contains(url, "plugins/cloud_storage/groups/g-")
+  assert string.contains(url, "workspaces/alpha/objects/")
   assert string.ends_with(url, "/notes/%E8%A8%88%E7%95%AB.txt")
 
   let #(runtime, deleted) =
@@ -185,11 +185,11 @@ pub fn cloud_storage_exposes_scoped_text_crud_tools_test() {
   let assert Ok(Nil) = simplifile.delete(root)
 }
 
-pub fn listing_is_sorted_paginated_live_and_group_scoped_test() {
+pub fn listing_is_sorted_paginated_live_and_prefix_scoped_test() {
   let root = temporary_root()
   let backend = local.new(local.config(root))
-  let runtime_a = activate(backend, "../group/A")
-  let runtime_b = activate(backend, "../group/B")
+  let runtime_a = activate(backend, "workspaces/a/objects")
+  let runtime_b = activate(backend, "workspaces/b/objects")
   let runtime_a = write(runtime_a, "notes/z.txt", "z")
   let runtime_a = write(runtime_a, "notes/a.txt", "a")
   let runtime_a = write(runtime_a, "notes/m.txt", "middle")
@@ -232,32 +232,60 @@ pub fn listing_is_sorted_paginated_live_and_group_scoped_test() {
   assert_error(conflict)
   assert string.contains(output_text(conflict), "does not match")
 
-  let #(runtime_b, group_b_page) =
+  let #(runtime_b, workspace_b_page) =
     invoke(runtime_b, "cloud_storage.list", [
       #("prefix", json.string("notes/")),
     ])
-  let Page(objects: group_b_objects, ..) = page(group_b_page)
-  assert object_keys(group_b_objects) == ["notes/a.txt"]
+  let Page(objects: workspace_b_objects, ..) = page(workspace_b_page)
+  assert object_keys(workspace_b_objects) == ["notes/a.txt"]
 
-  let #(_, group_a_read) =
+  let #(_, workspace_a_read) =
     invoke(runtime_a, "cloud_storage.read", [
       #("key", json.string("notes/a.txt")),
     ])
-  let #(_, group_b_read) =
+  let #(_, workspace_b_read) =
     invoke(runtime_b, "cloud_storage.read", [
       #("key", json.string("notes/a.txt")),
     ])
-  assert output_text(group_a_read) == "a"
-  assert output_text(group_b_read) == "private B"
+  assert output_text(workspace_a_read) == "a"
+  assert output_text(workspace_b_read) == "private B"
 
   let assert Ok(Nil) = simplifile.delete(root)
+}
+
+/// Plugins configured with the same prefix share objects even when separate
+/// runtimes (i.e. separate agents) hold them, and a prefix without a trailing
+/// slash scopes identically to one with it.
+pub fn matching_prefixes_share_objects_across_runtimes_test() {
+  let root = temporary_root()
+  let backend = local.new(local.config(root))
+  let runtime_plain = activate(backend, "workspaces/shared/objects")
+  let runtime_slashed = activate(backend, "workspaces/shared/objects/")
+  let runtime_plain = write(runtime_plain, "handoff/note.txt", "joint")
+  let #(_, slashed_read) =
+    invoke(runtime_slashed, "cloud_storage.read", [
+      #("key", json.string("handoff/note.txt")),
+    ])
+  assert_success(slashed_read)
+  assert output_text(slashed_read) == "joint"
+  let assert Ok(Nil) = simplifile.delete(root)
+}
+
+pub fn invalid_storage_prefixes_are_rejected_test() {
+  let backend = local.new(local.config(temporary_root()))
+  list.each(
+    ["", "/absolute", "../outside", "a//b", "a/./b", "a/../b", "a\\b", "/"],
+    fn(prefix) {
+      let assert Error(_) = cloud_storage.new(backend, prefix)
+    },
+  )
 }
 
 pub fn invalid_keys_cursors_limits_and_non_utf8_objects_are_tool_errors_test() {
   let root = temporary_root()
   let backend = local.new(local.config(root))
-  let group_id = "validation-group"
-  let runtime = activate(backend, group_id)
+  let prefix = "workspaces/validation/objects"
+  let runtime = activate(backend, prefix)
 
   list.each(
     ["", "/absolute", "../outside", "a//b", "a/./b", "a/../b", "a\\b", "a/"],
@@ -307,8 +335,8 @@ pub fn invalid_keys_cursors_limits_and_non_utf8_objects_are_tool_errors_test() {
     )
   assert_error(malformed_arguments)
 
-  let group_scope = scope.new(group_id)
-  let assert Ok(backend_key) = scope.object_key(group_scope, "binary.dat")
+  let assert Ok(storage_scope) = scope.new(prefix)
+  let assert Ok(backend_key) = scope.object_key(storage_scope, "binary.dat")
   let assert Ok(_) =
     storage.put(backend, backend_key, <<255, 254>>, storage.Unconditional)
   let #(_, binary_read) =
@@ -318,7 +346,7 @@ pub fn invalid_keys_cursors_limits_and_non_utf8_objects_are_tool_errors_test() {
   assert_error(binary_read)
   assert string.contains(output_text(binary_read), "not UTF-8")
 
-  // Empty prefix is valid and lists the complete logical group namespace.
+  // Empty prefix is valid and lists the complete logical scoped namespace.
   let #(_, all_objects) = invoke(runtime, "cloud_storage.list", [])
   let Page(objects:, ..) = page(all_objects)
   assert object_keys(objects) == ["binary.dat"]
@@ -328,7 +356,7 @@ pub fn invalid_keys_cursors_limits_and_non_utf8_objects_are_tool_errors_test() {
 
 pub fn storage_backend_failures_are_recoverable_tool_errors_test() {
   let backend = failing_storage()
-  let runtime = activate(backend, "offline-group")
+  let runtime = activate(backend, "workspaces/offline/objects")
   let operations = [
     #("cloud_storage.read", [#("key", json.string("object.txt"))]),
     #("cloud_storage.write", [
@@ -376,7 +404,7 @@ pub fn cloud_transfer_urls_are_requested_with_five_minute_ttl_test() {
         Some(expires_in_seconds),
       ))
     })
-  let runtime = activate(backend, "url-group")
+  let runtime = activate(backend, "workspaces/url/objects")
   let #(_, output) =
     invoke(runtime, "cloud_storage.get_url", [
       #("key", json.string("export.txt")),

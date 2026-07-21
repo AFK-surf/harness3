@@ -15,6 +15,7 @@ import harness3/agent_group
 import harness3/llm
 import harness3/model_catalog
 import harness3/plugin/mcp/configuration as mcp_configuration
+import harness3_server/cloud_storage_workspaces as storage_workspaces
 import harness3_server/config
 import harness3_server/service.{type Service, type Session}
 import mist.{type ResponseData}
@@ -86,6 +87,28 @@ fn handle(
     http.Delete,
       ["api", "mcp", "configurations", configuration_id, "servers", server_id]
     -> remove_mcp_server(service, configuration_id, server_id)
+    http.Get, ["api", "cloud-storage", "workspaces"] ->
+      json_response(
+        200,
+        json.object([
+          #(
+            "workspaces",
+            json.array(
+              service.cloud_storage_workspaces(service),
+              workspace_json,
+            ),
+          ),
+        ]),
+      )
+    http.Post, ["api", "cloud-storage", "workspaces"] ->
+      add_cloud_storage_workspace(service, request.body)
+    http.Put, ["api", "cloud-storage", "workspaces", workspace_id] ->
+      update_cloud_storage_workspace(service, workspace_id, request.body)
+    http.Delete, ["api", "cloud-storage", "workspaces", workspace_id] ->
+      case service.remove_cloud_storage_workspace(service, workspace_id) {
+        Ok(Nil) -> json_response(200, json.object([#("ok", json.bool(True))]))
+        Error(error) -> error_response(workspace_error_status(error), error)
+      }
     http.Get, ["api", "sessions"] ->
       outcome(service.list_sessions(service), fn(sessions) {
         json.object([#("sessions", json.array(sessions, session_json))])
@@ -232,6 +255,57 @@ fn update_mcp_server(
   }
 }
 
+fn add_cloud_storage_workspace(
+  service: Service,
+  body: BitArray,
+) -> Response(ResponseData) {
+  use input <- body_decoded(body, workspace_input_decoder())
+  case
+    service.add_cloud_storage_workspace(
+      service,
+      input.id,
+      input.label,
+      input.prefix,
+    )
+  {
+    Ok(workspace) -> json_response(201, workspace_json(workspace))
+    Error(error) -> error_response(workspace_error_status(error), error)
+  }
+}
+
+fn update_cloud_storage_workspace(
+  service: Service,
+  workspace_id: String,
+  body: BitArray,
+) -> Response(ResponseData) {
+  use input <- body_decoded(body, workspace_input_decoder())
+  case
+    service.update_cloud_storage_workspace(
+      service,
+      workspace_id,
+      input.label,
+      input.prefix,
+    )
+  {
+    Ok(workspace) -> json_response(200, workspace_json(workspace))
+    Error(error) -> error_response(workspace_error_status(error), error)
+  }
+}
+
+/// Service errors are strings, so status mapping is by content: an unknown
+/// workspace is 404, one still referenced by sessions is a 409 conflict, and
+/// anything else is a 400 validation failure.
+fn workspace_error_status(error: String) -> Int {
+  case string.contains(error, "unknown cloud storage workspace") {
+    True -> 404
+    False ->
+      case string.contains(error, "still used by") {
+        True -> 409
+        False -> 400
+      }
+  }
+}
+
 fn body_decoded(
   body: BitArray,
   decoder: decode.Decoder(value),
@@ -349,6 +423,10 @@ fn session_json(session: Session) -> json.Json {
     #("title", json.string(metadata.title)),
     #("prompt", json.string(metadata.prompt)),
     #("workspace", json.string(metadata.workspace)),
+    #(
+      "cloud_storage_workspace",
+      json.nullable(metadata.cloud_storage_workspace, json.string),
+    ),
     #("created_at", json.int(metadata.created_at)),
     #("revision", json.int(group.revision)),
     #("execution", execution_json(group.execution)),
@@ -534,13 +612,31 @@ fn create_input_decoder() -> decode.Decoder(service.CreateInput) {
   use model_id <- decode.field("model_id", decode.string)
   use workspace <- decode.optional_field("workspace", "", decode.string)
   use team_size <- decode.optional_field("team_size", 3, decode.int)
-  decode.success(service.CreateInput(model_id, workspace, team_size))
+  use cloud_storage_workspace_id <- decode.optional_field(
+    "cloud_storage_workspace_id",
+    None,
+    decode.optional(decode.string),
+  )
+  decode.success(service.CreateInput(
+    model_id,
+    workspace,
+    team_size,
+    cloud_storage_workspace_id,
+  ))
 }
 
 fn update_input_decoder() -> decode.Decoder(service.UpdateInput) {
   use name <- decode.field("name", decode.string)
   use agents <- decode.field("agents", decode.list(of: edit_agent_decoder()))
-  decode.success(service.UpdateInput(name, agents))
+  // Tri-state: a missing field keeps the current association, an explicit
+  // null clears it back to the isolated default, and a string associates the
+  // named workspace.
+  use cloud_storage_workspace <- decode.optional_field(
+    "cloud_storage_workspace_id",
+    service.KeepAssociation,
+    decode.map(decode.optional(decode.string), service.SetAssociation),
+  )
+  decode.success(service.UpdateInput(name, agents, cloud_storage_workspace))
 }
 
 fn edit_agent_decoder() -> decode.Decoder(service.AgentSpec) {
@@ -676,4 +772,23 @@ fn message_decoder() -> decode.Decoder(MessageRequest) {
   use agent_id <- decode.field("agent_id", decode.string)
   use message <- decode.field("message", decode.string)
   decode.success(MessageRequest(agent_id, message))
+}
+
+fn workspace_json(workspace: storage_workspaces.Workspace) -> json.Json {
+  json.object([
+    #("id", json.string(workspace.id)),
+    #("label", json.string(workspace.label)),
+    #("prefix", json.string(workspace.prefix)),
+  ])
+}
+
+type WorkspaceInput {
+  WorkspaceInput(id: String, label: String, prefix: String)
+}
+
+fn workspace_input_decoder() -> decode.Decoder(WorkspaceInput) {
+  use id <- decode.optional_field("id", "", decode.string)
+  use label <- decode.field("label", decode.string)
+  use prefix <- decode.optional_field("prefix", "", decode.string)
+  decode.success(WorkspaceInput(id, label, prefix))
 }
