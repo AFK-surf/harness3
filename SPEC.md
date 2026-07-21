@@ -493,7 +493,11 @@ new message are folded into `messages` in one CAS (revision+1, status Ready) and
 worker is started. With an unresolved tool journal, even a dormant worker keeps all new
 deliveries in the inbox and restarts recovery first. A message is never inserted between
 an Assistant ToolCall and its complete ToolResult block. When a worker exits leaving an
-inbox or journal, the coordinator immediately restarts it.
+inbox or journal, the coordinator immediately restarts it. Journal-driven restarts are
+budgeted: after 3 consecutive worker exits with no successful commit in between (only a
+commit can close a journal, so this means storage writes are failing persistently), the
+coordinator abandons the group instead of hot-looping; recovery re-dispatches it after
+the lease expires, with the journal intact. Any successful commit resets the budget.
 
 ### 7.6 Cross-agent callbacks
 

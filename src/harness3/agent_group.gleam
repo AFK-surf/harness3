@@ -20,6 +20,13 @@ import harness3/storage.{type Metadata, type Storage, type VersionToken}
 
 const default_minimum_lifetime_milliseconds = 10_000
 
+/// Consecutive times a worker holding an unresolved tool journal may exit and
+/// be restarted without any successful commit in between. The journal can only
+/// close via a commit, so exhausting this budget means storage writes are
+/// failing; the coordinator abandons instead of hot-looping restarts, and
+/// recovery re-dispatches the group after the lease expires.
+const max_journal_restarts = 3
+
 /// User message prepended to an injected synthetic tool call when the pair
 /// would otherwise start the conversation or directly follow an assistant
 /// message; provider APIs reject both shapes.
@@ -162,6 +169,7 @@ type CoordinatorState {
     profiles: List(agent_profile.AgentProfile),
     minimum_lifetime_milliseconds: Int,
     minimum_lifetime_elapsed: Bool,
+    journal_restarts: Dict(String, Int),
   )
 }
 
@@ -618,6 +626,7 @@ fn start_coordinator(
       config.profiles,
       config.minimum_lifetime_milliseconds,
       False,
+      dict.new(),
     )
   use started <- result.try(
     actor.new(state)
@@ -962,7 +971,14 @@ fn handle_message(
       case outcome {
         Ok(#(state, receipt)) -> {
           process.send(reply, Ok(receipt))
-          actor.continue(state)
+          // A successful commit proves storage writes work again; the
+          // worker's journal-restart budget starts over.
+          actor.continue(
+            CoordinatorState(
+              ..state,
+              journal_restarts: dict.delete(state.journal_restarts, id),
+            ),
+          )
         }
         Error(error) -> {
           process.send(reply, Error(error))
@@ -1023,14 +1039,40 @@ fn handle_message(
                 // A worker that exits after a tool-progress checkpoint must be
                 // replaced even with an empty inbox, so the journal can be
                 // closed with an honest interrupted/unknown ToolResult block.
-                Some(_) ->
-                  case start_agent_worker(state, current, coordinator) {
-                    Ok(next) -> actor.continue(next)
-                    Error(_) -> {
+                // The restart budget is consumed only by exits with no
+                // successful commit in between (`CommitAgent` resets it);
+                // exhausting it means commits are failing persistently, so
+                // restarting would spin — abandon and let recovery re-dispatch
+                // the group after the lease expires.
+                Some(_) -> {
+                  let attempts =
+                    dict.get(state.journal_restarts, id)
+                    |> result.unwrap(0)
+                  case attempts < max_journal_restarts {
+                    False -> {
                       abandon(state)
                       actor.stop()
                     }
+                    True -> {
+                      let state =
+                        CoordinatorState(
+                          ..state,
+                          journal_restarts: dict.insert(
+                            state.journal_restarts,
+                            id,
+                            attempts + 1,
+                          ),
+                        )
+                      case start_agent_worker(state, current, coordinator) {
+                        Ok(next) -> actor.continue(next)
+                        Error(_) -> {
+                          abandon(state)
+                          actor.stop()
+                        }
+                      }
+                    }
                   }
+                }
                 None ->
                   case current.pending_messages {
                     [] ->

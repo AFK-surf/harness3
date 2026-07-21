@@ -3042,3 +3042,129 @@ pub fn interrupted_tool_journal_recovers_before_pending_messages_test() {
   let assert Ok(Nil) = agent_group.stop(group)
   remove_directory(root)
 }
+
+type CommitFailureMessage {
+  RecordPut(condition: storage.PutCondition, reply: Subject(Bool))
+  FailureCount(reply: Subject(Int))
+}
+
+fn handle_commit_failures(
+  state: #(Int, Int),
+  message: CommitFailureMessage,
+) -> actor.Next(#(Int, Int), CommitFailureMessage) {
+  let #(seen, failures) = state
+  case message {
+    RecordPut(storage.IfUnchanged(_), reply) -> {
+      let should_fail = seen > 0
+      process.send(reply, should_fail)
+      actor.continue(#(
+        seen + 1,
+        case should_fail {
+          True -> failures + 1
+          False -> failures
+        },
+      ))
+    }
+    RecordPut(_, reply) -> {
+      process.send(reply, False)
+      actor.continue(state)
+    }
+    FailureCount(reply) -> {
+      process.send(reply, failures)
+      actor.continue(state)
+    }
+  }
+}
+
+/// Lets the first IfUnchanged put — the wake's claim CAS — through, then
+/// fails every later one with a non-CAS storage error, imitating a backend
+/// whose writes break after the group is claimed.
+fn failing_commit_storage(
+  backend: storage.Storage,
+) -> #(storage.Storage, Subject(CommitFailureMessage)) {
+  let assert Ok(started) =
+    actor.new(#(0, 0))
+    |> actor.on_message(handle_commit_failures)
+    |> actor.start
+  let control = started.data
+  let wrapped =
+    storage.from_functions(
+      get: fn(key) { storage.get(backend, key) },
+      head: fn(key) { storage.head(backend, key) },
+      put: fn(key, body, condition) {
+        let should_fail =
+          process.call_forever(control, fn(reply) {
+            RecordPut(condition, reply)
+          })
+        case should_fail {
+          True -> Error(storage.Transport("injected commit failure"))
+          False -> storage.put(backend, key, body, condition)
+        }
+      },
+      list: fn(prefix) { storage.list(backend, prefix) },
+      delete: fn(key) { storage.delete(backend, key) },
+      stream_get: fn(key, consume) { storage.get_stream(backend, key, consume) },
+      stream_put: fn(key, source, condition) {
+        storage.put_stream(backend, key, source, condition)
+      },
+    )
+  #(wrapped, control)
+}
+
+pub fn journal_restart_loop_is_bounded_when_commits_fail_test() {
+  let root = temporary_root("journal-restart-budget-test")
+  let backend = local.new(local.config(root))
+  let assert Ok(catalog) =
+    model_catalog.put_model(model_catalog.new(), test_model())
+  let assert Ok(_) = model_catalog.create(backend, "catalog", catalog)
+  let assert Ok(registry) = plugin.registry([])
+  let transport =
+    agent.model_transport(fn(_, _, consume) {
+      let assert Ok(Nil) = consume(llm.MessageStart("unused", "test-model"))
+      let assert Ok(Nil) = consume(llm.TextDelta(0, "unused"))
+      let assert Ok(Nil) = consume(llm.Finished(llm.Stop))
+      let assert Ok(Nil) = consume(llm.MessageStop)
+      Ok(Nil)
+    })
+  let profile =
+    agent_profile.AgentProfile("agent", registry, transport, None, observe)
+  let interrupted =
+    agent.State(
+      ..agent.state("agent", "model"),
+      messages: [
+        llm.Message(llm.User, [llm.Text("perform the operation")]),
+        llm.Message(llm.Assistant, [
+          llm.ToolCall("running", "test.running", json.object([])),
+        ]),
+      ],
+      tool_journal: Some(
+        agent.ToolJournal([agent.ToolRunning("running", "test.running", "{}")]),
+      ),
+    )
+  let create_config =
+    agent_group.Config(backend, "groups/journal-budget", [profile], 10, 60_000)
+  let assert Ok(_) =
+    agent_group.create(
+      create_config,
+      agent_group.new("journal-budget", "catalog", [interrupted]),
+    )
+  let #(wrapped, control) = failing_commit_storage(backend)
+  let wake_config =
+    agent_group.Config(wrapped, "groups/journal-budget", [profile], 10, 60_000)
+  let assert Ok(loaded) = agent_group.resume(wake_config)
+  let assert Ok(group) = agent_group.wake(loaded)
+  // Every journal-closing commit fails, so each replacement worker exits
+  // again. The coordinator must stop once the restart budget is exhausted
+  // instead of spinning up workers forever.
+  await_down(process.monitor(agent_group.pid(group)))
+  // Initial worker plus three budgeted replacements, one failed
+  // journal-closing commit each.
+  let failures = process.call_forever(control, FailureCount)
+  assert failures == 4
+  // Durable state is untouched: the journal survives for recovery to close
+  // once the group is re-dispatched.
+  let assert Ok(snapshot) = agent_group.load(create_config)
+  let assert [pending] = snapshot.agents
+  let assert Some(_) = pending.tool_journal
+  remove_directory(root)
+}
